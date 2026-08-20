@@ -9,9 +9,9 @@ NET=logtap-e2e
 
 docker network create "$NET" >/dev/null 2>&1 || true
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true
-docker rm -f pglogtap-vector >/dev/null 2>&1 || true
+docker rm -f pglogtap-vector-e2e >/dev/null 2>&1 || true
 rm -rf /tmp/logtap-e2e && mkdir -p /tmp/logtap-e2e
-docker run -d --name pglogtap-vector --network "$NET" \
+docker run -d --name pglogtap-vector-e2e --network "$NET" \
   -v "$(pwd)/tests/e2e/vector.yaml:/etc/vector/vector.yaml:ro" \
   -v /tmp/logtap-e2e:/var/log \
   timberio/vector:0.57.0-alpine --config /etc/vector/vector.yaml >/dev/null
@@ -19,7 +19,7 @@ sleep 3
 
 # Point pg_logtap at Vector (URL is re-read every flush cycle, no restart
 # needed) and reset the counters' baseline.
-docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" -qc "SELECT pg_reload_conf()" >/dev/null
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector-e2e:8686'" -qc "SELECT pg_reload_conf()" >/dev/null
 sleep 2
 
 i=0
