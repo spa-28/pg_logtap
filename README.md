@@ -244,6 +244,23 @@ ABI note: a `.so` built against X.Y runs on any X.* of the same major and arch
 (headers are build-time only); release builds should target the oldest glibc
 you support (e.g. debian:bookworm).
 
+## Releases
+
+The version lives in three places that must stay in sync (CI checks this):
+`pg_logtap.control` (`default_version`), the `sql/pg_logtap--X.Y.Z.sql`
+filename, and `build.zig.zon`. To cut a release:
+
+```sh
+# 1. bump the version in all three files (rename the sql file accordingly)
+# 2. commit, tag, push
+git tag v0.2.0 && git push origin v0.2.0
+# 3. create a Release for the tag in the GitHub UI (or: gh release create v0.2.0)
+```
+
+Publishing the Release triggers CI, which rebuilds the matrix and attaches one
+package per major as `pg_logtap-<version>-pg<N>-amd64.tar.gz` — a `lib/` +
+`extension/` tree ready to untar into the PostgreSQL installation.
+
 ## License
 
 MIT. Depends on [pgzx](https://github.com/spa-28/pgzx) (fork of

@@ -19,6 +19,12 @@ jobs:
       # The pgzx dependency runs pg_config at configure time (any zig build
       # invocation) and links libpq; any server-dev version will do here.
       - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev libkrb5-dev
+      # Version lives in control + sql filename + build.zig.zon; fail early
+      # if they drift apart (the release job names packages from the tag).
+      - run: |
+          v=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
+          [ -f "sql/pg_logtap--$v.sql" ] || { echo "sql/pg_logtap--$v.sql missing"; exit 1; }
+          grep -q "\"$v\"" build.zig.zon || { echo "build.zig.zon version != $v"; exit 1; }
       - run: zig build fmt --summary all
       - run: zig build lint --summary all
       - run: zig build test --summary all
@@ -55,3 +61,34 @@ jobs:
           name: pg_logtap-pg${{ matrix.pg }}-amd64
           path: dist/pg${{ matrix.pg }}/lib/pg_logtap.so
           if-no-files-found: error
+
+  # On a published release: rebuild via the jobs above, then attach one
+  # installable package per PG major, named pg_logtap-<version>-pg<N>-amd64.tar.gz
+  # (lib/ + extension/ layout, ready to untar into the PG install).
+  release:
+    needs: [check, matrix]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - run: |
+          V=${GITHUB_REF_NAME#v}
+          ctl=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
+          [ "$V" = "$ctl" ] || { echo "tag v$V != control default_version $ctl"; exit 1; }
+          mkdir rel
+          for d in dist/pg_logtap-pg*-amd64; do
+            pg=${d#dist/pg_logtap-pg}; pg=${pg%-amd64}
+            pkg=pg_logtap-$V-pg$pg-amd64
+            mkdir -p pkg/lib pkg/extension rel
+            cp "$d/pg_logtap.so" pkg/lib/
+            cp pg_logtap.control sql/*.sql pkg/extension/
+            tar -C pkg -czf "rel/$pkg.tar.gz" .
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rel/*
