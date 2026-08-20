@@ -1,0 +1,23 @@
+.{
+    .name = .pg_logtap,
+    .version = "0.1.0",
+    .fingerprint = 0xa4a7ecd69b38e118,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .pgzx = .{
+            .url = "git+https://github.com/spa-28/pgzx#a31969645c8f29169ac22bca5c0d8078e0d00d57",
+            .hash = "pgzx-0.1.0-PsG6MC7QAwD5rYO9c_n5trnwATm0xnH4GSM00Ma-MO0B",
+        },
+        .zlinter = .{
+            .url = "git+https://github.com/kurtwagner/zlinter?ref=0.16.x#8b10b45d33c684be4f869baf95a37c282e9db750",
+            .hash = "zlinter-0.0.1-OjQ08doQDADkvkcRq2ONICvDheGl2onZzS5upWDxFNnA",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "sql",
+        "pg_logtap.control",
+    },
+}

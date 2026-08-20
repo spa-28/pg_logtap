@@ -1,0 +1,6 @@
+/vendor/
+/dist/
+/zig-out*/
+/zig-pkg/
+/.zig-cache/
+/dev/

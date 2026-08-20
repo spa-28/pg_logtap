@@ -1,0 +1,6 @@
+comment = 'pg_logtap: capture PostgreSQL logs and push them to external collectors (Vector)'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_logtap'
+relocatable = false
+superuser = true
+trusted = false

@@ -1,0 +1,23 @@
+# M3 e2e: pg_logtap pushes ndjson over HTTP → Vector sinks it to console+file.
+sources:
+  pg_logtap:
+    type: http
+    address: 0.0.0.0:8686
+    decoding:
+      codec: json
+      framing:
+        method: newline_delimited
+
+sinks:
+  console_out:
+    type: console
+    inputs: [pg_logtap]
+    encoding:
+      codec: json
+
+  file_out:
+    type: file
+    inputs: [pg_logtap]
+    path: /var/log/vector-out.jsonl
+    encoding:
+      codec: json

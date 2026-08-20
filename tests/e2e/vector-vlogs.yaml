@@ -1,0 +1,22 @@
+# pg_logtap → Vector → VictoriaLogs (jsonline ingest, как в проде: http sink
+# + маппинг полей в query string). Дев-вариант: без vmauth/тенантов.
+# host/cluster/pgdata прошивает в JSON сам pg_logtap — Vector одинаков для
+# любого количества отправителей.
+sources:
+  http_in:
+    type: http_server
+    address: 0.0.0.0:8686
+    decoding: { codec: json, framing: { method: newline_delimited } }
+
+sinks:
+  logs_victoria:
+    inputs: [http_in]
+    type: http
+    uri: http://pglogtap-vlogs:9428/insert/jsonline?_stream_fields=host,cluster,level,database,user,backend_type&_msg_field=message&_time_field=timestamp
+    compression: gzip
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    healthcheck:
+      enabled: true
