@@ -18,7 +18,7 @@ jobs:
           echo "/opt/zig" >> "$GITHUB_PATH"
       # The pgzx dependency runs pg_config at configure time (any zig build
       # invocation) and links libpq; any server-dev version will do here.
-      - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev libkrb5-dev
       - run: zig build fmt --summary all
       - run: zig build lint --summary all
       - run: zig build test --summary all
@@ -46,7 +46,7 @@ jobs:
             echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
             sudo apt-get update
           fi
-          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev libkrb5-dev
       - run: scripts/test-matrix.sh 5 ${{ matrix.pg }}
         env:
           PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
