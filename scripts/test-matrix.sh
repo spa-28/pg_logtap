@@ -15,6 +15,16 @@ STATUS=0
 cleanup_vector() { docker rm -f pglogtap-vector-mx >/dev/null 2>&1 || true; }
 trap cleanup_vector EXIT
 
+# Restart/run readiness: poll instead of a fixed sleep — CI runners are
+# slower than a local docker daemon and postgres needs 5-15s there.
+wait_ready() {
+  for _ in $(seq 1 30); do
+    docker exec "$1" pg_isready -U postgres -q 2>/dev/null && return 0
+    sleep 1
+  done
+  echo "pg in $1 not ready after 30s" >&2; return 1
+}
+
 for v in $VERSIONS; do
   echo "===== pg$v ====="
   C=pglogtap-mx$v
@@ -27,7 +37,7 @@ for v in $VERSIONS; do
 
   docker rm -f "$C" >/dev/null 2>&1 || true
   docker run -d --name "$C" --network "$NET" -e POSTGRES_PASSWORD=dev "postgres:$v" >/dev/null
-  sleep 8
+  wait_ready "$C"
   LIBDIR=$(docker exec "$C" pg_config --pkglibdir)
   EXTDIR=$(docker exec "$C" pg_config --sharedir)/extension
   docker cp "dist/pg$v/lib/pg_logtap.so" "$C:$LIBDIR/"
@@ -38,11 +48,11 @@ for v in $VERSIONS; do
   # custom GUCs, so the library must load first.
   docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'" \
     -qc "ALTER SYSTEM SET cluster_name = 'matrix-pg$v'" >/dev/null
-  docker restart "$C" >/dev/null; sleep 6
+  docker restart "$C" >/dev/null; wait_ready "$C"
   # Phase 2: pg_logtap.* GUCs are registered now; ring_capacity is POSTMASTER.
   docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.ring_capacity = 8192" \
     -qc "ALTER SYSTEM SET pg_logtap.flush_interval = 100" >/dev/null
-  docker restart "$C" >/dev/null; sleep 6
+  docker restart "$C" >/dev/null; wait_ready "$C"
   docker exec "$C" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 
   # Functional: N distinct events must reach Vector (file sink).

@@ -36,7 +36,13 @@ jobs:
           curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
           mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
           echo "/opt/zig" >> "$GITHUB_PATH"
-      - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev
+      # ubuntu ships only one server-dev major; the rest come from PGDG
+      # (the official PostgreSQL apt repository).
+      - run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh https://salsa.debian.org/postgresql/postgresql-common/raw/master/pgdg/apt.postgresql.org.sh
+          sudo sh /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+          sudo apt-get update && sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev
       - run: scripts/test-matrix.sh 5 ${{ matrix.pg }}
         env:
           PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
