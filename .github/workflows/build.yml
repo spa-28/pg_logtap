@@ -37,12 +37,16 @@ jobs:
           mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
           echo "/opt/zig" >> "$GITHUB_PATH"
       # ubuntu ships only one server-dev major; the rest come from PGDG
-      # (the official PostgreSQL apt repository).
+      # (the official PostgreSQL apt repository, manual repo setup).
       - run: |
-          sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh https://salsa.debian.org/postgresql/postgresql-common/raw/master/pgdg/apt.postgresql.org.sh
-          sudo sh /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
-          sudo apt-get update && sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev
+          . /etc/os-release
+          if ! apt-cache show postgresql-server-dev-${{ matrix.pg }} >/dev/null 2>&1; then
+            sudo install -d /etc/apt/keyrings
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/keyrings/pgdg.asc >/dev/null
+            echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+            sudo apt-get update
+          fi
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev
       - run: scripts/test-matrix.sh 5 ${{ matrix.pg }}
         env:
           PATH: /usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
