@@ -50,6 +50,28 @@ pipeline before any of it applies:
 
 ## Installation
 
+### From a release (no toolchain needed)
+
+Grab the package matching your PostgreSQL major from the
+[releases page](https://github.com/spa-28/pg_logtap/releases) —
+`pg_logtap-<version>-pg<N>-amd64.tar.gz` — and unpack it into the running
+installation:
+
+```sh
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.1.0/pg_logtap-0.1.0-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.1.0-pg18-amd64.tar.gz          # → lib/ + extension/
+sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
+sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
+```
+
+Release binaries are x86-64, built with ReleaseSafe against glibc 2.28 —
+the oldest glibc among current distributions (RHEL 8; glibc is
+forward-compatible), so they run on RHEL/Rocky/Alma 8+, Debian 11+,
+Ubuntu 20.04+, Amazon Linux 2023. On other architectures or musl, build
+from source as below.
+
+### From source
+
 Prerequisites: Zig 0.16.0, `pg_config` for the target major on PATH, and
 libpq headers (`postgresql-server-dev-NN` + `libpq-dev` on Debian/Ubuntu) —
 the [pgzx](https://github.com/spa-28/pgzx) dependency (git dep in

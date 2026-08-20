@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .pgzx = .{
-            .url = "git+https://github.com/spa-28/pgzx#a31969645c8f29169ac22bca5c0d8078e0d00d57",
-            .hash = "pgzx-0.1.0-PsG6MC7QAwD5rYO9c_n5trnwATm0xnH4GSM00Ma-MO0B",
+            .url = "git+https://github.com/spa-28/pgzx#f815939e2d0e5143a72ae1c38e360445c4714fde",
+            .hash = "pgzx-0.1.0-PsG6MFXRAwDrq-0BqLowcR96EhNCbJYM4jI1Q_XOVZq1",
         },
         .zlinter = .{
             .url = "git+https://github.com/kurtwagner/zlinter?ref=0.16.x#8b10b45d33c684be4f869baf95a37c282e9db750",
