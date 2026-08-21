@@ -107,14 +107,22 @@ GUCs and restart again.
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
+| `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 
-`export_url` schemes:
+`export_url` schemes (gzip applies to the `http://` scheme only):
 
 - `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS);
 - `tcp://host:port` — raw JSON lines;
 - `file:///abs/path` — append, mode 0600.
+
+With `pg_logtap.export_gzip = on` the HTTP body is gzipped
+(`Content-Encoding: gzip`) — same NDJSON after decompression, just less
+wire. Request-body gzip is *not* universal: Vector `http_server`,
+VictoriaLogs/VictoriaMetrics insert endpoints, Fluent Bit `http` and
+Logstash `http` inputs decompress it natively; a hand-rolled endpoint that
+reads the raw body does not — leave the GUC off for those.
 
 ## Receivers
 
