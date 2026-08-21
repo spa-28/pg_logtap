@@ -308,9 +308,12 @@ filename, and `build.zig.zon`. To cut a release:
 
 ```sh
 # 1. bump the version in all three files (rename the sql file accordingly)
-# 2. commit, tag, push
+# 2. add sql/pg_logtap--<old>--<new>.sql — the delta script (comment-only if
+#    the SQL didn't change); every version needs one, it is the ALTER EXTENSION
+#    UPDATE hop, and chains compose (0.1.0 → 0.2.0 → 0.3.0 in one command)
+# 3. commit, tag, push
 git tag v0.2.0 && git push origin v0.2.0
-# 3. create a Release for the tag in the GitHub UI (or: gh release create v0.2.0)
+# 4. create a Release for the tag in the GitHub UI (or: gh release create v0.2.0)
 ```
 
 Publishing the Release triggers CI, which rebuilds the matrix and attaches one
