@@ -36,32 +36,38 @@ pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Sta
 /// Exposition format 0.0.4; counters end in _total by convention.
 fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
     try w.print(
-        \\# HELP pg_logtap_captured_total Log events captured into the ring.
-        \\# TYPE pg_logtap_captured_total counter
-        \\pg_logtap_captured_total {d}
-        \\# HELP pg_logtap_dropped_total Events dropped because the ring was full.
-        \\# TYPE pg_logtap_dropped_total counter
-        \\pg_logtap_dropped_total {d}
-        \\# HELP pg_logtap_exported_total Events pushed to the export URL.
-        \\# TYPE pg_logtap_exported_total counter
-        \\pg_logtap_exported_total {d}
-        \\# HELP pg_logtap_export_failed_total Failed flush cycles (not events).
-        \\# TYPE pg_logtap_export_failed_total counter
-        \\pg_logtap_export_failed_total {d}
-        \\# HELP pg_logtap_export_lost_total Events lost to backlog overflow.
-        \\# TYPE pg_logtap_export_lost_total counter
-        \\pg_logtap_export_lost_total {d}
-        \\# HELP pg_logtap_ring_count Events currently waiting in the ring.
-        \\# TYPE pg_logtap_ring_count gauge
-        \\pg_logtap_ring_count {d}
+        \\# HELP pg_logtap_events_captured_total Log events captured into the ring.
+        \\# TYPE pg_logtap_events_captured_total counter
+        \\pg_logtap_events_captured_total {d}
+        \\# HELP pg_logtap_events_dropped_total Events dropped because the ring was full.
+        \\# TYPE pg_logtap_events_dropped_total counter
+        \\pg_logtap_events_dropped_total {d}
+        \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
+        \\# TYPE pg_logtap_events_sent_total counter
+        \\pg_logtap_events_sent_total {d}
+        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed.
+        \\# TYPE pg_logtap_events_queued_total counter
+        \\pg_logtap_events_queued_total {d}
+        \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.
+        \\# TYPE pg_logtap_events_replayed_total counter
+        \\pg_logtap_events_replayed_total {d}
+        \\# HELP pg_logtap_send_cycles_failed_total Failed send attempts — one per flush cycle whose send failed, NOT events. The events are safe (fallback queue / backlog); this is the receiver-down signal.
+        \\# TYPE pg_logtap_send_cycles_failed_total counter
+        \\pg_logtap_send_cycles_failed_total {d}
+        \\# HELP pg_logtap_events_lost_total Events permanently lost: RAM backlog overflow with no fallback file, or an unreadable fallback member skipped.
+        \\# TYPE pg_logtap_events_lost_total counter
+        \\pg_logtap_events_lost_total {d}
+        \\# HELP pg_logtap_ring_events Events currently waiting in the ring.
+        \\# TYPE pg_logtap_ring_events gauge
+        \\pg_logtap_ring_events {d}
         \\# HELP pg_logtap_ring_capacity Ring capacity in events.
         \\# TYPE pg_logtap_ring_capacity gauge
         \\pg_logtap_ring_capacity {d}
         \\
     , .{
-        snap.captured,      snap.dropped,     snap.exported,
-        snap.export_failed, snap.export_lost, snap.count,
-        snap.capacity,
+        snap.captured,   snap.dropped,    snap.sent,
+        snap.queued,     snap.replayed,   snap.send_failed,
+        snap.export_lost, snap.count,     snap.capacity,
     });
 }
 
@@ -74,7 +80,7 @@ test "metrics response" {
     try writeResponse(&resp_w, "GET /metrics HTTP/1.1", snap);
     const got = resp_w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
-    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_captured_total 7\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_captured_total 7\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_ring_capacity 1024\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;

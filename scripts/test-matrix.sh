@@ -85,9 +85,9 @@ for v in $VERSIONS; do
   sleep 2
   # Counters are cumulative since start: baseline now, compare deltas after.
   base=$(docker exec "$C" psql -U postgres -Atc "SELECT pg_logtap_stats()")
-  bcap=${base#*captured=}; bcap=${bcap%% *}
-  bdrp=${base#*dropped=}; bdrp=${bdrp%% *}
-  bexp=${base#*exported=}; bexp=${bexp%% *}
+  bcap=${base#*events_captured=}; bcap=${bcap%% *}
+  bdrp=${base#*events_dropped=}; bdrp=${bdrp%% *}
+  bexp=${base#*events_sent=}; bexp=${bexp%% *}
   docker exec "$C" bash -c "pgbench -i -q -U postgres postgres >/dev/null 2>&1; \
     pgbench -U postgres -c 8 -j 2 -T $SECS postgres 2>&1 | grep tps" | sed "s/^/  /"
   docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET log_min_duration_statement = -1" \
@@ -97,9 +97,9 @@ for v in $VERSIONS; do
 
   stats=$(docker exec "$C" psql -U postgres -Atc "SELECT pg_logtap_stats()")
   echo "  $stats"
-  cap=${stats#*captured=}; cap=${cap%% *}; cap=$((cap - bcap))
-  drp=${stats#*dropped=}; drp=${drp%% *}; drp=$((drp - bdrp))
-  exp=${stats#*exported=}; exp=${exp%% *}; exp=$((exp - bexp))
+  cap=${stats#*events_captured=}; cap=${cap%% *}; cap=$((cap - bcap))
+  drp=${stats#*events_dropped=}; drp=${drp%% *}; drp=$((drp - bdrp))
+  exp=${stats#*events_sent=}; exp=${exp%% *}; exp=$((exp - bexp))
   lines=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -f "$OUT/vector-out.jsonl" ] && lines=$(wc -l < "$OUT/vector-out.jsonl")
@@ -113,7 +113,7 @@ for v in $VERSIONS; do
     scripts/e2e-kill.sh "$C" || { echo "pg$v: kill-scenarios FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
     echo "  pg$v: OK"; docker rm -f "$C" >/dev/null
   else
-    echo "  pg$v: FAILED (dropped=$drp captured=$cap exported=$exp received=$lines)"
+    echo "  pg$v: FAILED (dropped=$drp captured=$cap sent=$exp received=$lines)"
     STATUS=1 # keep the container for post-mortem
   fi
   cleanup_vector

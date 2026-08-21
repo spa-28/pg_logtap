@@ -4,7 +4,8 @@ What pg_logtap promises, per failure scenario, with numbers. The assumptions:
 `ring_capacity` = R (default 1024, max 8192, POSTMASTER), capture rate = r events/s,
 `flush_interval` = f (default 1000 ms). One event ≈ 3.4 KB of shared memory
 (8192-slot ring ≈ 28 MB). Counters are **per cluster life** — shared memory dies
-with the postmaster, so `pg_logtap_stats()` restarts from zero on every restart.
+with the postmaster, so `pg_logtap_stats()` (and the `pg_logtap_delivery`
+view) restarts from zero on every restart.
 
 ## Semantics per destination
 
@@ -13,7 +14,7 @@ with the postmaster, so `pg_logtap_stats()` restarts from zero on every restart.
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
 | `tcp://` | **at-most-once** | none — `write(2)` success counts as delivered | none; a receiver dying after accept loses silently. Use `http://` for loss-sensitive receivers |
 | `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write retries the whole batch → duplicate lines possible |
-| fallback queue | durable (fdatasync per batch), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
+| fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
 
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
@@ -105,8 +106,10 @@ and must survive reboots and log cleanup.
 
 When an `http://`/`tcp://` send fails and the path is set, the batch is
 appended to the queue — one **gzip member per batch** behind a length framing
-(`PGLTFB01` magic, 0600, fdatasync per batch) — and counted as `exported`: it
-left pg_logtap durably. The queue is an internal format, not a tailable log.
+(`PGLTFB01` magic, 0600, fdatasynced once per flush cycle) — and counted as
+`events_queued`: it left pg_logtap durably, and is counted again as
+`events_replayed` when delivered. The queue is an internal format, not a
+tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
 step is involved. On restart the same replay happens automatically (scenario C
@@ -120,16 +123,19 @@ members again — dedup by `(host, seq)` as above makes that harmless. Events
 may also appear twice because the failed send that queued them may have
 partially landed — same dedup.
 
-Placement caveat, measured under a debug-level storm (~16k events/s, receiver
-down, plain NDJSON at the time): the queue shares the device with WAL, and the
-worker's writes + fdatasync compete with it — ~30% tps on a single disk
-(2626 quiet / 2317 live receiver / 1629 fallback). Compression cuts the bytes
-~30× (600 events: 310 KB plain → 9.5 KB queued), which removes most of the
-write-side contention; the per-batch fdatasync remains. Backends never block
-or wait on the queue; the cost is pure disk contention (the same storm with
-the file on a separate device recovered to ~2385). Keep it under PGDATA by
-default; if debug storms and receiver outages regularly coincide and the tps
-matters, give PGDATA (and the queue with it) its own device.
+Placement caveat, measured under a debug-level storm (~16k events/s, 16
+pgbench clients, receiver down, queue on the same overlay device as WAL):
+the queue costs ~5-10% tps (2480-2510 quiet / 2250-2390 with the queue
+absorbing everything, dropped=0 lost=0 across 11+ runs and 8-250 clients).
+Two properties buy that: compression (~30×: 600 events 310 KB plain →
+9.5 KB queued) and pooled buffers — the per-chunk ~100KB+ transients used
+to cross glibc's mmap threshold, and the resulting TLB shootdowns taxed
+every core; the worker now reuses its body/compressor/inflate buffers for
+the process life and fdatasyncs once per flush cycle, not per member.
+Backends never block or wait on the queue; the residual cost is disk
+contention with WAL. If debug storms and receiver outages regularly
+coincide and the tps matters, give PGDATA (and the queue with it) its
+own device.
 
 Transition lines in the server log mark divert start/stop:
 
@@ -138,20 +144,46 @@ pg_logtap export diverting batches to fallback file (receiver failing)
 pg_logtap fallback closed, receiver delivery resumed
 ```
 
-During catch-up after a long outage, live events wait in RAM while the queue
-drains first (order: queued events are older); if the live rate exceeds the
-drain rate for long enough, the RAM backlog drops oldest-first as usual
-(`export_lost`). Drain throughput is high — local read + gunzip + send — so
-this needs a sustained multi-thousand-events/s live rate on top of a large
-queue.
+During catch-up after a long outage, live events join the queue itself
+(appended after the older members, global seq order holds) rather than
+waiting in RAM — catch-up stays lossless even when the live rate exceeds the
+drain rate. The ring never idles behind `flush_interval` either: the worker
+publishes its latch in shared memory and the first event pushed into an empty
+ring wakes it immediately, so even a connection burst (~85k events/s from 16
+pgbench connects at debug1) is drained as it arrives instead of overflowing
+the ring during one sleep. The queue drains one gzip member per flush cycle
+(plus a bounded 64 members before the worker yields to counters/metrics/SIGHUP),
+so delivery resumes without a RAM-backlog loss path; `lost` can still grow
+only if the queue file itself becomes unreadable or the disk fills (then the
+RAM-backlog semantics apply to the excess).
 
 ## Alerting
 
 Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules.yml):
 
-- `PgLogtapEventsLost` — `increase(pg_logtap_export_lost_total[5m]) > 0`: backlog overflow, receiver too slow or down past R/r.
-- `PgLogtapRingDropped` — `increase(pg_logtap_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
-- `PgLogtapExportFailing` — `increase(pg_logtap_export_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
+- `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow, receiver too slow or down past R/r.
+- `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
+- `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
 
 Counters reset on restart (per cluster life) — `increase()` handles that
 natively as long as the Prometheus scrape interval is shorter than the restart.
+
+## Counter glossary
+
+Each event is counted once per lifecycle stage it actually passes through.
+The delivery invariant is `events_captured ≈ events_sent +
+(events_queued - events_replayed) + events_dropped + events_lost +
+in-flight/ring`. Names are identical in `pg_logtap_stats()` text, the
+`pg_logtap_delivery` view and the Prometheus exposition; the view adds
+derived `queue_backlog` and `delivered`.
+
+| counter | unit | grows when |
+|---|---|---|
+| `events_captured` | events | a log line entered the shared ring |
+| `events_dropped` | events | the ring was full at capture time (worker drain behind the capture rate) |
+| `events_sent` | events | delivered to the export URL by a live send |
+| `events_queued` | events | durably appended to the fallback file |
+| `events_replayed` | events | delivered out of the fallback file after the receiver recovered |
+| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, or an unreadable queue member skipped |
+| `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
+| `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

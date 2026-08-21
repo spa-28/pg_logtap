@@ -54,11 +54,17 @@ pub const ShmState = extern struct {
     write_pos: u32 = 0,
     read_pos: u32 = 0,
     count: u32 = 0,
+    /// The export worker's latch, published at worker start (0 = not yet).
+    /// Backends SetLatch it when the ring goes empty → non-empty, so a burst
+    /// is drained immediately instead of after a full flush_interval of sleep.
+    worker_latch: usize = 0,
     seq_next: u64 = 0,
     captured: u64 = 0,
     dropped: u64 = 0,
-    exported: u64 = 0,
-    export_failed: u64 = 0,
+    sent: u64 = 0,
+    queued: u64 = 0,
+    replayed: u64 = 0,
+    send_failed: u64 = 0,
     export_lost: u64 = 0,
 };
 
@@ -75,8 +81,10 @@ pub const Ring = struct {
 pub const Stats = struct {
     captured: u64,
     dropped: u64,
-    exported: u64,
-    export_failed: u64,
+    sent: u64,
+    queued: u64,
+    replayed: u64,
+    send_failed: u64,
     export_lost: u64,
     count: u32,
     capacity: u32,
@@ -124,8 +132,10 @@ pub fn snapshot(ring: Ring) Stats {
     return .{
         .captured = ring.state.captured,
         .dropped = ring.state.dropped,
-        .exported = ring.state.exported,
-        .export_failed = ring.state.export_failed,
+        .sent = ring.state.sent,
+        .queued = ring.state.queued,
+        .replayed = ring.state.replayed,
+        .send_failed = ring.state.send_failed,
         .export_lost = ring.state.export_lost,
         .count = ring.state.count,
         .capacity = ring.state.capacity,

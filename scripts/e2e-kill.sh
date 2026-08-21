@@ -78,27 +78,28 @@ dups=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" | sort | uniq -d | wc -l)
 [ "$(received a1)" = 20 ] && [ "$(received a3)" = 100 ] && [ "$(received a4)" = 20 ] \
   || fail "A: loss (a1=$(received a1) a3=$(received a3) a4=$(received a4))"
 [ "$dups" = 0 ] || fail "A: $dups duplicate seqs — dedup-by-seq contract broken"
-[ "$(statf lost)" = 0 ] && [ "$(statf dropped)" = 0 ] \
-  || fail "A: counters lost=$(statf lost) dropped=$(statf dropped)"
+[ "$(statf events_lost)" = 0 ] && [ "$(statf events_dropped)" = 0 ] \
+  || fail "A: counters lost=$(statf events_lost) dropped=$(statf events_dropped)"
 ok "140/140 delivered, 0 duplicate seqs, lost=0 dropped=0"
 
 echo "== B: SIGKILL postmaster with a backlog =="
 setguc pg_logtap.export_url "http://127.0.0.1:1"; setguc pg_logtap.export_fallback_file ''
 reload; sleep 2 # dead port: dial fails instantly, no fallback — pure RAM backlog
 # Baseline after the reload: the live URL may still export during the switch.
-base_cap=$(statf captured); base_exp=$(statf exported)
+base_cap=$(statf events_captured); base_exp=$(statf events_sent)
 gen b1 300; sleep 3
-[ $(( $(statf captured) - base_cap )) -ge 300 ] || fail "B: events not captured"
-[ $(( $(statf exported) - base_exp )) = 0 ] || fail "B: exported moved with a dead receiver"
-[ "$(statf lost)" = 0 ] || fail "B: backlog overflowed (ring too small for 300 events?)"
+[ $(( $(statf events_captured) - base_cap )) -ge 300 ] || fail "B: events not captured"
+[ $(( $(statf events_sent) - base_exp )) = 0 ] || fail "B: sent moved with a dead receiver"
+[ "$(statf events_lost)" = 0 ] || fail "B: backlog overflowed (ring too small for 300 events?)"
 pre_seq=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" | cut -d: -f2 | sort -n | tail -1)
 docker kill "$PG_CT" >/dev/null # SIGKILL: postmaster, worker, shmem — all gone
 docker start "$PG_CT" >/dev/null; wait_ready
-# Fresh shmem: only the postmaster's own boot noise is captured (<50 events),
-# nothing delivered. Had the old segment survived, captured would be ≥300.
-[ "$(statf captured)" -lt 50 ] && [ "$(statf exported)" = 0 ] && [ "$(statf lost)" = 0 ] \
+# Fresh shmem: only the postmaster's own boot noise is captured (well under
+# b1's 300 even at debug1 verbosity), nothing delivered. Had the old segment
+# survived, captured would be ≥300.
+[ "$(statf events_captured)" -lt 150 ] && [ "$(statf events_sent)" = 0 ] && [ "$(statf events_lost)" = 0 ] \
   || fail "B: counters did not reset from zero after restart"
-ok "counters fresh (captured=$(statf captured) boot noise); the 300 in-RAM events are the documented restart loss"
+ok "counters fresh (captured=$(statf events_captured) boot noise); the 300 in-RAM events are the documented restart loss"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 gen b2 20; wait_for b2 20
 new_min=$(seqs_of b2 | sort -n | head -1)
@@ -114,23 +115,23 @@ FB="$FB_DIR/$FB_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
-gen c1 600; sleep 3 # >2 chunks: multiple framed members
+gen c1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "C: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill c1" "$FB" 2>/dev/null && fail "C: file is plain text, not compressed"
-[ "$(statf lost)" = 0 ] || fail "C: lost>0 despite the fallback file"
-ok "receiver dead → 600 events queued compressed ($fb_sz bytes), lost=0"
+[ "$(statf events_lost)" = 0 ] || fail "C: lost>0 despite the fallback file"
+ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 # The queue is on disk: a cluster restart must not lose it — replay after boot.
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
-wait_for c1 600
-[ "$(received c1)" = 600 ] || fail "C: replay delivered $(received c1)/600"
+wait_for c1 2600
+[ "$(received c1)" = 2600 ] || fail "C: replay delivered $(received c1)/2600"
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 [ "$fb_sz" = 0 ] || fail "C: queue not truncated after replay ($fb_sz bytes left)"
 c1_dups=$(seqs_of c1 | sort | uniq -d | wc -l)
 [ "$c1_dups" = 0 ] || fail "C: $c1_dups duplicate seqs in replay"
-[ "$(statf lost)" = 0 ] || fail "C: lost>0 during replay"
-ok "restart + receiver back → 600/600 replayed, queue truncated, 0 duplicate seqs"
+[ "$(statf events_lost)" = 0 ] || fail "C: lost>0 during replay"
+ok "restart + receiver back → 2600/2600 replayed, queue truncated, 0 duplicate seqs"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
 echo "== D: worker kill -9 =="

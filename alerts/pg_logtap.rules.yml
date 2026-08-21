@@ -4,7 +4,7 @@ groups:
   - name: pg_logtap
     rules:
       - alert: PgLogtapEventsLost
-        expr: increase(pg_logtap_export_lost_total[5m]) > 0
+        expr: increase(pg_logtap_events_lost_total[5m]) > 0
         labels:
           severity: warning
         annotations:
@@ -14,7 +14,7 @@ groups:
             than ring_capacity / events_per_s, and oldest events were dropped.
             Loss is bounded by the backlog; see docs/delivery.md.
       - alert: PgLogtapRingDropped
-        expr: increase(pg_logtap_dropped_total[5m]) > 0
+        expr: increase(pg_logtap_events_dropped_total[5m]) > 0
         labels:
           severity: warning
         annotations:
@@ -24,7 +24,7 @@ groups:
             or the capture rate exceeds the drain rate. Check the worker
             process and receiver latency.
       - alert: PgLogtapExportFailing
-        expr: increase(pg_logtap_export_failed_total[5m]) > 0
+        expr: increase(pg_logtap_send_cycles_failed_total[5m]) > 0
         for: 5m
         labels:
           severity: info
