@@ -5,26 +5,42 @@
 //! http input, Logstash http input all do; a naive custom endpoint may not).
 const std = @import("std");
 
+/// The compressor state is ~256K (struct + window) — above glibc's mmap
+/// threshold, so per-call create/destroy costs an mmap/munmap + TLB
+/// shootdown on every core (measured as ring drops under a 16-client
+/// storm). The worker is single-threaded: keep one for the process life.
+var pool: ?struct { window: []u8, comp: *std.compress.flate.Compress } = null;
+
 /// gzip the batch, returning an owned slice. level_1: log text compresses
 /// 10-20x even at the cheapest setting, and keeps the worker's CPU low.
 pub fn compress(alloc: std.mem.Allocator, body: []const u8) error{ OutOfMemory, WriteFailed }![]u8 {
     // Compress.init asserts an output capacity > 8; .init starts empty.
     var out: std.Io.Writer.Allocating = try .initCapacity(alloc, 4096);
     defer out.deinit();
-    // The compressor needs a 32K window and is itself ~224K — heap, not stack.
-    const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
-    defer alloc.free(window);
-    const comp = try alloc.create(std.compress.flate.Compress);
-    defer alloc.destroy(comp);
-
-    comp.* = try std.compress.flate.Compress.init(&out.writer, window, .gzip, .level_1);
-    try comp.writer.writeAll(body);
-    try comp.finish();
+    if (pool == null) {
+        const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+        const comp = try alloc.create(std.compress.flate.Compress);
+        pool = .{ .window = window, .comp = comp };
+    }
+    pool.?.comp.* = try std.compress.flate.Compress.init(&out.writer, pool.?.window, .gzip, .level_1);
+    try pool.?.comp.writer.writeAll(body);
+    try pool.?.comp.finish();
     return alloc.dupe(u8, out.written());
+}
+
+/// Test hook: the worker keeps the pool for the process life; tests free it
+/// so the leak detector sees a clean heap.
+pub fn deinitPool(alloc: std.mem.Allocator) void {
+    if (pool) |p| {
+        alloc.free(p.window);
+        alloc.destroy(p.comp);
+        pool = null;
+    }
 }
 
 test "gzip roundtrip" {
     const alloc = std.testing.allocator;
+    defer deinitPool(alloc);
     const body = "pg_logtap gzip roundtrip line\n" ** 200; // ~6K compressible text
 
     const packed_body = try compress(alloc, body);

@@ -1,6 +1,8 @@
 //! Export background worker (one per cluster): drains the ring and pushes
 //! JSON lines to http/tcp/file. Unsent events retry from a worker-local
-//! backlog bounded by ring capacity (oldest dropped, counted in `lost`).
+//! backlog bounded by ring capacity (oldest dropped, counted in `lost`) —
+//! or, with export_fallback_file set, from a compressed on-disk queue that
+//! replays once the receiver answers (fb* helpers below).
 //! IO is plain blocking libc — the right shape for a bgworker loop.
 const std = @import("std");
 
@@ -22,14 +24,24 @@ const c = struct {
     extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
     extern "c" fn accept4(conn_fd: c_int, addr: ?*anyopaque, len: ?*u32, flags: c_int) c_int;
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
+    extern "c" fn fdatasync(fd: c_int) c_int;
+    extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
+    extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
+    extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
 };
 const net = std.c;
 
-const chunk_max = 256; // events per request / file write
+const chunk_max = 256; // events per request / queue member. 1024 measured
+// 40% SLOWER under a debug storm: the transient body/member buffers cross
+// glibc's mmap threshold and every flush cycle munmaps ~1MB — TLB shootdown
+// IPIs tax every core, postgres backends included. 256 keeps allocations on
+// the malloc heap and 4x more fdatasyncs cost less than that.
 const drain_batch = 64; // popped per lock round; stack-sized
 
 var guc_export_url: [*c]u8 = null;
+var guc_cluster_name: [*c]u8 = null;
 var guc_export_gzip: bool = false;
+var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_metrics_port: c_int = 0;
 
@@ -38,7 +50,9 @@ var got_sighup = interrupts.Signal.new(0);
 
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
@@ -68,6 +82,7 @@ pub fn workerMain() void {
     var pending: std.ArrayList(ring.ShmLogEntry) = .empty;
     defer pending.deinit(alloc);
     var names = NameCache{};
+    capture.setWorkerLatch(); // backends wake this worker on the first event
     syncMetricsListener();
     refreshSourceId();
 
@@ -89,6 +104,8 @@ pub fn workerMain() void {
 
 /// One cycle: interleave ring drains with chunk pushes. A slow POST no longer
 /// lets the ring fill up mid-cycle — the backlog absorbs the burst instead.
+/// While the fallback file holds undelivered events it IS the backlog: live
+/// events append to it and it drains to the receiver in order.
 fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry), names: *NameCache) void {
     if (guc_export_url == null or guc_export_url[0] == 0) return;
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
@@ -97,38 +114,98 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
         return;
     };
 
-    var exported: u64 = 0;
+    var sent: u64 = 0; // delivered by a live send
+    var queued: u64 = 0; // durably appended to the fallback file
+    var replayed: u64 = 0; // delivered out of the fallback file
     var failed: u64 = 0;
     var lost: u64 = 0;
+    var members: usize = 0; // members sent this cycle — bounded so a long
+    // catch-up still returns: counters bump, /metrics gets scraped, the latch
+    // honors SIGHUP/TERM. 64 members ≈ 16k events per flush_interval.
     var gzip_buf: ?[]u8 = null; // reused across chunks, freed on cycle exit
     defer if (gzip_buf) |z| alloc.free(z);
     while (!got_sigterm.isSet()) {
         drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
+
+        if (fbQueued()) {
+            // Queued events are older than anything live, so pending joins the
+            // queue first — global seq order holds — and the file drains to the
+            // receiver one member per iteration (the ring keeps draining through
+            // a long catch-up). Parking live events on disk rather than RAM is
+            // what makes catch-up lossless when the live rate exceeds the drain
+            // rate; logFallback(true) fires only on a failed send, never on
+            // these appends — a transition line per append would feed itself
+            // back through the hook into the queue, forever.
+            while (pending.items.len > 0) {
+                const count = @min(pending.items.len, chunk_max);
+                const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+                if (!fbAppend(alloc, body, false)) { // disk full → RAM-backlog semantics for the rest
+                    failed += 1;
+                    break;
+                }
+                dropFront(pending, count);
+                queued += count;
+            }
+            fbFsync();
+            const m = fbNextMember(alloc) orelse {
+                lost += fb_lost;
+                fb_lost = 0;
+                failed += @intFromBool(pending.items.len > 0); // append failed above
+                break;
+            };
+            lost += fb_lost;
+            fb_lost = 0;
+            const gz = gzipPayload(alloc, dest, m.body, &gzip_buf);
+            if (send(dest, url, gz.payload, gz.on)) {
+                logFallback(false);
+                // counted queued at append time; this is its delivery
+                replayed += std.mem.countScalar(u8, m.body, '\n');
+                fb_offset += m.advance;
+                if (fb_offset >= m.size) fbTruncate(); // fully delivered → back to direct sends
+                members += 1;
+                if (members < 64) continue;
+                break; // hand the loop back: counters, metrics, latch
+            }
+            logFallback(true); // receiver down: divert starts (transition-guarded)
+            failed += 1;
+            break; // retry the queue next cycle
+        }
+
         if (pending.items.len == 0) break;
         const count = @min(pending.items.len, chunk_max);
-        var body_w: std.Io.Writer.Allocating = .init(alloc);
-        defer body_w.deinit();
-        for (pending.items[0..count]) |*e| {
-            jsonl.writeEntry(&body_w.writer, e, names.lookup(e)) catch break;
-            body_w.writer.writeByte('\n') catch break;
-        }
-        if (gzip_buf) |z| { // previous chunk's compressed body
-            alloc.free(z);
-            gzip_buf = null;
-        }
-        const gz = gzipPayload(alloc, dest, body_w.written(), &gzip_buf);
+        const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+        const gz = gzipPayload(alloc, dest, body, &gzip_buf);
         if (send(dest, url, gz.payload, gz.on)) {
+            logFallback(false);
             dropFront(pending, count);
-            exported += count;
+            sent += count;
+        } else if (fbAppend(alloc, body, true)) {
+            logFallback(true);
+            dropFront(pending, count);
+            queued += count; // durably parked: counted replayed on delivery
         } else {
-            failed += 1; // counts failed flush CYCLES, not events (A8: no double counting)
+            failed += 1; // counts failed flush CYCLES, not events
             break; // retry the backlog next cycle
         }
     }
 
-    capture.bumpExport(exported, failed, lost);
-    logTransitions(exported, failed, lost);
+    capture.bumpExport(sent, queued, replayed, failed, lost);
+    logTransitions(sent + replayed, failed, lost);
+}
+
+/// pending slice → NDJSON body (one JSON line per event), built in a REUSED
+/// buffer: a fresh ~100KB chunk body sits above glibc's mmap threshold, and
+/// the per-chunk mmap/munmap + TLB shootdowns stall every core — measured as
+/// ring drops under a 16-client storm. The slice is valid until the next call.
+/// null = formatting failed (OOM); the caller retries the chunk next cycle.
+fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, names: *NameCache) ?[]const u8 {
+    w.writer.end = 0; // reset, keep capacity
+    for (entries) |*e| {
+        jsonl.writeEntry(&w.writer, e, names.lookup(e)) catch return null;
+        w.writer.writeByte('\n') catch return null;
+    }
+    return w.writer.buffer[0..w.writer.end];
 }
 
 /// Ring → backlog. OOM counts the drained events as lost (ring is already drained).
@@ -138,7 +215,7 @@ fn drainInto(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry)
         const count = capture.drainBatch(&batch);
         if (count == 0) return;
         pending.appendSlice(alloc, batch[0..count]) catch {
-            capture.bumpExport(0, 0, count);
+            capture.bumpExport(0, 0, 0, 0, count);
             return;
         };
     }
@@ -162,11 +239,11 @@ fn dropFront(list: *std.ArrayList(ring.ShmLogEntry), count: usize) void {
 
 var was_failing = false;
 
-fn logTransitions(exported: u64, failed: u64, lost: u64) void {
+fn logTransitions(delivered: u64, failed: u64, lost: u64) void {
     if (failed > 0 and !was_failing) {
         elog.Log(@src(), "pg_logtap export failing ({s}), events buffered (pending retry)", .{fail_reason});
     } else if (failed == 0 and was_failing) {
-        elog.Log(@src(), "pg_logtap export recovered, exported={d} lost_total_logged={d}", .{ exported, lost });
+        elog.Log(@src(), "pg_logtap export recovered, delivered={d} lost_total_logged={d}", .{ delivered, lost });
     }
     was_failing = failed > 0;
     if (lost > 0) elog.Log(@src(), "pg_logtap backlog overflow: {d} events lost", .{lost});
@@ -182,15 +259,19 @@ fn warnUrlOnce(url: []const u8) void {
 
 // --- source identity (multi-host → one Vector): stamped into every event ------
 
-/// hostname and pgdata never change; cluster_name is SIGHUP-able, hence the
-/// refresh on reload. ponytail: leaks ~50 bytes per reload — reloads are rare.
+/// hostname and pgdata never change; pg_logtap.cluster_name is SIGHUP-able,
+/// hence the refresh on reload. ponytail: leaks ~50 bytes per reload — reloads
+/// are rare.
 fn refreshSourceId() void {
     var buf: [128]u8 = undefined;
     @memset(&buf, 0);
     if (c.gethostname(&buf, buf.len - 1) == 0) {
         jsonl.source_host = std.heap.c_allocator.dupe(u8, std.mem.sliceTo(&buf, 0)) catch "";
     }
-    jsonl.source_cluster = gucStr("cluster_name");
+    // The override wins; otherwise reuse the server's cluster_name (which is
+    // POSTMASTER — restart-to-change, hence this SIGHUP GUC).
+    jsonl.source_cluster = gucStr("pg_logtap.cluster_name");
+    if (jsonl.source_cluster.len == 0) jsonl.source_cluster = gucStr("cluster_name");
     jsonl.source_pgdata = gucStr("data_directory");
 }
 
@@ -238,10 +319,15 @@ const NameCache = struct {
 
 /// gzip the batch for the http destination when export_gzip is on; plain
 /// bytes otherwise. OOM falls back to plain — compression is an
-/// optimization, not a guarantee.
+/// optimization, not a guarantee. Frees the previous cached payload itself;
+/// the caller frees the last one (flushAll's defer).
 fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, out: *?[]u8) struct { payload: []const u8, on: bool } {
     if (!guc_export_gzip or dest != .http) return .{ .payload = body, .on = false };
-    out.* = gzip.compress(alloc, body) catch return .{ .payload = body, .on = false };
+    if (out.*) |old| alloc.free(old);
+    out.* = gzip.compress(alloc, body) catch {
+        out.* = null;
+        return .{ .payload = body, .on = false };
+    };
     return .{ .payload = out.*.?, .on = true };
 }
 
@@ -252,6 +338,218 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gz: bool) bool {
         .tcp => |t| sendRaw(dialTcp(t.host, t.port), body),
         .file => |path| sendFile(path, body),
     };
+}
+
+// --- fallback file: compressed durable queue, replayed on recovery ------------
+//
+// Internal framing, one batch per member: [8-byte magic][u32 LE len][gzip]…
+// A crash mid-append leaves a torn tail member — detected by the short read,
+// truncated, appends resume at the member boundary. A crash mid-replay loses
+// only the in-memory offset: replay restarts from byte 0, so the receiver may
+// see duplicates — dedup by (host, seq), the http at-least-once contract.
+
+const fb_magic = "PGLTFB01";
+const fb_magic_len = 8;
+
+/// Consumed prefix of the queue (magic + members), worker-local. 0 also means
+/// "magic not verified yet".
+var fb_offset: u64 = 0;
+/// Foreign or corrupt framing — never append to or replay such a file; the
+/// RAM backlog takes over until the GUC is repointed or the server restarts.
+var fb_broken = false;
+/// Members skipped as unreadable (framing intact, gzip damaged) — folded into
+/// `lost` by the flush cycle that read them.
+var fb_lost: u64 = 0;
+
+var fb_path_buf: [4096]u8 = undefined;
+var fb_path_len: usize = 0;
+
+/// Resolve the GUC (relative → data directory, the log_directory convention;
+/// the queue belongs with the data). Repointing the GUC orphans the old queue
+/// (its events stay on disk for a manual drain) and resets consumer state.
+fn fallbackPath() ?[]const u8 {
+    if (guc_export_fallback_file == null) return null;
+    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_fallback_file)));
+    if (raw.len == 0 or raw.len + 1 > fb_path_buf.len) return null;
+    var tmp: [4096]u8 = undefined;
+    const full = blk: {
+        if (raw[0] == '/') break :blk raw;
+        if (pg.DataDir == null) return null;
+        const dd = std.mem.span(@as([*:0]const u8, @ptrCast(pg.DataDir)));
+        break :blk std.fmt.bufPrint(&tmp, "{s}/{s}", .{ dd, raw }) catch return null;
+    };
+    if (full.len != fb_path_len or !std.mem.eql(u8, fb_path_buf[0..fb_path_len], full)) {
+        fb_path_len = full.len;
+        @memcpy(fb_path_buf[0..full.len], full);
+        fb_path_buf[full.len] = 0;
+        fb_offset = 0;
+        fb_broken = false;
+    }
+    return fb_path_buf[0..fb_path_len];
+}
+
+fn fbOpen() ?c_int {
+    if (fallbackPath() == null) return null;
+    // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
+    // immune to the append position. 0600: not world-readable (C2).
+    const fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
+    return if (fd >= 0) fd else null;
+}
+
+fn fbSize(fd: c_int) ?u64 {
+    const end = c.lseek(fd, 0, 2); // SEEK_END
+    return if (end >= 0) @intCast(end) else null;
+}
+
+/// One pread; a regular file returns the full request unless EOF/EINTR-short.
+fn fbPread(fd: c_int, buf: []u8, offset: u64) isize {
+    return c.pread(fd, buf.ptr, buf.len, @intCast(offset));
+}
+
+/// True while the fallback file holds undelivered events — flushAll then
+/// routes everything through it to keep global order.
+fn fbQueued() bool {
+    if (fb_broken or fallbackPath() == null) return false;
+    const fd = fbOpen() orelse return false;
+    defer _ = c.close(fd);
+    const size = fbSize(fd) orelse return false;
+    return if (fb_offset == 0) size > fb_magic_len else size > fb_offset;
+}
+
+/// Append one batch as a framed gzip member. `sync` fdatasyncs this member;
+/// false defers to one fbFsync() per flush cycle — per-member syncs on a
+/// WAL-shared disk stall the worker past the ring's drain window (measured:
+/// 5k dropped in a 16-client storm). Success = the events left pg_logtap
+/// (page cache survives postmaster death; an OS crash loses the unsynced tail).
+fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
+    if (fb_broken) return false;
+    const fd = fbOpen() orelse return false;
+    defer _ = c.close(fd);
+    const size = fbSize(fd) orelse return false;
+    if (size == 0) {
+        if (!writeAll(fd, fb_magic)) return false;
+    } else {
+        var magic: [fb_magic_len]u8 = undefined;
+        if (size < fb_magic_len or fbPread(fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+            fb_broken = true;
+            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{fallbackPath() orelse ""});
+            return false;
+        }
+    }
+    const gz = gzip.compress(alloc, body) catch return false; // compression failed → RAM backlog retries
+    defer alloc.free(gz);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(gz.len), .little);
+    if (!writeAll(fd, &len_buf) or !writeAll(fd, gz)) return false;
+    return !sync or c.fdatasync(fd) == 0;
+}
+
+/// Durability point for a cycle's deferred appends.
+fn fbFsync() void {
+    if (fb_broken or fallbackPath() == null) return;
+    const fd = fbOpen() orelse return;
+    defer _ = c.close(fd);
+    _ = c.fdatasync(fd);
+}
+
+/// One queued batch: decompressed NDJSON, the byte size at read time, and how
+/// far fb_offset advances past it. body borrows the reused inflate buffer —
+/// valid until the next fbNextMember.
+const FbMember = struct { body: []const u8, size: u64, advance: u64 };
+
+// Reused inflate state: the 32K window and the ~100K+ decompressed member
+// sit above glibc's mmap threshold — same story as the gzip pool.
+var fb_dec: ?struct { window: []u8, body: std.Io.Writer.Allocating } = null;
+
+// Ditto for the NDJSON chunk body (~100K): one for the process life, or every
+// flush cycle pays an mmap/munmap.
+var fb_body: ?std.Io.Writer.Allocating = null;
+
+fn bodyWriter(alloc: std.mem.Allocator) *std.Io.Writer.Allocating {
+    if (fb_body == null) fb_body = .init(alloc);
+    return &fb_body.?;
+}
+
+/// Read the member at fb_offset. null = nothing replayable right now (drained,
+/// torn tail truncated away, unreadable member skipped, or the file is not
+/// ours). Torn tail: crash mid-append left a short member — truncated so
+/// appends resume at a member boundary.
+fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
+    if (fb_broken) return null;
+    const fd = fbOpen() orelse return null;
+    defer _ = c.close(fd);
+    const size = fbSize(fd) orelse return null;
+    if (fb_offset == 0) {
+        if (size <= fb_magic_len) return null;
+        var magic: [fb_magic_len]u8 = undefined;
+        if (fbPread(fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+            fb_broken = true;
+            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{fallbackPath() orelse ""});
+            return null;
+        }
+        fb_offset = fb_magic_len;
+    }
+    if (fb_offset >= size) return null;
+    var len_buf: [4]u8 = undefined;
+    if (fbPread(fd, &len_buf, fb_offset) != 4) return null;
+    const mlen = std.mem.readInt(u32, &len_buf, .little);
+    if (mlen == 0 or mlen > 512 * 1024 * 1024) {
+        fb_broken = true;
+        elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{fb_offset});
+        return null;
+    }
+    const gz = alloc.alloc(u8, mlen) catch return null;
+    if (fbPread(fd, gz, fb_offset + 4) != mlen) { // torn tail
+        alloc.free(gz);
+        _ = c.ftruncate(fd, @intCast(fb_offset));
+        return null;
+    }
+    defer alloc.free(gz);
+    if (fb_dec == null) fb_dec = .{
+        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return null,
+        .body = .init(alloc),
+    };
+    const d = &fb_dec.?;
+    var src: std.Io.Reader = .fixed(gz);
+    var dec = std.compress.flate.Decompress.init(&src, .gzip, d.window);
+    d.body.writer.end = 0;
+    _ = dec.reader.streamRemaining(&d.body.writer) catch {
+        const at = fb_offset; // framing is intact: skip past, count as loss
+        fb_offset += 4 + mlen;
+        fb_lost += 1;
+        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{at});
+        return null;
+    };
+    if (d.body.writer.end > mlen * 64 + 65536) { // inflated absurdly: corrupt, skip
+        const at = fb_offset;
+        fb_offset += 4 + mlen;
+        fb_lost += 1;
+        elog.Log(@src(), "pg_logtap fallback member at offset {d} inflated past sanity, skipped", .{at});
+        return null;
+    }
+    return .{ .body = d.body.writer.buffer[0..d.body.writer.end], .size = size, .advance = 4 + @as(u64, mlen) };
+}
+
+/// Queue fully delivered: zero it (the next append re-creates the magic) and
+/// return to direct sends.
+fn fbTruncate() void {
+    const fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1, @as(c_uint, 0o600)); // O_WRONLY
+    if (fd < 0) return;
+    defer _ = c.close(fd);
+    if (c.ftruncate(fd, 0) == 0) fb_offset = 0;
+}
+
+/// Fallback on/off transitions only — same discipline as export failures.
+var was_fallback = false;
+
+fn logFallback(active: bool) void {
+    if (active == was_fallback) return;
+    was_fallback = active;
+    if (active) {
+        elog.Log(@src(), "pg_logtap export diverting batches to fallback file (receiver failing)", .{});
+    } else {
+        elog.Log(@src(), "pg_logtap fallback closed, receiver delivery resumed", .{});
+    }
 }
 
 fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
@@ -286,11 +584,15 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     var pbuf: [4096]u8 = undefined;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    // O_WRONLY|O_CREAT|O_APPEND (Linux), 0600: export file must not be world-readable (C2).
-    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 512, @as(c_uint, 0o600));
+    // O_WRONLY|O_CREAT|O_APPEND (Linux: 1|64|1024 — 512 is O_TRUNC, which
+    // silently keeps only the last batch), 0600: not world-readable (C2).
+    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
     if (conn_fd < 0) return false;
     defer _ = c.close(conn_fd);
-    return writeAll(conn_fd, body);
+    if (!writeAll(conn_fd, body)) return false;
+    // Durable per batch: the page cache survives process death but not OS
+    // death. One fdatasync per flush cycle is cheap next to the write itself.
+    return c.fdatasync(conn_fd) == 0;
 }
 
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.

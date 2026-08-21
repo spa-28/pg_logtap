@@ -102,6 +102,11 @@ fn shmemStartupHook() callconv(.c) void {
     if (!found) {
         state.* = std.mem.zeroes(ring.ShmState);
         state.capacity = @intCast(cap);
+        // Seed seq from the wall clock (µs since 2000-01-01): each second of
+        // uptime advances the seed by 1e6 but consumes <1e6 values unless the
+        // capture rate exceeds 1M events/s, so seq never repeats on a host
+        // across restarts — receivers may dedup on (host, seq) long-term.
+        state.seq_next = @intCast(pg.GetCurrentTimestamp());
         @memset(entries, std.mem.zeroes(ring.ShmLogEntry));
     }
     pg.LWLockInitialize(@ptrCast(&state.lock), tranche_id);
@@ -123,6 +128,12 @@ fn unlockRing() void {
 fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (prev_hook) |p| p(edata);
     if (!ready or in_hook) return;
+    // The postmaster runs this hook for its own lines too — and during an
+    // emergency restart it logs from inside PGSharedMemoryCreate, after the
+    // old segment is already unmapped: `state` dangles there and even a read
+    // SEGVs (gdb: emitLogHook ← PGSharedMemoryCreate). PGPROC-less callers
+    // are exactly that process — skip them; their lines still reach stderr.
+    if (pg.MyProc == null) return;
     if (edata == null) return;
     const d = edata.*;
     if (d.message == null) return;
@@ -157,8 +168,14 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (guc_field_query) copyStr(&entry.query, &entry, .query, pg.debug_query_string);
 
     lockRing();
+    const was_empty = state.count == 0;
     _ = ring.push(ring.Ring.init(state, entries), entry);
     unlockRing();
+    // Wake the worker the moment the ring goes non-empty: a connection burst
+    // at debug1 (~85k events/s from 16 pgbench connects) fills the whole ring
+    // in one 100ms sleep otherwise. SetLatch on the worker's shmem latch is
+    // the standard inter-process poke in PostgreSQL.
+    if (was_empty and state.worker_latch != 0) pg.SetLatch(@ptrFromInt(state.worker_latch));
 }
 
 /// Copy a C string field into the entry, tracking truncation in its mask.
@@ -186,11 +203,26 @@ pub fn capacity() u32 {
     return if (ready) state.capacity else 0;
 }
 
-pub fn bumpExport(exported: u64, failed: u64, lost: u64) void {
+/// The worker publishes its latch so backends can wake it on the first
+/// pushed event (see hookLog). Re-published on every worker (re)start.
+pub fn setWorkerLatch() void {
     if (!ready) return;
     lockRing();
-    state.exported += exported;
-    state.export_failed += failed;
+    state.worker_latch = @intFromPtr(pg.MyLatch);
+    unlockRing();
+}
+
+/// Lifecycle counters — one event is counted exactly once per stage it
+/// passes through: sent (live send), queued (fallback-file append),
+/// replayed (queue member delivered after recovery). Stuck in the queue
+/// right now = queued - replayed. failed counts CYCLES, not events.
+pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64) void {
+    if (!ready) return;
+    lockRing();
+    state.sent += sent;
+    state.queued += queued;
+    state.replayed += replayed;
+    state.send_failed += failed;
     state.export_lost += lost;
     unlockRing();
 }
@@ -241,9 +273,30 @@ fn resolveNames(entry: *const ring.ShmLogEntry) jsonl.Names {
 pub fn statsText(buf: []u8) ?[]const u8 {
     if (!ready) return "shmem not initialized (shared_preload_libraries?)";
     const snap = snapshot();
-    return std.fmt.bufPrint(buf, "captured={d} dropped={d} exported={d} failed={d} lost={d} count={d} capacity={d}", .{
-        snap.captured, snap.dropped, snap.exported, snap.export_failed, snap.export_lost, snap.count, snap.capacity,
+    // Same names and order as the pg_logtap_delivery view columns.
+    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d}", .{
+        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.send_failed, snap.export_lost, snap.count, snap.capacity,
     }) catch "stats overflow";
+}
+
+/// Same counters as JSON with the full column names of pg_logtap_delivery
+/// (plus the derived queue_backlog / delivered).
+pub fn statsJson(buf: []u8) ?[]const u8 {
+    if (!ready) return "{\"events_captured\":0}"; // shmem not up: zero row
+    const snap = snapshot();
+    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d}}}", .{
+        snap.captured,
+        snap.dropped,
+        snap.sent,
+        snap.queued,
+        snap.replayed,
+        snap.queued -| snap.replayed,
+        snap.sent +| snap.replayed,
+        snap.export_lost,
+        snap.send_failed,
+        snap.count,
+        snap.capacity,
+    }) catch "{\"events_captured\":0}";
 }
 
 /// Consistent counter/gauge snapshot for /metrics.

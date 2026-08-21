@@ -28,6 +28,10 @@ jobs:
       - run: zig build fmt --summary all
       - run: zig build lint --summary all
       - run: zig build test --summary all
+      # `zig build test` does not compile the library itself (only the test
+      # module) — broken src/ code has passed it. Compile the .so here too,
+      # in the fast job, instead of waiting for the four matrix jobs.
+      - run: zig build --summary all
 
   matrix:
     runs-on: ubuntu-latest

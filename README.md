@@ -31,7 +31,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~29k events/s.
-- **Retry backlog** — receiver down? Events buffer in the worker (bounded, oldest-dropped with a `lost` counter) and retry.
+- **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
 
@@ -107,7 +107,9 @@ GUCs and restart again.
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
+| `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
 | `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
+| `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed `http://`/`tcp://` batches go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 
@@ -115,7 +117,7 @@ GUCs and restart again.
 
 - `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS);
 - `tcp://host:port` — raw JSON lines;
-- `file:///abs/path` — append, mode 0600.
+- `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
 (`Content-Encoding: gzip`) — same NDJSON after decompression, just less
@@ -184,13 +186,37 @@ on fixed-size copy. Overlong fields are cut on UTF-8 boundaries.
 ## Monitoring
 
 ```sql
-SELECT pg_logtap_stats();                  -- captured/dropped/exported/failed/lost/count/capacity
+SELECT * FROM pg_logtap_delivery;          -- monitoring view, one row (see below)
+SELECT pg_logtap_stats();                  -- same counters as compact text
 SELECT unnest(pg_logtap_dump(100));        -- last events as JSON, non-destructive
 ```
 
-With `metrics_port` set: `pg_logtap_{captured,dropped,exported,export_failed,
-export_lost}_total` (counters) + `pg_logtap_ring_{count,capacity}` (gauges),
-plus `/healthz`. No TLS/auth — closed networks only.
+Event counters — same names in `pg_logtap_stats()` text, the
+`pg_logtap_delivery` view and the Prometheus exposition (each event counted
+once per lifecycle stage it passes; stuck in the fallback queue right now =
+`events_queued - events_replayed`):
+
+| counter | unit | grows when |
+|---|---|---|
+| `events_captured` | events | a log line entered the shared ring |
+| `events_dropped` | events | the ring was full at capture — worker drain behind the rate |
+| `events_sent` | events | delivered to the export URL by a live send |
+| `events_queued` | events | durably appended to the fallback file |
+| `events_replayed` | events | delivered out of the fallback file after recovery |
+| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, or an unreadable queue member |
+| `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
+| `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
+
+The view adds two derived columns: `queue_backlog` (`events_queued −
+events_replayed`, stuck in the file right now) and `delivered`
+(`events_sent + events_replayed`, everything handed to a receiver).
+
+With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
+events_sent,events_queued,events_replayed,send_cycles_failed,events_lost}_total`
+(counters) + `pg_logtap_ring_{events,capacity}` (gauges),
+plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
+[`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
+dropped, export failing).
 
 ## Development & Testing
 

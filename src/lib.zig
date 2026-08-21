@@ -13,6 +13,7 @@ comptime {
     fmgr.PG_MODULE_MAGIC();
     fmgr.PG_FUNCTION_INFO_V1("pg_logtap_version");
     fmgr.PG_FUNCTION_INFO_V1("pg_logtap_stats");
+    fmgr.PG_FUNCTION_INFO_V1("pg_logtap_stats_json");
     fmgr.PG_FUNCTION_INFO_V1("pg_logtap_dump");
     fmgr.PG_FUNCTION_INFO_V1("pg_logtap_worker");
 }
@@ -26,8 +27,15 @@ export fn pg_logtap_version(fcinfo: pg.FunctionCallInfo) pg.Datum {
 export fn pg_logtap_stats(fcinfo: pg.FunctionCallInfo) pg.Datum {
     _ = fcinfo;
     // statsText prints into zbuf (leaving one zero byte as NUL terminator).
-    var zbuf: [192]u8 = [_]u8{0} ** 192;
+    var zbuf: [384]u8 = [_]u8{0} ** 384;
     _ = capture.statsText(zbuf[0 .. zbuf.len - 1]);
+    return @intFromPtr(pg.cstring_to_text(@ptrCast(&zbuf)));
+}
+
+export fn pg_logtap_stats_json(fcinfo: pg.FunctionCallInfo) pg.Datum {
+    _ = fcinfo;
+    var zbuf: [384]u8 = [_]u8{0} ** 384;
+    _ = capture.statsJson(zbuf[0 .. zbuf.len - 1]);
     return @intFromPtr(pg.cstring_to_text(@ptrCast(&zbuf)));
 }
 

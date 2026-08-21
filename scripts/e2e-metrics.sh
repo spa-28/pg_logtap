@@ -24,7 +24,7 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'metric
 
 got=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  [ -f "$OUT" ] && got=$(grep -c 'pg_logtap_captured_total' "$OUT" 2>/dev/null || true)
+  [ -f "$OUT" ] && got=$(grep -c 'pg_logtap_events_captured_total' "$OUT" 2>/dev/null || true)
   [ "$got" -ge 1 ] && break
   sleep 1
 done
