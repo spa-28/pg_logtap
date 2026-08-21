@@ -1,0 +1,36 @@
+# Prometheus alert rules for pg_logtap (see docs/delivery.md for the contract).
+# Load e.g.: prometheus --rules.alerts.file ... or wire into your rule_dirs.
+groups:
+  - name: pg_logtap
+    rules:
+      - alert: PgLogtapEventsLost
+        expr: increase(pg_logtap_export_lost_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_logtap lost events on {{ $labels.instance }}"
+          description: >-
+            Backlog overflow: the receiver was down or too slow for longer
+            than ring_capacity / events_per_s, and oldest events were dropped.
+            Loss is bounded by the backlog; see docs/delivery.md.
+      - alert: PgLogtapRingDropped
+        expr: increase(pg_logtap_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_logtap capture ring full on {{ $labels.instance }}"
+          description: >-
+            Events were dropped at capture time: the export worker is stalled
+            or the capture rate exceeds the drain rate. Check the worker
+            process and receiver latency.
+      - alert: PgLogtapExportFailing
+        expr: increase(pg_logtap_export_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "pg_logtap export failing on {{ $labels.instance }}"
+          description: >-
+            Sends to export_url have been failing for 5m. Events buffer in
+            the bounded backlog (and the fallback queue, if set); they start
+            dropping once it fills.

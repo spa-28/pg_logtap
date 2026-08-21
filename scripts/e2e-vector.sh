@@ -40,5 +40,5 @@ sleep 2
 
 echo "events_sent=$EVENTS vector_received=$(wc -l < "$OUT") distinct_messages=$(grep -o 'logtap e2e event [0-9]*' "$OUT" 2>/dev/null | sort -u | wc -l)"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
-docker rm -f pglogtap-vector >/dev/null
+docker rm -f pglogtap-vector-e2e >/dev/null
 [ "$got" -ge "$EVENTS" ]

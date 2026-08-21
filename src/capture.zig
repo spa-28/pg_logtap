@@ -102,6 +102,11 @@ fn shmemStartupHook() callconv(.c) void {
     if (!found) {
         state.* = std.mem.zeroes(ring.ShmState);
         state.capacity = @intCast(cap);
+        // Seed seq from the wall clock (µs since 2000-01-01): each second of
+        // uptime advances the seed by 1e6 but consumes <1e6 values unless the
+        // capture rate exceeds 1M events/s, so seq never repeats on a host
+        // across restarts — receivers may dedup on (host, seq) long-term.
+        state.seq_next = @intCast(pg.GetCurrentTimestamp());
         @memset(entries, std.mem.zeroes(ring.ShmLogEntry));
     }
     pg.LWLockInitialize(@ptrCast(&state.lock), tranche_id);
@@ -123,6 +128,12 @@ fn unlockRing() void {
 fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (prev_hook) |p| p(edata);
     if (!ready or in_hook) return;
+    // The postmaster runs this hook for its own lines too — and during an
+    // emergency restart it logs from inside PGSharedMemoryCreate, after the
+    // old segment is already unmapped: `state` dangles there and even a read
+    // SEGVs (gdb: emitLogHook ← PGSharedMemoryCreate). PGPROC-less callers
+    // are exactly that process — skip them; their lines still reach stderr.
+    if (pg.MyProc == null) return;
     if (edata == null) return;
     const d = edata.*;
     if (d.message == null) return;
