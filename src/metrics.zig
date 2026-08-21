@@ -65,9 +65,9 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\pg_logtap_ring_capacity {d}
         \\
     , .{
-        snap.captured,   snap.dropped,    snap.sent,
-        snap.queued,     snap.replayed,   snap.send_failed,
-        snap.export_lost, snap.count,     snap.capacity,
+        snap.captured,    snap.dropped,  snap.sent,
+        snap.queued,      snap.replayed, snap.send_failed,
+        snap.export_lost, snap.count,    snap.capacity,
     });
 }
 
