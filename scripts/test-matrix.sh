@@ -15,14 +15,17 @@ STATUS=0
 cleanup_vector() { docker rm -f pglogtap-vector-mx >/dev/null 2>&1 || true; }
 trap cleanup_vector EXIT
 
-# Restart/run readiness: poll instead of a fixed sleep — CI runners are
-# slower than a local docker daemon and postgres needs 5-15s there.
+# Readiness via the container healthcheck: wait for State.Health=healthy.
+# The probe is TCP (127.0.0.1) on purpose — the official image's temporary
+# initdb server listens on the unix socket only and would answer a plain
+# pg_isready, flipping the container healthy before the real server exists
+# (random CI failure: next psql hits a dead socket).
 wait_ready() {
-  for _ in $(seq 1 30); do
-    docker exec "$1" pg_isready -U postgres -q 2>/dev/null && return 0
+  for _ in $(seq 1 60); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$1" 2>/dev/null)" = healthy ] && return 0
     sleep 1
   done
-  echo "pg in $1 not ready after 30s" >&2; return 1
+  echo "pg in $1 not ready after 60s" >&2; return 1
 }
 
 # Release artifacts are built against the oldest glibc among current distros
@@ -41,7 +44,10 @@ for v in $VERSIONS; do
   fi
 
   docker rm -f "$C" >/dev/null 2>&1 || true
-  docker run -d --name "$C" --network "$NET" -e POSTGRES_PASSWORD=dev "postgres:$v" >/dev/null
+  docker run -d --name "$C" --network "$NET" -e POSTGRES_PASSWORD=dev \
+    --health-cmd 'pg_isready -U postgres -h 127.0.0.1' \
+    --health-interval 2s --health-timeout 3s --health-retries 10 \
+    "postgres:$v" >/dev/null
   wait_ready "$C"
   LIBDIR=$(docker exec "$C" pg_config --pkglibdir)
   EXTDIR=$(docker exec "$C" pg_config --sharedir)/extension
