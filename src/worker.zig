@@ -12,6 +12,7 @@ const ring = @import("ring.zig");
 const jsonl = @import("jsonl.zig");
 const capture = @import("capture.zig");
 const dest_mod = @import("export.zig");
+const gzip = @import("gzip.zig");
 const metrics = @import("metrics.zig");
 
 /// libc socket/open wrappers: stable, boring, no std.Io plumbing.
@@ -28,6 +29,7 @@ const chunk_max = 256; // events per request / file write
 const drain_batch = 64; // popped per lock round; stack-sized
 
 var guc_export_url: [*c]u8 = null;
+var guc_export_gzip: bool = false;
 var guc_flush_interval: c_int = 1000;
 var guc_metrics_port: c_int = 0;
 
@@ -36,6 +38,7 @@ var got_sighup = interrupts.Signal.new(0);
 
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
@@ -97,6 +100,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
     var exported: u64 = 0;
     var failed: u64 = 0;
     var lost: u64 = 0;
+    var gzip_buf: ?[]u8 = null; // reused across chunks, freed on cycle exit
+    defer if (gzip_buf) |z| alloc.free(z);
     while (!got_sigterm.isSet()) {
         drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
@@ -108,7 +113,12 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
             jsonl.writeEntry(&body_w.writer, e, names.lookup(e)) catch break;
             body_w.writer.writeByte('\n') catch break;
         }
-        if (send(dest, url, body_w.written())) {
+        if (gzip_buf) |z| { // previous chunk's compressed body
+            alloc.free(z);
+            gzip_buf = null;
+        }
+        const gz = gzipPayload(alloc, dest, body_w.written(), &gzip_buf);
+        if (send(dest, url, gz.payload, gz.on)) {
             dropFront(pending, count);
             exported += count;
         } else {
@@ -226,21 +236,32 @@ const NameCache = struct {
 
 // --- senders -------------------------------------------------------------------
 
-fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8) bool {
+/// gzip the batch for the http destination when export_gzip is on; plain
+/// bytes otherwise. OOM falls back to plain — compression is an
+/// optimization, not a guarantee.
+fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, out: *?[]u8) struct { payload: []const u8, on: bool } {
+    if (!guc_export_gzip or dest != .http) return .{ .payload = body, .on = false };
+    out.* = gzip.compress(alloc, body) catch return .{ .payload = body, .on = false };
+    return .{ .payload = out.*.?, .on = true };
+}
+
+fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gz: bool) bool {
     _ = url;
     return switch (dest) {
-        .http => |h| sendHttp(h, body),
+        .http => |h| sendHttp(h, body, gz),
         .tcp => |t| sendRaw(dialTcp(t.host, t.port), body),
         .file => |path| sendFile(path, body),
     };
 }
 
-fn sendHttp(h: anytype, body: []const u8) bool {
+fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
     const conn_fd = dialTcp(h.host, h.port) orelse return failSend("dial", 0);
     defer _ = c.close(conn_fd);
     var head_buf: [512]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ h.path, h.host, h.port, body.len }) catch return failSend("head build", 0);
+    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
+    if (gz) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
+    head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
     if (!writeAll(conn_fd, head.buffered())) return failSend("write head", std.c._errno().*);
     if (!writeAll(conn_fd, body)) return failSend("write body", std.c._errno().*);
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
