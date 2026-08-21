@@ -17,6 +17,6 @@ fi
 scripts/build.sh 18
 docker cp zig-out/lib/pg_logtap.so "$C:$LIBDIR/"
 docker cp pg_logtap.control "$C:$EXTDIR/"
-docker cp sql/pg_logtap--*.sql "$C:$EXTDIR/"
+for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done
 
 echo "deployed to $C ($LIBDIR)"

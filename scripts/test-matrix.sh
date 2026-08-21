@@ -53,7 +53,7 @@ for v in $VERSIONS; do
   EXTDIR=$(docker exec "$C" pg_config --sharedir)/extension
   docker cp "dist/pg$v/lib/pg_logtap.so" "$C:$LIBDIR/"
   docker cp pg_logtap.control "$C:$EXTDIR/"
-  docker cp sql/pg_logtap--*.sql "$C:$EXTDIR/"
+  for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done
 
   # Phase 1: core GUCs only — PG<=16 rejects ALTER SYSTEM on unregistered
   # custom GUCs, so the library must load first.
