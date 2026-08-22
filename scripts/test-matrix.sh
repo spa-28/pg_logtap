@@ -130,6 +130,9 @@ for v in $VERSIONS; do
     # Mute-but-accepting receiver: sends must fail after export_timeout_ms,
     # batches divert to the fallback file, /healthz keeps answering.
     scripts/e2e-silent-receiver.sh "$C" || { echo "pg$v: silent-receiver FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
+    # Slow-but-answering receiver: export_slow_ms parks live batches on the
+    # fallback file (lossless), the queue drains once it answers fast.
+    scripts/e2e-slow-receiver.sh "$C" || { echo "pg$v: slow-receiver FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
     echo "  pg$v: OK"; docker rm -f "$C" >/dev/null
   else
     echo "  pg$v: FAILED (dropped=$drp captured=$cap sent=$exp received=$lines)"

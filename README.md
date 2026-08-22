@@ -258,6 +258,7 @@ scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
 scripts/e2e-vector.sh <pg-container> 20     # 20 events through a real Vector
 scripts/e2e-metrics.sh <pg-container> 9187  # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh <pg-container> # mute receiver: timeout fires, fallback absorbs, /healthz alive
+scripts/e2e-slow-receiver.sh <pg-container>  # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
 scripts/test-matrix.sh                      # build + deploy + e2e + pgbench storm per major
 ```
 
