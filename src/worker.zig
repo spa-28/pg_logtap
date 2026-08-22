@@ -45,6 +45,14 @@ var guc_export_gzip: bool = false;
 var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
+var guc_export_slow_ms: c_int = 250;
+var guc_export_backlog_max: c_int = 65_536;
+/// Receiver liveness probe: set when a live send answered but took at least
+/// export_slow_ms — such a receiver cannot keep up (256 events per slow
+/// round trip), so live batches park on the fallback file instead of piling
+/// up in the RAM backlog and being trimmed. Cleared by a fast send on the
+/// drain path once the receiver recovers.
+var receiver_slow = false;
 var guc_metrics_port: c_int = 0;
 var guc_metrics_addr: [*c]u8 = null;
 
@@ -58,6 +66,8 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.metrics_addr", "Bind address for the /metrics and /healthz listener, as an IP literal (v4 or v6). Loopback by default — the counters name the host, cluster and data directory, so keep them off the network unless something scrapes them; 0.0.0.0 exposes to every interface.", null, &guc_metrics_addr, "127.0.0.1", pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
@@ -75,21 +85,24 @@ pub fn workerMain() void {
     if (comptime pg.PG_VERSION_NUM >= 180000) {
         pg.pqsignal_be(@intFromEnum(std.posix.SIG.TERM), handleTerm);
         pg.pqsignal_be(@intFromEnum(std.posix.SIG.HUP), handleHup);
+        pg.pqsignal_be(@intFromEnum(std.posix.SIG.USR1), handleUsr1);
     } else {
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.TERM), handleTerm);
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.HUP), handleHup);
+        _ = pg.pqsignal(@intFromEnum(std.posix.SIG.USR1), handleUsr1);
     }
     // Catalog access for database/user name resolution.
     pg.BackgroundWorkerInitializeConnection("postgres", null, 0);
     pg.BackgroundWorkerUnblockSignals();
 
     const alloc = std.heap.c_allocator;
-    var pending: std.ArrayList(ring.ShmLogEntry) = .empty;
+    var pending: Backlog = .{};
     defer pending.deinit(alloc);
     var names = NameCache{};
     capture.setWorkerLatch(); // backends wake this worker on the first event
     syncMetricsListener();
     refreshSourceId();
+    fbCreditBacklog(alloc);
 
     while (!got_sigterm.isSet()) {
         pg.ResetLatch(pg.MyLatch);
@@ -99,7 +112,18 @@ pub fn workerMain() void {
             syncMetricsListener();
             refreshSourceId();
         }
+        // Absorb procsignal barriers (see handleUsr1). Errors here have no
+        // better handler than the next cycle — the barrier itself doesn't
+        // ereport.
+        interrupts.CheckForInterrupts() catch {};
         flushAll(alloc, &pending, &names);
+        // Return a storm-swollen backlog buffer: parking keeps the ArrayList
+        // capacity, so a one-off million-event storm would otherwise pin GiB
+        // of RSS for the worker's whole life (measured: 6.6GiB retained).
+        if (pending.len() == 0 and pending.list.capacity > 4096) {
+            pending.deinit(alloc);
+            pending = .{};
+        }
         scrapeAll();
         _ = pg.WaitLatch(pg.MyLatch, pg.WL_LATCH_SET | pg.WL_TIMEOUT | pg.WL_EXIT_ON_PM_DEATH, @intCast(guc_flush_interval), 0);
     }
@@ -111,7 +135,7 @@ pub fn workerMain() void {
 /// lets the ring fill up mid-cycle — the backlog absorbs the burst instead.
 /// While the fallback file holds undelivered events it IS the backlog: live
 /// events append to it and it drains to the receiver in order.
-fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry), names: *NameCache) void {
+fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache) void {
     if (guc_export_url == null or guc_export_url[0] == 0) return;
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
     const dest = dest_mod.parseUrl(url) orelse {
@@ -129,8 +153,18 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
     // honors SIGHUP/TERM. 64 members ≈ 16k events per flush_interval.
     var gzip_buf: ?[]u8 = null; // reused across chunks, freed on cycle exit
     defer if (gzip_buf) |z| alloc.free(z);
+    // Bound one flushAll call to ~1s of wall clock. The direct-send branch
+    // has no members cap (only the fallback branch does), so a receiver that
+    // answers slower than the capture rate keeps this loop running for the
+    // whole outage: counters bump, /metrics and SIGHUP handling only happen
+    // between flushAll calls — all three froze mid-storm while trims piled
+    // up in a local and flushed minutes late. The next cycle resumes 100ms
+    // later; a fast receiver still drains a full backlog in one call.
+    const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
+    var drained_total: usize = 0; // live inflow this flushAll call
     while (!got_sigterm.isSet()) {
-        drainInto(alloc, pending);
+        if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+        drained_total += drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
 
         if (fbQueued()) {
@@ -142,27 +176,51 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
             // rate; logFallback(true) fires only on a failed send, never on
             // these appends — a transition line per append would feed itself
             // back through the hook into the queue, forever.
-            while (pending.items.len > 0) {
-                const count = @min(pending.items.len, chunk_max);
-                const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+            var appended = false;
+            while (pending.len() > 0) {
+                // The park loop obeys the outer loop's disciplines PER CHUNK:
+                // under a sustained storm pending never empties, and without
+                // these one flushAll call runs for the whole storm — counters,
+                // /metrics and SIGHUP freeze, the ring starves (3.7M events
+                // dropped at capture in a 7-min 15k/s storm) and the RAM
+                // backlog grows GiB-scale because trimBacklog never runs.
+                if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+                drained_total += drainInto(alloc, pending);
+                lost += trimBacklog(pending);
+                const count = @min(pending.len(), chunk_max);
+                const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
                 if (!fbAppend(alloc, body, false)) { // disk full → RAM-backlog semantics for the rest
                     failed += 1;
                     break;
                 }
-                dropFront(pending, count);
+                pending.dropFront(count);
                 queued += count;
+                appended = true;
             }
-            fbFsync();
+            if (appended) fbFsync();
+            // Capture outranks replay: a member send to a slow receiver blocks
+            // this loop for hundreds of milliseconds, and at high inflow the
+            // ring fills and drops events at capture before the next drain.
+            // While the receiver is slow AND this cycle saw any live inflow,
+            // park-only: fsync and hand the loop back to drainInto; members
+            // resume once inflow quiets or it recovers.
+            if (receiver_slow and drained_total > 0) continue;
             const m = fbNextMember(alloc) orelse {
                 lost += fb_lost;
                 fb_lost = 0;
-                failed += @intFromBool(pending.items.len > 0); // append failed above
+                failed += @intFromBool(pending.len() > 0); // append failed above
                 break;
             };
             lost += fb_lost;
             fb_lost = 0;
             const gz = gzipPayload(alloc, dest, m.body, &gzip_buf);
+            const m_sent_at = pg.GetCurrentTimestamp();
             if (send(dest, url, gz.payload, gz.on)) {
+                // Drain-path round trip is the receiver liveness probe: a slow
+                // answer re-arms the park (receiver_slow), a fast one clears
+                // it — this also arms it after a restart into a slow receiver
+                // where the live-send probe never ran.
+                if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
                 logFallback(false);
                 // counted queued at append time; this is its delivery
                 replayed += std.mem.countScalar(u8, m.body, '\n');
@@ -177,18 +235,42 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
             break; // retry the queue next cycle
         }
 
-        if (pending.items.len == 0) break;
-        const count = @min(pending.items.len, chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+        if (pending.len() == 0) break;
+        const count = @min(pending.len(), chunk_max);
+        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
+        if (receiver_slow and guc_export_slow_ms > 0) {
+            // Slow-but-alive receiver (receiver_slow): park coming batches on
+            // disk — left live, they pile up in the RAM backlog until trimmed.
+            // Same as the failed-send divert below, minus failed: nothing
+            // failed; the queue path owns catch-up from the next iteration.
+            if (!fbAppend(alloc, body, true)) {
+                failed += 1; // disk full → RAM-backlog semantics for the rest
+                break;
+            }
+            logFallback(true);
+            pending.dropFront(count);
+            queued += count;
+            continue;
+        }
         const gz = gzipPayload(alloc, dest, body, &gzip_buf);
+        const sent_at = pg.GetCurrentTimestamp();
         if (send(dest, url, gz.payload, gz.on)) {
             logFallback(false);
-            dropFront(pending, count);
+            pending.dropFront(count);
             sent += count;
+            // Liveness probe: an answer this slow cannot keep up with capture.
+            if (guc_export_slow_ms > 0 and pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000) receiver_slow = true;
         } else if (fbAppend(alloc, body, true)) {
             logFallback(true);
-            dropFront(pending, count);
+            pending.dropFront(count);
             queued += count; // durably parked: counted replayed on delivery
+            failed += 1; // the send DID fail — without this a diverting storm
+            // reports send_cycles_failed=0 (the receiver-down signal) while
+            // actively losing events
+            break; // return to the main loop: flush counters, serve /metrics
+            // and the latch; the queue path (the file is non-empty now) owns
+            // catch-up from the next cycle — without the break one flushAll
+            // call loops for the whole outage with stats frozen mid-loss
         } else {
             failed += 1; // counts failed flush CYCLES, not events
             break; // retry the backlog next cycle
@@ -214,31 +296,69 @@ fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, na
 }
 
 /// Ring → backlog. OOM counts the drained events as lost (ring is already drained).
-fn drainInto(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry)) void {
+fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
+    var drained: usize = 0;
     var batch: [drain_batch]ring.ShmLogEntry = undefined;
     while (true) {
         const count = capture.drainBatch(&batch);
-        if (count == 0) return;
-        pending.appendSlice(alloc, batch[0..count]) catch {
+        if (count == 0) return drained;
+        pending.append(alloc, batch[0..count]) catch {
             capture.bumpExport(0, 0, 0, 0, count);
-            return;
+            return drained;
         };
+        drained += count;
     }
 }
 
-/// Backlog bound: keep the newest ring_capacity events, return what fell off.
-fn trimBacklog(pending: *std.ArrayList(ring.ShmLogEntry)) u64 {
-    if (pending.items.len <= capture.capacity()) return 0;
-    const lost: u64 = pending.items.len - capture.capacity();
-    dropFront(pending, lost);
+/// Backlog bound: keep the newest export_backlog_max events, return what fell
+/// off. The bound only matters when parking sustains a real deficit — spikes
+/// (fsync, scheduler contention) must fit inside it, or events that would park
+/// a second later get trimmed; ring_capacity (~0.5s of storm inflow) was that
+/// tight, so trim fired in bursts while sustained parking matched inflow.
+fn trimBacklog(pending: *Backlog) u64 {
+    const cap: usize = @max(guc_export_backlog_max, capture.capacity());
+    if (pending.len() <= cap) return 0;
+    const lost: u64 = pending.len() - cap;
+    pending.dropFront(lost);
     return lost;
 }
 
-fn dropFront(list: *std.ArrayList(ring.ShmLogEntry), count: usize) void {
-    const rest = list.items.len - count;
-    std.mem.copyForwards(ring.ShmLogEntry, list.items[0..rest], list.items[count..]);
-    list.items.len = rest;
-}
+/// Front-consumable RAM backlog: appended at the tail (ring drains), consumed
+/// from the head (chunk parks / sends). dropFront is O(1) — a head index, with
+/// the dead prefix compacted inside append once it dominates. The old
+/// shift-per-chunk copyForwards moved up to 27MB (8192 × 3.4KB) per 256-event
+/// chunk and capped park throughput at ~14k events/s: below storm inflow, so
+/// the trim fired continuously and lost events even with the fallback file on.
+const Backlog = struct {
+    list: std.ArrayList(ring.ShmLogEntry) = .empty,
+    head: usize = 0,
+
+    fn len(self: *const Backlog) usize {
+        return self.list.items.len - self.head;
+    }
+
+    fn live(self: *const Backlog) []ring.ShmLogEntry {
+        return self.list.items[self.head..];
+    }
+
+    fn append(self: *Backlog, alloc: std.mem.Allocator, items: []const ring.ShmLogEntry) !void {
+        if (self.head > 0 and self.head * 2 >= self.list.items.len) {
+            const rest = self.list.items.len - self.head;
+            std.mem.copyForwards(ring.ShmLogEntry, self.list.items[0..rest], self.list.items[self.head..]);
+            self.list.items.len = rest;
+            self.head = 0;
+        }
+        try self.list.appendSlice(alloc, items);
+    }
+
+    fn dropFront(self: *Backlog, count: usize) void {
+        self.head = @min(self.head + count, self.list.items.len);
+    }
+
+    fn deinit(self: *Backlog, alloc: std.mem.Allocator) void {
+        self.list.deinit(alloc);
+    }
+};
 
 // --- failures in the server log: on transition only, not every cycle ----------
 
@@ -544,6 +664,35 @@ fn fbTruncate() void {
     if (c.ftruncate(fd, 0) == 0) fb_offset = 0;
 }
 
+/// The fallback file can outlive the shmem counters: a postmaster restart
+/// zeroes queued/replayed/…, the disk queue does not. Credit this epoch's
+/// queued with what the file already holds so backlog (queued − replayed)
+/// stays a real number and replayed ≤ queued holds. One decompress pass at
+/// worker start; fb_offset is restored afterwards — the drain replays from
+/// the top as before (at-least-once contract unchanged).
+/// ponytail: a worker CRASH-restart (postmaster alive, counters intact)
+/// double-credits what is left — backlog reads high until the file drains;
+/// bounded by one file, benign direction, not worth persisting offsets.
+fn fbCreditBacklog(alloc: std.mem.Allocator) void {
+    const saved_offset = fb_offset;
+    const saved_lost = fb_lost;
+    var lines: u64 = 0;
+    while (true) {
+        const before = fb_offset;
+        const m = fbNextMember(alloc) orelse {
+            // null without advancing = drained, torn tail or foreign file;
+            // null WITH advancing = unreadable member skipped — keep walking
+            if (fb_offset == before) break;
+            continue;
+        };
+        lines += std.mem.countScalar(u8, m.body, '\n');
+        fb_offset += m.advance;
+    }
+    fb_offset = saved_offset;
+    fb_lost = saved_lost;
+    if (lines > 0) capture.bumpExport(0, lines, 0, 0, 0);
+}
+
 /// Fallback on/off transitions only — same discipline as export failures.
 var was_fallback = false;
 
@@ -674,8 +823,15 @@ fn writeAll(conn_fd: c_int, buf: []const u8) bool {
 }
 
 fn recvSome(conn_fd: c_int, buf: []u8) usize {
-    const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
-    return if (count > 0) @intCast(count) else 0;
+    while (true) {
+        const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
+        if (count > 0) return @intCast(count);
+        // A signal (SIGUSR1 latch poke, SIGHUP) arriving mid-read is not a
+        // receiver fault — retry like writeAll does, or every reload aborts
+        // a healthy in-flight request ("status read errno=4").
+        if (count == -1 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        return 0; // real fault: EAGAIN (timeout) flows into failSend
+    }
 }
 
 // --- Prometheus /metrics (M4): scrapes served from the worker loop, no threads --
@@ -774,5 +930,21 @@ fn handleTerm(sig: c_int) callconv(.c) void {
 fn handleHup(sig: c_int) callconv(.c) void {
     _ = sig;
     got_sighup.set(1);
+    if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
+}
+
+/// procsignal (SIGUSR1) carries cross-backend events; the one that matters
+/// here is the barrier: DROP DATABASE waits until every backend holding a
+/// ProcSignal slot absorbs it, and this worker connects to a database, so it
+/// holds a slot. Without this handler (plus CheckForInterrupts in the main
+/// loop) it never absorbs — DROP DATABASE hangs forever on any cluster with
+/// pg_logtap loaded, worker idle the whole time. The barrier flag is set
+/// unconditionally: absorbing an already-absorbed generation is a no-op, and
+/// the other procsignal reasons (notify, parallel message) don't apply to a
+/// worker with no client.
+fn handleUsr1(sig: c_int) callconv(.c) void {
+    _ = sig;
+    interrupts.Pending.ProcSignalBarrier.set(1);
+    interrupts.Pending.Interrupt.set(1);
     if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
 }
