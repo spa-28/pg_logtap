@@ -111,6 +111,7 @@ GUCs and restart again.
 | `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed `http://`/`tcp://` batches go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
+| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 
 `export_url` schemes (gzip applies to the `http://` scheme only):
@@ -253,6 +254,7 @@ scripts/build.sh 18 test                    # unit tests (any zig build target; 
 scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
 scripts/e2e-vector.sh <pg-container> 20     # 20 events through a real Vector
 scripts/e2e-metrics.sh <pg-container> 9187  # /metrics scraped, values checked
+scripts/e2e-silent-receiver.sh <pg-container> # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/test-matrix.sh                      # build + deploy + e2e + pgbench storm per major
 ```
 

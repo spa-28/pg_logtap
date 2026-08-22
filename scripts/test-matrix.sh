@@ -111,6 +111,9 @@ for v in $VERSIONS; do
     # Failure modes: receiver down→up, SIGKILL postmaster, fallback file,
     # worker kill — the docs/delivery.md contract (restarts the container).
     scripts/e2e-kill.sh "$C" || { echo "pg$v: kill-scenarios FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
+    # Mute-but-accepting receiver: sends must fail after export_timeout_ms,
+    # batches divert to the fallback file, /healthz keeps answering.
+    scripts/e2e-silent-receiver.sh "$C" || { echo "pg$v: silent-receiver FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
     echo "  pg$v: OK"; docker rm -f "$C" >/dev/null
   else
     echo "  pg$v: FAILED (dropped=$drp captured=$cap sent=$exp received=$lines)"

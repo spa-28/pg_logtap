@@ -43,6 +43,7 @@ var guc_cluster_name: [*c]u8 = null;
 var guc_export_gzip: bool = false;
 var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
+var guc_export_timeout_ms: c_int = 5000;
 var guc_metrics_port: c_int = 0;
 
 var got_sigterm = interrupts.Signal.new(0);
@@ -54,6 +55,7 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
     // are not visible yet in _PG_init, so we cannot decide here. With an empty
@@ -621,6 +623,19 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     while (it) |ai| : (it = ai.next) {
         const conn_fd = c.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
         if (conn_fd < 0) continue;
+        // A silent receiver (accepted connect, never answers; hung LB,
+        // black-hole route) must not hang the single worker loop — with no
+        // timeout, the status recv blocks forever: drain stops, the ring
+        // overflows, /metrics and SIGHUP go unserved. Set before connect:
+        // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
+        // return EAGAIN, which flows into the ordinary failSend →
+        // retry/fallback path like any dead receiver.
+        const tv = Timeval{
+            .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
+            .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
+        };
+        _ = net.setsockopt(conn_fd, 1, 20, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
+        _ = net.setsockopt(conn_fd, 1, 21, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
         if (net.connect(conn_fd, ai.addr.?, ai.addrlen) == 0) return conn_fd;
         const err = std.c._errno().*;
         _ = c.close(conn_fd);
@@ -628,6 +643,9 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     }
     return null;
 }
+
+/// timeval(3type) for setsockopt: both fields c_long on linux x86-64/arm64.
+const Timeval = extern struct { sec: i64, usec: i64 };
 
 /// Remember why the last send failed; surfaces in the transition log line.
 fn failSend(stage: []const u8, err: c_int) bool {
