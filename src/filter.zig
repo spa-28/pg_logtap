@@ -1,38 +1,35 @@
 //! Capture filters: level threshold + POSIX regex include/exclude.
 //! Pure module: libc only, no PostgreSQL imports — regexes are compiled once
-//! per GUC assignment (PROBLEMS.md E1), never inside the log hook.
+//! per GUC assignment (PROBLEMS.md E1), never inside the log hook. The
+//! compiled state lives behind an opaque box owned by src/c/regex_shim.c:
+//! regex_t layout is libc- and arch-specific (glibc's even has bitfields,
+//! opaque to translate-c), so the buffer is allocated in C against the
+//! TARGET libc — the previous hardcoded 64-byte reservation in Zig (glibc
+//! x86-64) was stack corruption in every backend wherever it didn't match.
 const std = @import("std");
 
-/// glibc regex_t is 64 bytes on x86-64/aarch64; opaque reservation.
-const regex_t_size = 64;
-const reg_extended: c_int = 1;
-const reg_nosub: c_int = 8;
+/// Allocated by src/c/regex_shim.c; size is the target libc's own.
+pub const LtRegex = opaque {};
 
-extern fn regcomp(preg: *anyopaque, pattern: [*:0]const u8, cflags: c_int) c_int;
-extern fn regexec(preg: *const anyopaque, string: [*:0]const u8, nmatch: usize, pmatch: ?*anyopaque, eflags: c_int) c_int;
-extern fn regfree(preg: *anyopaque) void;
+extern fn lt_regex_compile(pattern: [*:0]const u8) ?*LtRegex;
+extern fn lt_regex_free(re: *LtRegex) void;
+extern fn lt_regex_matches(re: *const LtRegex, s: [*:0]const u8) c_int;
 
 pub const Regex = struct {
-    buf: [regex_t_size]u8 align(8) = [_]u8{0} ** regex_t_size,
-    compiled: bool = false,
+    re: *LtRegex,
 
-    /// Returns null on invalid pattern.
+    /// Returns null on invalid pattern (or OOM).
     pub fn compile(pattern: [:0]const u8) ?Regex {
-        var self = Regex{};
-        if (regcomp(&self.buf, pattern.ptr, reg_extended | reg_nosub) != 0) return null;
-        self.compiled = true;
-        return self;
+        return .{ .re = lt_regex_compile(pattern.ptr) orelse return null };
     }
 
     pub fn deinit(self: *Regex) void {
-        if (self.compiled) regfree(&self.buf);
-        self.compiled = false;
+        lt_regex_free(self.re);
     }
 
     /// Input must be NUL-terminated — our sources are C strings already.
     pub fn matches(self: *const Regex, s: [*:0]const u8) bool {
-        if (!self.compiled) return true;
-        return regexec(&self.buf, s, 0, null, 0) == 0;
+        return lt_regex_matches(self.re, s) != 0;
     }
 };
 

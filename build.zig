@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "pgzx", .module = pgzx_mod },
         },
     });
+    // filter.zig's regex box: compiled against the TARGET libc's <regex.h>
+    // (zig cc), so regex_t size/layout is the real one for glibc, musl, any
+    // arch — a hardcoded size in Zig was stack corruption on the first
+    // libc it didn't match.
+    mod.addCSourceFiles(.{ .files = &.{"src/c/regex_shim.c"} });
 
     const lib = b.addLibrary(.{
         .name = "pg_logtap",
@@ -35,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true, // filter.zig calls libc regcomp/regexec
     });
+    test_mod.addCSourceFiles(.{ .files = &.{"src/c/regex_shim.c"} });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
