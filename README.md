@@ -112,6 +112,8 @@ GUCs and restart again.
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed `http://`/`tcp://` batches go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
+| `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
+| `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot (~3.4 KB), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 | `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
 
@@ -211,7 +213,7 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `events_sent` | events | delivered to the export URL by a live send |
 | `events_queued` | events | durably appended to the fallback file |
 | `events_replayed` | events | delivered out of the fallback file after recovery |
-| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, or an unreadable queue member |
+| `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — or an unreadable queue member |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 

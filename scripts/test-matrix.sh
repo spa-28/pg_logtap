@@ -66,6 +66,22 @@ for v in $VERSIONS; do
   docker restart "$C" >/dev/null; wait_ready "$C"
   docker exec "$C" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 
+  # Cluster ops that interact with other backends — the exporter connects to
+  # the cluster, so it participates in barrier/connection/catalog signaling.
+  # Each under timeout: pre-0.2.1 the worker never absorbed ProcSignalBarriers
+  # and DROP DATABASE hung forever (worker idle the whole time).
+  if ! docker exec "$C" bash -c "
+      set -e
+      timeout 30 createdb -U postgres probe
+      timeout 30 createdb -U postgres -T template0 probe2
+      timeout 30 dropdb -U postgres probe
+      timeout 30 dropdb -U postgres probe2
+      timeout 30 psql -U postgres -qc 'CREATE ROLE probe_r; DROP ROLE probe_r'
+      timeout 30 psql -U postgres -qc 'CHECKPOINT'
+  "; then
+    echo "pg$v: cluster-ops (barrier/signal classes) FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue
+  fi
+
   # Functional: N distinct events must reach Vector (file sink).
   if ! scripts/e2e-vector.sh "$C" 20; then
     echo "pg$v: e2e FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue
