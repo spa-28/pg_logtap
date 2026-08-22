@@ -30,7 +30,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
-- **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~29k events/s.
+- **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~29k events/s, and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
