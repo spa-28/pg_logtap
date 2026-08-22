@@ -50,6 +50,7 @@ jobs:
       # (the official PostgreSQL apt repository, manual repo setup).
       - run: |
           . /etc/os-release
+          sudo apt-get update
           if ! apt-cache show postgresql-server-dev-${{ matrix.pg }} >/dev/null 2>&1; then
             sudo install -d /etc/apt/keyrings
             curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /etc/apt/keyrings/pgdg.asc >/dev/null
