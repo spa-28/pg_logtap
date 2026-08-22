@@ -191,6 +191,12 @@ SELECT pg_logtap_stats();                  -- same counters as compact text
 SELECT unnest(pg_logtap_dump(100));        -- last events as JSON, non-destructive
 ```
 
+Privileges: `pg_logtap_dump` exposes other sessions' log content (queries,
+errors) and is owner-only by default — GRANT EXECUTE to a specific role if a
+monitoring user needs it. The counters (`pg_logtap_stats()`,
+`pg_logtap_stats_json()`, the view) are executable/readable by the built-in
+`pg_monitor` role and the owner; nobody else.
+
 Event counters — same names in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition (each event counted
 once per lifecycle stage it passes; stuck in the fallback queue right now =
