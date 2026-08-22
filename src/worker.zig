@@ -28,6 +28,7 @@ const c = struct {
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
+    extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 };
 const net = std.c;
 
@@ -45,6 +46,7 @@ var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
 var guc_metrics_port: c_int = 0;
+var guc_metrics_addr: [*c]u8 = null;
 
 var got_sigterm = interrupts.Signal.new(0);
 var got_sighup = interrupts.Signal.new(0);
@@ -57,6 +59,7 @@ pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.metrics_addr", "Bind address for the /metrics and /healthz listener, as an IP literal (v4 or v6). Loopback by default — the counters name the host, cluster and data directory, so keep them off the network unless something scrapes them; 0.0.0.0 exposes to every interface.", null, &guc_metrics_addr, "127.0.0.1", pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
     // are not visible yet in _PG_init, so we cannot decide here. With an empty
     // URL the worker just sleeps on its latch (no drain, no export).
@@ -678,33 +681,58 @@ fn recvSome(conn_fd: c_int, buf: []u8) usize {
 // --- Prometheus /metrics (M4): scrapes served from the worker loop, no threads --
 
 var metrics_fd: c_int = -1;
-var metrics_port_open: c_int = -1; // port the socket currently reflects
+var metrics_open_port: c_int = -1; // port the socket currently reflects
+var metrics_open_addr_buf: [64]u8 = undefined; // …and the address it reflects
+var metrics_open_addr: []const u8 = "";
 
-/// (Re)open the listening socket when the configured port changed (SIGHUP).
+/// (Re)open the listening socket when port or address changed (SIGHUP).
 fn syncMetricsListener() void {
-    if (metrics_port_open == guc_metrics_port) return;
-    metrics_port_open = guc_metrics_port;
+    const addr = if (guc_metrics_addr == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(guc_metrics_addr)));
+    if (metrics_open_port == guc_metrics_port and std.mem.eql(u8, metrics_open_addr, addr)) return;
+    metrics_open_port = guc_metrics_port;
+    if (addr.len <= metrics_open_addr_buf.len) {
+        @memcpy(metrics_open_addr_buf[0..addr.len], addr);
+        metrics_open_addr = metrics_open_addr_buf[0..addr.len];
+    } else metrics_open_addr = addr; // overlong: listenOn will reject it anyway
     if (metrics_fd >= 0) {
         _ = c.close(metrics_fd);
         metrics_fd = -1;
     }
     if (guc_metrics_port <= 0) return;
-    metrics_fd = listenOn(@intCast(guc_metrics_port)) orelse {
-        elog.Log(@src(), "pg_logtap.metrics_port {d} failed to listen, metrics disabled", .{guc_metrics_port});
+    metrics_fd = listenOn(addr, @intCast(guc_metrics_port)) orelse {
+        elog.Log(@src(), "pg_logtap.metrics_port {d} on \"{s}\" failed to listen, metrics disabled", .{ guc_metrics_port, addr });
         return;
     };
-    elog.Log(@src(), "pg_logtap metrics serving /metrics and /healthz on port {d}", .{guc_metrics_port});
+    elog.Log(@src(), "pg_logtap metrics serving /metrics and /healthz on {s}:{d}", .{ addr, guc_metrics_port });
 }
 
-fn listenOn(port: u16) ?c_int {
-    const listen_fd = c.socket(2, 1 | 2048, 0); // AF_INET, SOCK_STREAM|SOCK_NONBLOCK
+fn listenOn(addr_str: []const u8, port: u16) ?c_int {
+    if (addr_str.len >= 64) return null;
+    var str_buf: [64]u8 = undefined;
+    @memcpy(str_buf[0..addr_str.len], addr_str);
+    str_buf[addr_str.len] = 0;
+    // inet_pton, not DNS: a bind address is an IP literal or a config error —
+    // a name would silently bind to whatever it resolved to at open time.
+    var v4 = std.mem.zeroes(net.sockaddr.in);
+    v4.family = 2; // AF_INET
+    v4.port = std.mem.nativeToBig(u16, port);
+    var v6 = std.mem.zeroes(net.sockaddr.in6);
+    v6.family = 10; // AF_INET6
+    v6.port = std.mem.nativeToBig(u16, port);
+    var family: c_uint = undefined;
+    var sa: []const u8 = undefined;
+    if (c.inet_pton(2, @ptrCast(&str_buf), &v4.addr) == 1) { // AF_INET
+        family = 2;
+        sa = std.mem.asBytes(&v4);
+    } else if (c.inet_pton(10, @ptrCast(&str_buf), &v6.addr) == 1) { // AF_INET6
+        family = 10;
+        sa = std.mem.asBytes(&v6);
+    } else return null;
+    const listen_fd = c.socket(family, 1 | 2048, 0); // SOCK_STREAM|SOCK_NONBLOCK
     if (listen_fd < 0) return null;
     const one: c_int = 1;
     _ = net.setsockopt(listen_fd, 1, 2, &one, @sizeOf(c_int)); // SOL_SOCKET, SO_REUSEADDR
-    var addr = std.mem.zeroes(net.sockaddr.in);
-    addr.family = 2; // AF_INET
-    addr.port = std.mem.nativeToBig(u16, port);
-    if (net.bind(listen_fd, @ptrCast(&addr), @sizeOf(net.sockaddr.in)) != 0 or net.listen(listen_fd, 8) != 0) {
+    if (net.bind(listen_fd, @ptrCast(@alignCast(sa.ptr)), @intCast(sa.len)) != 0 or net.listen(listen_fd, 8) != 0) {
         _ = c.close(listen_fd);
         return null;
     }
