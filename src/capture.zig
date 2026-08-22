@@ -240,21 +240,32 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
         return @intFromPtr(pg.construct_array_builtin(&none, 0, text_oid));
     }
 
-    var datums: [max_dump]pg.Datum = undefined;
+    // Under the lock: only the struct copy out of shmem. Everything that can
+    // elog (palloc, catalog lookups) runs below, outside — an elog between
+    // acquire/release longjmps past LWLockRelease, and every logging backend
+    // then blocks on the held lock: an OOM in dump would hang the cluster.
+    // The copy buffer itself is palloc'd BEFORE the lock for the same reason
+    // (elogs while the lock is still unheld); the query context owns it.
+    const copies: []ring.ShmLogEntry = (@as([*]ring.ShmLogEntry, @ptrCast(@alignCast(pg.palloc(@sizeOf(ring.ShmLogEntry) * limit)))))[0..limit];
     const ring_q = ring.Ring.init(state, entries);
     lockRing();
     const count = @min(ring.snapshot(ring_q).count, limit);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const entry = ring.peek(ring_q, i) orelse break;
-        var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-        defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, &entry, resolveNames(&entry)) catch break;
-        const line = line_w.written();
-        datums[i] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+    var taken: u32 = 0;
+    while (taken < count) : (taken += 1) {
+        copies[taken] = ring.peek(ring_q, taken) orelse break;
     }
     unlockRing();
-    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(i), text_oid));
+
+    var datums: [max_dump]pg.Datum = undefined;
+    var n: u32 = 0;
+    while (n < taken) : (n += 1) {
+        var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer line_w.deinit();
+        jsonl.writeEntry(&line_w.writer, &copies[n], resolveNames(&copies[n])) catch break;
+        const line = line_w.written();
+        datums[n] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+    }
+    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(n), text_oid));
 }
 
 /// Catalog lookups run in the caller's memory context — palloc'd results are
