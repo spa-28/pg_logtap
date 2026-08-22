@@ -45,3 +45,15 @@ CREATE TYPE pg_logtap_stats_t AS (
 CREATE VIEW pg_logtap_delivery AS
 SELECT * FROM jsonb_populate_record(NULL::pg_logtap_stats_t,
                                     pg_logtap_stats_json()::jsonb);
+
+/* Log content is other sessions' data (queries via field_query, errors,
+   detail/context with SQL text): dump stays owner-only by default — GRANT
+   EXECUTE to a specific role if a monitoring user needs it. Counters are
+   cluster metadata: PUBLIC loses them, the built-in pg_monitor role keeps
+   them (agents usually already carry it). */
+REVOKE EXECUTE ON FUNCTION pg_logtap_dump(int) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_logtap_stats() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_logtap_stats_json() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION pg_logtap_stats() TO pg_monitor;
+GRANT EXECUTE ON FUNCTION pg_logtap_stats_json() TO pg_monitor;
+GRANT SELECT ON pg_logtap_delivery TO pg_monitor;
