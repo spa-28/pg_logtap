@@ -123,19 +123,35 @@ members again — dedup by `(host, seq)` as above makes that harmless. Events
 may also appear twice because the failed send that queued them may have
 partially landed — same dedup.
 
-Placement caveat, measured under a debug-level storm (~16k events/s, 16
-pgbench clients, receiver down, queue on the same overlay device as WAL):
-the queue costs ~5-10% tps (2480-2510 quiet / 2250-2390 with the queue
-absorbing everything, dropped=0 lost=0 across 11+ runs and 8-250 clients).
-Two properties buy that: compression (~30×: 600 events 310 KB plain →
-9.5 KB queued) and pooled buffers — the per-chunk ~100KB+ transients used
-to cross glibc's mmap threshold, and the resulting TLB shootdowns taxed
-every core; the worker now reuses its body/compressor/inflate buffers for
-the process life and fdatasyncs once per flush cycle, not per member.
+Placement caveat, measured (v0.2.0, one 16-core host, nvme, docker
+overlay; debug-level storm, 16 pgbench clients, duration logging on,
+receiver down for a full 10 minutes, queue on the same device as WAL):
+
+| | stderr on | stderr off (`log_destination=''`) |
+|---|---|---|
+| storm throughput, everything diverted to the queue | 6.2k ev/s (tps 892) | 11.5k ev/s (tps 1643) |
+| live storm while the queue replays | 7.3k ev/s (tps 1046) | 13.6k ev/s (tps 1941) |
+| queue cost | 75 B/event | 65 B/event |
+| dropped / lost | 0 / 0 | 0 / 0 |
+
+Two conclusions. First, the queue itself is cheap: worst-case write rate
+~0.75 MB/s (every event diverted, gzip ~5× on debug-storm lines, ~30× on
+repetitive ones), fdatasynced once per flush cycle, and pooled buffers
+keep the worker out of malloc's mmap path (the per-chunk ~100KB+ transients
+used to cross the threshold and their TLB shootdowns taxed every core).
+Second, the dominant disk cost under a debug storm is not pg_logtap but
+stderr duplication into the container log: turning it off
+(`log_destination=''` — the hook captures everything regardless, it sits
+before destination routing) raised storm throughput by 84%. End-to-end,
+the same run took a 10-minute receiver outage under storm — 11M events
+total, zero dropped, zero lost — and drained the 642 MB queue afterwards
+at 5–7k events/s, live traffic joining in FIFO order the whole time.
+
 Backends never block or wait on the queue; the residual cost is disk
 contention with WAL. If debug storms and receiver outages regularly
-coincide and the tps matters, give PGDATA (and the queue with it) its
-own device.
+coincide and the tps matters, keep stderr off during them (the events
+still get captured and exported) and give PGDATA — and the queue with
+it — its own device.
 
 Transition lines in the server log mark divert start/stop:
 
