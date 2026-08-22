@@ -19,12 +19,13 @@ jobs:
       # The pgzx dependency runs pg_config at configure time (any zig build
       # invocation) and links libpq; any server-dev version will do here.
       - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev libkrb5-dev
-      # Version lives in control + sql filename + build.zig.zon; fail early
-      # if they drift apart (the release job names packages from the tag).
+      # Version lives in control + sql filename + build.zig.zon + version.zig;
+      # fail early if they drift apart (the release job names packages from the tag).
       - run: |
           v=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
           [ -f "sql/pg_logtap--$v.sql" ] || { echo "sql/pg_logtap--$v.sql missing"; exit 1; }
           grep -q "\"$v\"" build.zig.zon || { echo "build.zig.zon version != $v"; exit 1; }
+          grep -q "\"$v\"" src/version.zig || { echo "src/version.zig version != $v"; exit 1; }
       - run: zig build fmt --summary all
       - run: zig build lint --summary all
       - run: zig build test --summary all

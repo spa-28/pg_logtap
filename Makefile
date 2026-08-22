@@ -18,7 +18,7 @@ build:
 install: build
 	install -D zig-out/lib/pg_logtap.so $(PG_PKGLIBDIR)/pg_logtap.so
 	install -D pg_logtap.control $(PG_SHAREDIR)/extension/pg_logtap.control
-	install -D sql/pg_logtap--0.1.0.sql $(PG_SHAREDIR)/extension/pg_logtap--0.1.0.sql
+	install -m 644 sql/*.sql $(PG_SHAREDIR)/extension/
 
 test:
 	zig build test --summary all

@@ -58,8 +58,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.2.0/pg_logtap-0.2.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.2.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.2.1/pg_logtap-0.2.1-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.2.1-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -308,9 +308,10 @@ you support (e.g. debian:bookworm).
 
 ## Releases
 
-The version lives in three places that must stay in sync (CI checks this):
+The version lives in four places that must stay in sync (CI checks this):
 `pg_logtap.control` (`default_version`), the `sql/pg_logtap--X.Y.Z.sql`
-filename, and `build.zig.zon`. To cut a release:
+filename, `build.zig.zon`, and `src/version.zig` (what
+`pg_logtap_version()` returns). To cut a release:
 
 ```sh
 # 1. bump the version in all three files (rename the sql file accordingly)
@@ -318,8 +319,8 @@ filename, and `build.zig.zon`. To cut a release:
 #    the SQL didn't change); every version needs one, it is the ALTER EXTENSION
 #    UPDATE hop, and chains compose (0.1.0 → 0.2.0 → 0.3.0 in one command)
 # 3. commit, tag, push
-git tag v0.2.0 && git push origin v0.2.0
-# 4. create a Release for the tag in the GitHub UI (or: gh release create v0.2.0)
+git tag v0.2.1 && git push origin v0.2.1
+# 4. create a Release for the tag in the GitHub UI (or: gh release create v0.2.1)
 ```
 
 Publishing the Release triggers CI, which rebuilds the matrix and attaches one
