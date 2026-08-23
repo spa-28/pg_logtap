@@ -7,6 +7,9 @@
 #   C fallback file      : receiver dead + export_fallback_file set → zero
 #                          lost, every event in the file
 #   D worker kill -9     : postmaster emergency-restarts, delivery resumes
+#   E worker SIGTERM mid-send: the shutdown flush parks the RAM backlog the
+#                          dying process would otherwise drop (ring events
+#                          survive anyway — the restarted worker picks them up)
 # Usage: scripts/e2e-kill.sh [pg_container]
 set -eu
 PG_CT="${1:-pglogtap-pg}"
@@ -16,13 +19,15 @@ VEC=pglogtap-vector-kill
 
 fail() {
   echo "e2e-kill: FAILED: $*" >&2
-  # Post-mortem for the log: counters, worker liveness, recent server log —
-  # a lost-but-uncounted path (e.g. a soft worker exit dropping the RAM
-  # backlog) is invisible in the counters and only shows here.
+  # Post-mortem for the log: counters, worker liveness, export transition
+  # lines, the receiver's own log. The server-log grep scans the WHOLE log
+  # and only then tails: a burst of the very events being lost once pushed
+  # the "export failing (fail_reason)" line past a plain tail -15.
   docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
   docker exec "$PG_CT" psql -U postgres -Atc \
     "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
-  docker logs --tail 15 "$PG_CT" 2>&1 | grep -iE "logtap|export|worker|PANIC|FATAL" >&2 || true
+  docker logs "$PG_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2 || true
+  docker logs --tail 8 "$VEC" >&2 2>&1 || true
   exit 1
 }
 ok() { echo "  ok: $*"; }
@@ -158,6 +163,36 @@ gen d1 20; wait_for d1 20
 [ "$(received d1)" = 20 ] || fail "D: no delivery after worker crash"
 ok "worker crash → cluster restarted itself, delivery resumed"
 
-setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''; reload
+echo "== E: worker SIGTERM mid-send — shutdown flush parks the RAM backlog =="
+# A mute receiver (accepts, never answers) pins the worker in recv for the
+# full export_timeout_ms — recvSome retries EINTR, so the window is
+# deterministic, not a race. e1 (600 > chunk_max) leaves ~344 events in the
+# RAM backlog when the cycle parks the first chunk; the backlog dies with
+# the process, so only the worker's shutdown flush can park it. e2 lands in
+# the ring during the same window and rides the worker restart instead.
+SILENT=pglogtap-silent-kill
+docker rm -f "$SILENT" >/dev/null 2>&1 || true
+docker run -d --name "$SILENT" --network "$NET" alpine/socat \
+  TCP-LISTEN:9499,reuseaddr,fork SYSTEM:'cat >/dev/null' >/dev/null
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_timeout_ms 3000
+setguc pg_logtap.export_url "http://$SILENT:9499"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+[ -n "$wpid" ] || fail "E: worker not found"
+gen e1 600; sleep 1 # worker: drains e1, send → recv blocked for 3s
+gen e2 100 # captured during the blocked recv
+docker exec "$PG_CT" kill -TERM "$wpid" # inside the 3s recv window
+sleep 8 # recv timeout → park chunk → shutdown flush parks the backlog → restart
+docker rm -f "$SILENT" >/dev/null
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for e1 600; wait_for e2 100
+[ "$(received e1)" = 600 ] || fail "E: RAM backlog lost on worker TERM (e1=$(received e1)/600)"
+[ "$(received e2)" = 100 ] || fail "E: ring events lost on worker TERM (e2=$(received e2)/100)"
+ok "worker TERM mid-send: shutdown flush parked the backlog, 700/700 replayed"
+
+setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
+setguc pg_logtap.export_timeout_ms 5000; reload
 docker rm -f "$VEC" >/dev/null
 echo "e2e-kill: all scenarios passed"
