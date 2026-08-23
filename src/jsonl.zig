@@ -71,7 +71,40 @@ fn fixed(fs: anytype) []const u8 {
 }
 
 fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
-    try std.json.Stringify.encodeJsonString(s, .{}, w);
+    try w.writeByte('"');
+    try jsonChars(w, s);
+    try w.writeByte('"');
+}
+
+/// JSON string body, UTF-8-sanitized. Log fields can carry raw invalid bytes —
+/// SQL_ASCII databases, COPY/encoding errors quoting the offending bytes — and
+/// JSON strings must be valid UTF-8 or the receiving parser (Vector's
+/// serde_json, VictoriaLogs) rejects the line. Invalid bytes become U+FFFD;
+/// valid input (the overwhelmingly common case) is one validate + one pass.
+fn jsonChars(w: *std.Io.Writer, s: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(s))
+        return std.json.Stringify.encodeJsonStringChars(s, .{}, w);
+    var run: usize = 0; // start of the current valid run
+    var i: usize = 0;
+    while (i < s.len) {
+        if (validSeqAt(s, i)) |len| {
+            i += len;
+        } else {
+            try std.json.Stringify.encodeJsonStringChars(s[run..i], .{}, w);
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            run = i;
+        }
+    }
+    return std.json.Stringify.encodeJsonStringChars(s[run..], .{}, w);
+}
+
+/// Length of the valid UTF-8 sequence at s[i], or null for an invalid byte
+/// (bad lead byte, truncated/overlong/surrogate sequence).
+fn validSeqAt(s: []const u8, i: usize) ?u3 {
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
+    if (i + len > s.len) return null;
+    return if (std.unicode.utf8Decode(s[i..][0..len])) |_| len else |_| null;
 }
 
 /// Absent (null) or empty string → JSON null (copyStr skips null sources).
@@ -141,6 +174,48 @@ pub fn levelName(elevel: i32) []const u8 {
         23 => "PANIC",
         else => "UNKNOWN",
     };
+}
+
+test "invalid utf-8 bytes sanitize to U+FFFD, line stays valid JSON" {
+    // The live case: a COPY/encoding error quotes the offending raw bytes
+    // into DETAIL ("invalid byte sequence ... : 0x80" with the byte itself).
+    var entry = std.mem.zeroes(ring.ShmLogEntry);
+    entry.seq = 1;
+    entry.elevel = 19;
+    // 0x80 (stray continuation), \xC3\x28 (broken 2-byte), 'a\xED\xA0\x80z'
+    // (surrogate pair) — all invalid; valid ASCII and a valid 2-byte 'é'
+    // around them must pass through untouched.
+    ring.setStr(&entry.message, &entry.truncated_mask, .message, "a\x80b\xC3\x28 \xC3\xA9 \xED\xA0\x80");
+
+    var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line_w.deinit();
+    try writeEntry(&line_w.writer, &entry, .{});
+    const line = line_w.written();
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+    try std.testing.expect(std.mem.indexOf(u8, line, "\u{FFFD}") != null);
+    // valid sequences survive: é (U+00E9) not replaced
+    try std.testing.expect(std.mem.indexOf(u8, line, "\xC3\xA9") != null);
+    // structural sanity: control chars would be escaped by encodeJsonStringChars
+    try std.testing.expect(std.mem.indexOf(u8, line, "\n") == null);
+}
+
+test "control characters in message escape correctly" {
+    var entry = std.mem.zeroes(ring.ShmLogEntry);
+    entry.seq = 2;
+    entry.elevel = 19;
+    ring.setStr(&entry.message, &entry.truncated_mask, .message, "tab\tquote\"nl\n\x00");
+
+    var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line_w.deinit();
+    try writeEntry(&line_w.writer, &entry, .{});
+    const line = line_w.written();
+
+    // still one line: no raw \n or \0 anywhere, quotes escaped
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, line, 0) == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\\\"") != null);
+    try std.testing.expect(try std.json.validate(std.testing.allocator, line));
 }
 
 test "timestamp formatting" {
