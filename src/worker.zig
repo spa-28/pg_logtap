@@ -683,9 +683,12 @@ fn fbTruncate() void {
 /// stays a real number and replayed ≤ queued holds. One decompress pass at
 /// worker start; fb_offset is restored afterwards — the drain replays from
 /// the top as before (at-least-once contract unchanged).
-/// ponytail: a worker CRASH-restart (postmaster alive, counters intact)
-/// double-credits what is left — backlog reads high until the file drains;
-/// bounded by one file, benign direction, not worth persisting offsets.
+/// A worker restart (postmaster alive, counters intact) must credit nothing:
+/// its predecessor already counted every append now in the file, and a
+/// re-credit would inflate backlog (queued − replayed) forever — the file
+/// draining does not repair a counter difference. Every append this epoch
+/// bumped queued, so `file events −| queued` is exactly the uncounted part:
+/// zero after a worker restart, the whole file after a postmaster restart.
 fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     const saved_offset = fb_offset;
     const saved_lost = fb_lost;
@@ -703,7 +706,8 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     }
     fb_offset = saved_offset;
     fb_lost = saved_lost;
-    if (lines > 0) capture.bumpExport(0, lines, 0, 0, 0);
+    const due = lines -| capture.snapshot().queued;
+    if (due > 0) capture.bumpExport(0, due, 0, 0, 0);
 }
 
 /// Fallback on/off transitions only — same discipline as export failures.

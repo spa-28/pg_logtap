@@ -190,7 +190,12 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for e1 600; wait_for e2 100
 [ "$(received e1)" = 600 ] || fail "E: RAM backlog lost on worker TERM (e1=$(received e1)/600)"
 [ "$(received e2)" = 100 ] || fail "E: ring events lost on worker TERM (e2=$(received e2)/100)"
-ok "worker TERM mid-send: shutdown flush parked the backlog, 700/700 replayed"
+# Counter invariant: the restarted worker must not re-credit the parked file
+# (its predecessor already counted those appends) — backlog = queued - replayed
+# would read 700 forever while the file itself is empty.
+ebl=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$ebl" = 0 ] || fail "E: queue_backlog=$ebl after replay — counter drift on worker restart"
+ok "worker TERM mid-send: shutdown flush parked the backlog, 700/700 replayed, queue_backlog=0"
 
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.export_timeout_ms 5000; reload
