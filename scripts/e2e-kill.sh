@@ -14,7 +14,17 @@ NET=logtap-e2e
 OUT=/tmp/logtap-kill
 VEC=pglogtap-vector-kill
 
-fail() { echo "e2e-kill: FAILED: $*" >&2; exit 1; }
+fail() {
+  echo "e2e-kill: FAILED: $*" >&2
+  # Post-mortem for the log: counters, worker liveness, recent server log —
+  # a lost-but-uncounted path (e.g. a soft worker exit dropping the RAM
+  # backlog) is invisible in the counters and only shows here.
+  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
+  docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
+  docker logs --tail 15 "$PG_CT" 2>&1 | grep -iE "logtap|export|worker|PANIC|FATAL" >&2 || true
+  exit 1
+}
 ok() { echo "  ok: $*"; }
 
 docker network create "$NET" >/dev/null 2>&1 || true
@@ -37,7 +47,7 @@ gen() { # gen <marker> <count> — distinct events from one psql round trip.
     WHILE i < $2 LOOP
       RAISE WARNING 'logtap kill $1 %', i;
       i := i + 1;
-    END LOOP; END \$\$" >/dev/null 2>&1
+    END LOOP; END \$\$" >/dev/null 2>&1 || echo "  gen $1: psql FAILED (events never emitted)" >&2
 }
 # Count distinct marker events; the trailing digit requirement keeps out the
 # duration-log line of the generating DO statement itself (its message quotes
