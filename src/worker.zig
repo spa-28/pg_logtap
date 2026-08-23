@@ -128,7 +128,15 @@ pub fn workerMain() void {
         _ = pg.WaitLatch(pg.MyLatch, pg.WL_LATCH_SET | pg.WL_TIMEOUT | pg.WL_EXIT_ON_PM_DEATH, @intCast(guc_flush_interval), 0);
     }
     flushAll(alloc, &pending, &names, true); // graceful shutdown: hand off what we can
-    pg.proc_exit(0);
+    // Exit code 1, not 0: the postmaster treats a zero exit of a static
+    // bgworker as "work done, never restart" (rw_terminate), so anything
+    // except a postmaster-ordered stop — a stray SIGTERM from an operator,
+    // a supervisor — would silently disable export until the next cluster
+    // restart. Code 1 is the expected bgworker failure code: restart after
+    // bgw_restart_time (1 s), no cluster crash (only death by signal does
+    // that). During a real shutdown the postmaster is exiting itself and
+    // does not respawn.
+    pg.proc_exit(1);
 }
 
 /// One cycle: interleave ring drains with chunk pushes. A slow POST no longer
