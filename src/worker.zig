@@ -116,7 +116,7 @@ pub fn workerMain() void {
         // better handler than the next cycle — the barrier itself doesn't
         // ereport.
         interrupts.CheckForInterrupts() catch {};
-        flushAll(alloc, &pending, &names);
+        flushAll(alloc, &pending, &names, false);
         // Return a storm-swollen backlog buffer: parking keeps the ArrayList
         // capacity, so a one-off million-event storm would otherwise pin GiB
         // of RSS for the worker's whole life (measured: 6.6GiB retained).
@@ -127,7 +127,7 @@ pub fn workerMain() void {
         scrapeAll();
         _ = pg.WaitLatch(pg.MyLatch, pg.WL_LATCH_SET | pg.WL_TIMEOUT | pg.WL_EXIT_ON_PM_DEATH, @intCast(guc_flush_interval), 0);
     }
-    flushAll(alloc, &pending, &names); // graceful shutdown: hand off what we can
+    flushAll(alloc, &pending, &names, true); // graceful shutdown: hand off what we can
     pg.proc_exit(0);
 }
 
@@ -135,7 +135,12 @@ pub fn workerMain() void {
 /// lets the ring fill up mid-cycle — the backlog absorbs the burst instead.
 /// While the fallback file holds undelivered events it IS the backlog: live
 /// events append to it and it drains to the receiver in order.
-fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache) void {
+/// `final` (worker SIGTERM) ignores got_sigterm: the main loop already exited
+/// on it, so without this the "graceful shutdown: hand off what we can" call
+/// skipped its loop entirely and every clean stop silently dropped the ring
+/// contents and the RAM backlog. Still bounded: the 1s cycle deadline plus one
+/// send timeout (~export_timeout_ms worst case) with a dead receiver.
+fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, final: bool) void {
     if (guc_export_url == null or guc_export_url[0] == 0) return;
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
     const dest = dest_mod.parseUrl(url) orelse {
@@ -162,7 +167,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache) void
     // later; a fast receiver still drains a full backlog in one call.
     const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
     var drained_total: usize = 0; // live inflow this flushAll call
-    while (!got_sigterm.isSet()) {
+    while (final or !got_sigterm.isSet()) {
         if (pg.GetCurrentTimestamp() > cycle_deadline) break;
         drained_total += drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
@@ -750,6 +755,11 @@ fn sendFile(path: []const u8, body: []const u8) bool {
 }
 
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.
+/// getaddrinfo is blocking with NO timeout knob — export_timeout_ms bounds
+/// only connect/send/recv (set below). A wedged resolver stalls the worker
+/// for the resolver's own timeouts (resolv.conf: ~5s × attempts × servers);
+/// the failure mode is the same as a dead receiver (ring absorbs, then
+/// events_lost), never a permanent hang. IP literals skip resolution.
 fn dialTcp(host: []const u8, port: u16) ?c_int {
     if (host.len >= 256) {
         _ = failSend("host too long", 0);

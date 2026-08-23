@@ -73,7 +73,9 @@ on-disk queue and replayed when the receiver answers.
 Without a fallback file, both buffers are volatile. Everything
 captured-but-not-yet-delivered is lost: **up to R + export_backlog_max events,
 uncounted** (the counters die with the shmem). Graceful shutdown
-(SIGTERM/postmaster stop) runs one final flush cycle first; SIGKILL skips it.
+(SIGTERM/postmaster stop) runs one final flush cycle first — bounded: ~1 s of
+work plus one send timeout with a dead receiver — delivering or parking what it
+can; SIGKILL skips it.
 With `export_fallback_file` set, the queue is on disk and **survives the
 crash** — the restarted worker replays it; the exposure shrinks to roughly one
 `flush_interval` of events (in RAM at the moment of the kill) plus the
