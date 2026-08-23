@@ -183,9 +183,9 @@ test "invalid utf-8 bytes sanitize to U+FFFD, line stays valid JSON" {
     entry.seq = 1;
     entry.elevel = 19;
     // 0x80 (stray continuation), \xC3\x28 (broken 2-byte), 'a\xED\xA0\x80z'
-    // (surrogate pair) — all invalid; valid ASCII and a valid 2-byte 'é'
-    // around them must pass through untouched.
-    ring.setStr(&entry.message, &entry.truncated_mask, .message, "a\x80b\xC3\x28 \xC3\xA9 \xED\xA0\x80");
+    // (surrogate pair), trailing \xC3 (2-byte sequence cut at buffer end) —
+    // all invalid; valid ASCII and a valid 2-byte 'é' must pass untouched.
+    ring.setStr(&entry.message, &entry.truncated_mask, .message, "a\x80b\xC3\x28 \xC3\xA9 \xED\xA0\x80 \xC3");
 
     var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer line_w.deinit();
