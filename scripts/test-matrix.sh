@@ -29,9 +29,15 @@ wait_ready() {
 }
 
 # Release artifacts are built against the oldest glibc among current distros
-# (2.28 = RHEL 8; glibc is forward-compatible) and with ReleaseSafe, so the
-# storm below tests exactly the binary that ships.
-FLAGS="-Dtarget=x86_64-linux-gnu.2.28 -Doptimize=ReleaseSafe"
+# (2.28 = RHEL 8, amd64 and arm64 alike; glibc is forward-compatible) and
+# with ReleaseSafe, so the storm below tests exactly the binary that ships.
+# The target follows the runner's arch — CI builds natively on both.
+case "$(uname -m)" in
+  x86_64)  ZIG_TARGET="x86_64-linux-gnu.2.28" ;;
+  aarch64) ZIG_TARGET="aarch64-linux-gnu.2.28" ;;
+  *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+esac
+FLAGS="-Dtarget=$ZIG_TARGET -Doptimize=ReleaseSafe"
 
 for v in $VERSIONS; do
   echo "===== pg$v ====="

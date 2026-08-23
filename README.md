@@ -64,11 +64,11 @@ sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
 
-Release binaries are x86-64, built with ReleaseSafe against glibc 2.28 —
-the oldest glibc among current distributions (RHEL 8; glibc is
-forward-compatible), so they run on RHEL/Rocky/Alma 8+, Debian 11+,
-Ubuntu 20.04+, Amazon Linux 2023. On other architectures or musl, build
-from source as below.
+Release binaries cover **amd64 and arm64**, built with ReleaseSafe against
+glibc 2.28 — the oldest glibc among current distributions (RHEL 8, both
+arches; glibc is forward-compatible), so they run on RHEL/Rocky/Alma 8+,
+Debian 11+, Ubuntu 20.04+, Amazon Linux 2023 — including their arm64 ports.
+On other architectures or musl, build from source as below.
 
 ### From source
 
@@ -329,8 +329,9 @@ git tag v0.2.1 && git push origin v0.2.1
 # 4. create a Release for the tag in the GitHub UI (or: gh release create v0.2.1)
 ```
 
-Publishing the Release triggers CI, which rebuilds the matrix and attaches one
-package per major as `pg_logtap-<version>-pg<N>-amd64.tar.gz` — a `lib/` +
+Publishing the Release triggers CI, which rebuilds the matrix (PG majors ×
+amd64/arm64, each arch natively on its own runner) and attaches one package
+per combination as `pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` +
 `extension/` tree ready to untar into the PostgreSQL installation.
 
 ## License
