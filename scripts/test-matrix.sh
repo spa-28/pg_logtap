@@ -139,6 +139,9 @@ for v in $VERSIONS; do
     # Slow-but-answering receiver: export_slow_ms parks live batches on the
     # fallback file (lossless), the queue drains once it answers fast.
     scripts/e2e-slow-receiver.sh "$C" || { echo "pg$v: slow-receiver FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
+    # Another emit_log_hook extension preloaded first: pg_logtap must chain
+    # to it, not replace it (restores the container's preload afterwards).
+    scripts/e2e-hook-chain.sh "$C" || { echo "pg$v: hook-chain FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue; }
     echo "  pg$v: OK"; docker rm -f "$C" >/dev/null
   else
     echo "  pg$v: FAILED (dropped=$drp captured=$cap sent=$exp received=$lines)"
