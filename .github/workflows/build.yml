@@ -35,6 +35,9 @@ jobs:
       - run: zig build --summary all
 
   matrix:
+    # Fast-fail: check (fmt/lint/test/version sync, ~2.5 min) gates the eight
+    # build legs so a trivial break doesn't burn the whole matrix.
+    needs: check
     strategy:
       fail-fast: false
       matrix:
