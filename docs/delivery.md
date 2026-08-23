@@ -118,9 +118,10 @@ appended to the queue — one **gzip member per batch** behind a length framing
 tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
-step is involved. On restart the same replay happens automatically (scenario C
-of `scripts/e2e-kill.sh`: SIGKILL with a full queue, receiver back after boot
-→ all events delivered, queue empty, zero duplicate seqs).
+step is involved. On restart the same replay happens automatically (the
+`fallback-queue` scenario of `scripts/e2e-kill.sh`: SIGKILL with a full
+queue, receiver back after boot → all events delivered, queue empty, zero
+duplicate seqs).
 
 Crash windows: a crash mid-append leaves a torn trailing member — detected and
 truncated on the next read. A crash mid-replay loses only the in-memory
