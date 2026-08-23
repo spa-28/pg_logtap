@@ -6,6 +6,12 @@
 //! opaque to translate-c), so the buffer is allocated in C against the
 //! TARGET libc — the previous hardcoded 64-byte reservation in Zig (glibc
 //! x86-64) was stack corruption in every backend wherever it didn't match.
+//!
+//! regexec has no timeout, and matches() runs in every logging backend.
+//! Measured: plain EREs are linear on both glibc and musl ((a+)+b, (a|aa)+b,
+//! (x+x+)+y at n=1000 → ≤3 ms); backreferences (\1) drop glibc off its fast
+//! matcher to ~n^2.6 (measured 47/91/163 ms at n=100/130/160 → ~20 s at the
+//! 1024-byte message-slot cap) — avoid \1 and friends in patterns.
 const std = @import("std");
 
 /// Allocated by src/c/regex_shim.c; size is the target libc's own.

@@ -102,7 +102,7 @@ GUCs and restart again.
 | Option | Default | Context | Description |
 |---|---|---|---|
 | `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 22=PANIC). |
-| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. |
+| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at the 1024-byte message cap; matching runs in every logging backend). |
 | `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching messages. |
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
@@ -119,7 +119,7 @@ GUCs and restart again.
 
 `export_url` schemes (gzip applies to the `http://` scheme only):
 
-- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS);
+- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it;
 - `tcp://host:port` — raw JSON lines;
 - `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
 
