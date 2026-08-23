@@ -7,14 +7,15 @@
 # oldest-first (events_lost > 0 under load); without the cycle deadline the
 # worker loop itself stalled behind every slow round trip.
 # Usage: scripts/e2e-slow-receiver.sh [pg_container] [sink_port]
+# The stand (tests/e2e/compose.yaml) provides the network; this sink is
+# suite-local on purpose — the test toggles its delay mid-run (up_sink).
 set -eu
 PG_CT="${1:-pglogtap-pg}"
 PORT="${2:-9498}"
-NET=logtap-e2e
+NET=pglogtap-e2e_default
 SINK=pglogtap-slow
 
-docker network create "$NET" >/dev/null 2>&1 || true
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true
+docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
 # socat forks per connection; the background (sleep N; printf) answers with a
 # bare 200 after N seconds while `cat` drains the request body. N=1: every
@@ -22,7 +23,7 @@ docker network connect "$NET" "$PG_CT" 2>/dev/null || true
 up_sink() { # $1 = seconds to delay the response
   docker rm -f "$SINK" >/dev/null 2>&1 || true
   docker run -d --name "$SINK" --network "$NET" alpine/socat \
-    TCP-LISTEN:$PORT,reuseaddr,fork \
+    "TCP-LISTEN:$PORT,reuseaddr,fork" \
     SYSTEM:"(sleep $1; printf 'HTTP/1.0 200 OK\r\n\r\n') & cat >/dev/null" >/dev/null
   sleep 1
 }

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # Version-matrix acceptance: for each requested PG major — build from its
-# vendored headers, deploy into a throwaway container, run the e2e + a log
-# storm, assert zero drops and exact delivery to Vector.
+# vendored headers, deploy into the compose stand, run the e2e + a log storm,
+# assert zero drops and exact delivery to Vector.
 # Usage: scripts/test-matrix.sh [storm_secs] [version ...]   (default: all vendored)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-NET=logtap-e2e
-OUT=/tmp/logtap-mx
-docker network create "$NET" >/dev/null 2>&1 || true
+COMPOSE="docker compose -f tests/e2e/compose.yaml"
+OUT=/tmp/logtap-e2e
+mkdir -p "$OUT"
 STATUS=0
 
-cleanup_vector() { docker rm -f pglogtap-vector-mx >/dev/null 2>&1 || true; }
-trap cleanup_vector EXIT
+# Down on success only — a failed job keeps its containers for post-mortem
+# (the STATUS=1 paths below), as the pre-compose matrix did.
+# shellcheck disable=SC2329 # invoked via the EXIT trap below
+cleanup() { [ "$STATUS" = 0 ] && $COMPOSE down >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 # Readiness via the container healthcheck: wait for State.Health=healthy.
 # The probe is TCP (127.0.0.1) on purpose — the official image's temporary
@@ -37,23 +40,25 @@ case "$(uname -m)" in
   aarch64) ZIG_TARGET="aarch64-linux-gnu.2.28" ;;
   *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
 esac
-FLAGS="-Dtarget=$ZIG_TARGET -Doptimize=ReleaseSafe"
+FLAGS=(-Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe)
 
 for v in $VERSIONS; do
   echo "===== pg$v ====="
-  C=pglogtap-mx$v
+  C=pglogtap-mx$v # per-major container name: failed jobs stay distinguishable
+                  # and post-mortem-able, as the matrix always was
   if command -v pg_config >/dev/null 2>&1; then
-    zig build $FLAGS -p "dist/pg$v"   # CI: server-dev for $v is installed
+    zig build "${FLAGS[@]}" -p "dist/pg$v"   # CI: server-dev for $v is installed
   else
-    scripts/build.sh "$v" $FLAGS && mkdir -p "dist/pg$v/lib" && \
+    scripts/build.sh "$v" "${FLAGS[@]}" && mkdir -p "dist/pg$v/lib" && \
       cp zig-out/lib/pg_logtap.so "dist/pg$v/lib/"   # local: build in pgzx-build
   fi
 
-  docker rm -f "$C" >/dev/null 2>&1 || true
-  docker run -d --name "$C" --network "$NET" -e POSTGRES_PASSWORD=dev \
-    --health-cmd 'pg_isready -U postgres -h 127.0.0.1' \
-    --health-interval 2s --health-timeout 3s --health-retries 10 \
-    "postgres:$v" >/dev/null
+  # Bring up (or, on an image change, recreate) the stand's pg under the
+  # per-major name. On a fresh stand the depends_on chain in compose.yaml
+  # gates `up` itself on pg-healthy + vector-port-accepting; on a recreate
+  # (ready already exited 0) the health wait below covers the new pg.
+  docker rm -f "$C" >/dev/null 2>&1 || true # stale same-name container
+  PG_MAJOR=$v PG_CT=$C $COMPOSE up -d
   wait_ready "$C"
   LIBDIR=$(docker exec "$C" pg_config --pkglibdir)
   EXTDIR=$(docker exec "$C" pg_config --sharedir)/extension
@@ -93,14 +98,17 @@ for v in $VERSIONS; do
     echo "pg$v: e2e FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue
   fi
 
-  # Storm: duration-logging on, vector up, assert dropped=0 and exact delivery.
-  rm -rf "$OUT" && mkdir -p "$OUT"
-  docker run -d --name pglogtap-vector-mx --network "$NET" \
-    -v "$(pwd)/tests/e2e/vector.yaml:/etc/vector/vector.yaml:ro" \
-    -v "$OUT:/var/log" timberio/vector:0.57.0-alpine \
-    --config /etc/vector/vector.yaml >/dev/null
-  sleep 3
-  docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector-mx:8686'" \
+  # Prod-shaped chain: Vector → VictoriaLogs jsonline insert, exact count.
+  if ! scripts/e2e-vlogs.sh "$C" 50; then
+    echo "pg$v: vlogs-chain FAILED"; STATUS=1; docker rm -f "$C" >/dev/null; continue
+  fi
+
+  # Storm: duration-logging on, stand vector, assert dropped=0 and exact
+  # delivery. vector-out.jsonl accumulates across suites and versions —
+  # count from a baseline, not from zero.
+  base_lines=0
+  [ -f "$OUT/vector-out.jsonl" ] && base_lines=$(wc -l < "$OUT/vector-out.jsonl")
+  docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
     -qc "ALTER SYSTEM SET log_min_duration_statement = 0" \
     -qc "ALTER SYSTEM SET log_min_messages = 'debug1'" \
     -qc "ALTER SYSTEM SET pg_logtap.level_min = 10" -qc "SELECT pg_reload_conf()" >/dev/null
@@ -125,6 +133,7 @@ for v in $VERSIONS; do
   lines=0
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -f "$OUT/vector-out.jsonl" ] && lines=$(wc -l < "$OUT/vector-out.jsonl")
+    lines=$((lines - base_lines))
     [ "$lines" -ge "$cap" ] && break
     sleep 1
   done
@@ -147,7 +156,6 @@ for v in $VERSIONS; do
     echo "  pg$v: FAILED (dropped=$drp captured=$cap sent=$exp received=$lines)"
     STATUS=1 # keep the container for post-mortem
   fi
-  cleanup_vector
 done
 
 exit $STATUS

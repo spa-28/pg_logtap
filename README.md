@@ -252,14 +252,21 @@ PostgreSQL-extension interface).
 
 ### Testing
 
+The e2e suites run against a docker-compose stand — postgres plus the
+receivers, brought up gated on real readiness (pg healthcheck, the
+receiver's port actually accepting):
+
 ```sh
-scripts/build.sh 18 test                    # unit tests (any zig build target; needs pg_config)
+PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
+# deploy the build into it, then:
+scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
+scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
+scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
+scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
+scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
+scripts/test-matrix.sh                       # per major: build + deploy into the stand + e2e + pgbench storm
+scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
 scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
-scripts/e2e-vector.sh <pg-container> 20     # 20 events through a real Vector
-scripts/e2e-metrics.sh <pg-container> 9187  # /metrics scraped, values checked
-scripts/e2e-silent-receiver.sh <pg-container> # mute receiver: timeout fires, fallback absorbs, /healthz alive
-scripts/e2e-slow-receiver.sh <pg-container>  # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/test-matrix.sh                      # build + deploy + e2e + pgbench storm per major
 ```
 
 `scripts/build.sh [major] [args...]` runs `zig build` inside the `pgzx-build`

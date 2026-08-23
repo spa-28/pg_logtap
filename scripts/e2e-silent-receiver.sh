@@ -6,21 +6,18 @@
 # cycles, nothing diverts to the fallback file, and /healthz is never
 # served again — all three asserted here.
 # Usage: scripts/e2e-silent-receiver.sh [pg_container] [sink_port]
+# The mute receiver is the compose stand's `silent` service.
 set -eu
 PG_CT="${1:-pglogtap-pg}"
 PORT="${2:-9499}"
-NET=logtap-e2e
+NET=pglogtap-e2e_default
 SINK=pglogtap-silent
 
-docker network create "$NET" >/dev/null 2>&1 || true
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true
-docker rm -f "$SINK" >/dev/null 2>&1 || true
-# socat forks per connection; `cat >/dev/null` drains the request body and
-# never writes a byte back — a receiver that is up, reading, and mute.
-docker run -d --name "$SINK" --network "$NET" alpine/socat \
-  TCP-LISTEN:$PORT,reuseaddr,fork SYSTEM:'cat >/dev/null' >/dev/null
-cleanup() { docker rm -f "$SINK" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
+  echo "e2e-silent: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
+  exit 1
+}
+docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
 # 1s timeout, fallback file on: failed sends must divert, not lose.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_timeout_ms = 1000" \
