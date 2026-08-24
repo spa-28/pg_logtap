@@ -184,8 +184,11 @@ One JSON object per line:
 
 Notes: `sqlerrcode` is the canonical 5-char SQLSTATE string. `app` /
 `client_host` come from the session (`[local]` for unix sockets). `host` /
-`cluster` / `pgdata` identify the sending server. `truncated` lists fields cut
-on fixed-size copy. Overlong fields are cut on UTF-8 boundaries.
+`cluster` / `pgdata` identify the sending server. Fields are copied into
+fixed-size slots — `message` up to 1024 bytes, other fields up to 256 — and
+`truncated` lists the fields that were cut; the cut backs off to a UTF-8
+character boundary, invalid bytes become U+FFFD. One event per log record,
+never split.
 
 ## Monitoring
 
@@ -261,13 +264,20 @@ PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
 # deploy the build into it, then:
 scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
 scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
+scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
+scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
+scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: chained, not replaced
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/test-matrix.sh                       # per major: build + deploy into the stand + e2e + pgbench storm
+scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
 scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
 scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
 ```
+
+`test-matrix.sh` runs each stage as a phase; `PHASES=storm,kill
+scripts/test-matrix.sh 5 18` replays a subset against a stand the full run
+brought up — for load-shaped local research.
 
 `scripts/build.sh [major] [args...]` runs `zig build` inside the `pgzx-build`
 container (zig 0.16 + PGDG server-dev 15–18 + libpq); on a machine with a
@@ -282,9 +292,14 @@ concentrated in `capture.zig` / `worker.zig`, the rest (`ring`, `filter`,
 Behavior that needs a real server is covered by the e2e scripts instead.
 
 Verified on PostgreSQL 15/16/17/18: capture, export, exact delivery under a
-pgbench storm (`dropped=0`). CI: `.github/workflows/build.yml` (fmt/lint/test +
-per-version matrix). A new major: add it to the CI matrix, extend the
-`pgzx-build` container with `postgresql-server-dev-19`.
+pgbench storm (`dropped=0`), and the failure/robustness classes — receiver
+outage and slow/mute receivers, postmaster SIGKILL, worker crash and TERM
+mid-send, fallback-queue replay with torn tails, fields past slot caps, a
+logging backend SIGKILLed mid-emit (the emergency-restart path a PANIC
+takes), 60k-event storm into a dead receiver with bounded RAM and exact loss
+accounting. CI: `.github/workflows/build.yml` (fmt/lint/test + per-version
+matrix). A new major: add it to the CI matrix, extend the `pgzx-build`
+container with `postgresql-server-dev-19`.
 
 ### Debugging
 
@@ -340,6 +355,31 @@ Publishing the Release triggers CI, which rebuilds the matrix (PG majors ×
 amd64/arm64, each arch natively on its own runner) and attaches one package
 per combination as `pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` +
 `extension/` tree ready to untar into the PostgreSQL installation.
+
+## TODO
+
+Known ceilings and deferred designs — kept here so they are not re-derived
+from scratch when the need becomes real:
+
+- **Larger message slots** (`pg_logtap.message_max`, postmaster GUC): fields
+  are cut at 1024 (`message`) / 256 (others) bytes — measured fine for what
+  PostgreSQL itself emits (p99 ≈ 136 bytes in a debug-level storm), the
+  exception being `duration:` lines that embed full SQL text and chatty
+  applications. A GUC computed into the shmem slot layout at boot is the
+  cheap fix; the memory cost is visible up front
+  (`ring_capacity × (message_max + ~2.8 KB)`).
+- **Chained slots for oversized messages**: capture splits a long message
+  across continuation ring slots under one LWLock hold, the worker joins
+  them back into one event at export — no fixed per-slot tax, the ring pays
+  only for the long messages it actually carries. Deferred because the three
+  boundaries (ring overflow mid-chain, backlog trim at a chain head, backend
+  death between slots) are exactly the failure classes that took the longest
+  to stabilize; each needs its own e2e scenario before this lands.
+- **Regex backreferences**: `\1` drops glibc's regexec off its fast matcher
+  (~n²·⁶ measured, worst case ~20 s at the message cap); plain EREs are
+  linear. A pattern-length/input-length guard, or a linear-time matcher,
+  would make pathological patterns safe to accept. Until then the pattern
+  GUC docs carry the warning.
 
 ## License
 
