@@ -770,6 +770,10 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     return c.fdatasync(conn_fd) == 0;
 }
 
+extern fn __res_init() c_int;
+
+var dns_fail_streak: u32 = 0;
+
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.
 /// getaddrinfo is blocking with NO timeout knob — export_timeout_ms bounds
 /// only connect/send/recv (set below). A wedged resolver stalls the worker
@@ -810,8 +814,20 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
         // separating "the name is really gone" from in-process rot.
         const code: c_int = if (gai == -1) std.c._errno().* else gai;
         fail_reason = std.fmt.bufPrint(&fail_reason_buf, "dns errno={d} host='{s}' ({d} bytes)", .{ code, host[0..@min(host.len, 24)], host.len }) catch "dns";
+        // glibc's resolver can wedge permanently in this process: a lookup
+        // interrupted at the wrong internal moment (the latch's SIGUSR1s are
+        // dense exactly while events flow) leaves every later getaddrinfo
+        // failing fast with EAI_AGAIN/EAI_NONAME, fresh processes resolve
+        // fine. res_init() re-parses resolv.conf and clears the state —
+        // harmless while the name is really gone, curative when it wedged.
+        dns_fail_streak += 1;
+        if (dns_fail_streak == 20) {
+            _ = __res_init();
+            elog.Log(@src(), "pg_logtap resolver re-initialized after {d} consecutive dns failures", .{dns_fail_streak});
+        }
         return null;
     }
+    dns_fail_streak = 0;
     defer if (res) |r| net.freeaddrinfo(r);
 
     var it = res;
