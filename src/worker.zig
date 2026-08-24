@@ -251,15 +251,15 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         if (pending.len() == 0) break;
         const count = @min(pending.len(), chunk_max);
         const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0) {
+        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, body, true)) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
             // failed; the queue path owns catch-up from the next iteration.
-            if (!fbAppend(alloc, body, true)) {
-                failed += 1; // disk full → RAM-backlog semantics for the rest
-                break;
-            }
+            // A park that cannot append (no fallback file, disk full) falls
+            // through to the live send below: that send is also the only
+            // probe that clears receiver_slow — parking into nowhere while
+            // the flag is set livelocks delivery forever.
             logFallback(true);
             pending.dropFront(count);
             queued += count;
@@ -271,8 +271,11 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             logFallback(false);
             pending.dropFront(count);
             sent += count;
-            // Liveness probe: an answer this slow cannot keep up with capture.
-            if (guc_export_slow_ms > 0 and pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000) receiver_slow = true;
+            // Liveness probe, both ways: an answer this slow cannot keep up
+            // with capture; a fast one clears the park — the live path must
+            // clear it too, or a slow answer with no fallback file set parks
+            // every later batch with no way back.
+            if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000;
         } else if (fbAppend(alloc, body, true)) {
             logFallback(true);
             pending.dropFront(count);
@@ -774,6 +777,20 @@ extern fn __res_init() c_int;
 
 var dns_fail_streak: u32 = 0;
 
+// The last address a dial actually reached, keyed by its host. When dns
+// later fails in-process — the wedged-resolver state below, outliving every
+// res_init re-arm on some cores — dialing this address keeps delivery alive.
+// Container names keep their IP across docker stop/start, which is exactly
+// the outage shape. Ceiling: a name that moves to a new IP while dns also
+// fails in-process stays unreachable until the resolver heals or the worker
+// restarts; recreating the receiver recreates the stand, which restarts
+// postgres too.
+var dns_good_host: [255]u8 = undefined;
+var dns_good_host_len: usize = 0;
+var dns_good_addr: [128]u8 = undefined; // sockaddr bytes as getaddrinfo made them
+var dns_good_addr_len: u32 = 0;
+var dns_good_family: c_int = 0;
+
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.
 /// getaddrinfo is blocking with NO timeout knob — export_timeout_ms bounds
 /// only connect/send/recv (set below). A wedged resolver stalls the worker
@@ -807,6 +824,26 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
         if (gai != -3) break;
     }
     if (gai != 0) {
+        // glibc's resolver can wedge in this process: a lookup interrupted at
+        // the wrong internal moment (the latch's SIGUSR1s are dense exactly
+        // while events flow) leaves later getaddrinfos failing fast with
+        // EAI_AGAIN/EAI_NONAME while fresh processes resolve fine — and the
+        // wedge RE-FORMS right after a successful delivery, because the
+        // delivery's own transition event wakes the worker into the next
+        // lookup 1ms later. Re-init every 10th consecutive failure so a
+        // wedged episode gets repeated chances; harmless while the name is
+        // really gone (res_init just re-parses resolv.conf). On some cores
+        // the wedge outlives every re-init — the cached-address dial below
+        // carries delivery through those.
+        dns_fail_streak += 1;
+        if (dns_fail_streak >= 10 and dns_fail_streak % 10 == 0) {
+            _ = __res_init();
+            if (dns_fail_streak == 10)
+                elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
+        }
+        if (dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {
+            if (dialAddr(&dns_good_addr, dns_good_addr_len, dns_good_family)) |conn_fd| return conn_fd;
+        }
         // The code separates the failure classes: -2 NONAME (name genuinely
         // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
         // the real cause in errno — report that instead. The host goes into
@@ -814,22 +851,6 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
         // separating "the name is really gone" from in-process rot.
         const code: c_int = if (gai == -1) std.c._errno().* else gai;
         fail_reason = std.fmt.bufPrint(&fail_reason_buf, "dns errno={d} host='{s}' ({d} bytes)", .{ code, host[0..@min(host.len, 24)], host.len }) catch "dns";
-        // glibc's resolver can wedge in this process: a lookup interrupted at
-        // the wrong internal moment (the latch's SIGUSR1s are dense exactly
-        // while events flow) leaves later getaddrinfos failing fast with
-        // EAI_AGAIN/EAI_NONAME while fresh processes resolve fine — and the
-        // wedge RE-FORMS right after a successful delivery, because the
-        // delivery's own transition event wakes the worker into the next
-        // lookup 1ms later. One re-init per episode is not enough: re-init
-        // every 10th consecutive failure so a wedged episode gets repeated
-        // chances. Harmless while the name is really gone (res_init just
-        // re-parses resolv.conf), curative when the resolver wedged.
-        dns_fail_streak += 1;
-        if (dns_fail_streak >= 10 and dns_fail_streak % 10 == 0) {
-            _ = __res_init();
-            if (dns_fail_streak == 10)
-                elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
-        }
         return null;
     }
     dns_fail_streak = 0;
@@ -837,26 +858,43 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
 
     var it = res;
     while (it) |ai| : (it = ai.next) {
-        const conn_fd = c.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
-        if (conn_fd < 0) continue;
-        // A silent receiver (accepted connect, never answers; hung LB,
-        // black-hole route) must not hang the single worker loop — with no
-        // timeout, the status recv blocks forever: drain stops, the ring
-        // overflows, /metrics and SIGHUP go unserved. Set before connect:
-        // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
-        // return EAGAIN, which flows into the ordinary failSend →
-        // retry/fallback path like any dead receiver.
-        const tv = Timeval{
-            .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
-            .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
-        };
-        _ = net.setsockopt(conn_fd, 1, 20, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
-        _ = net.setsockopt(conn_fd, 1, 21, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
-        if (net.connect(conn_fd, ai.addr.?, ai.addrlen) == 0) return conn_fd;
-        const err = std.c._errno().*;
-        _ = c.close(conn_fd);
-        _ = failSend("connect", err);
+        if (dialAddr(ai.addr.?, ai.addrlen, ai.family)) |conn_fd| {
+            if (host.len <= dns_good_host.len and ai.addrlen <= dns_good_addr.len) {
+                @memcpy(dns_good_host[0..host.len], host);
+                dns_good_host_len = host.len;
+                @memcpy(dns_good_addr[0..ai.addrlen], @as([*]const u8, @ptrCast(ai.addr.?))[0..ai.addrlen]);
+                dns_good_addr_len = ai.addrlen;
+                dns_good_family = ai.family;
+            }
+            return conn_fd;
+        }
     }
+    return null;
+}
+
+/// socket + connect for one resolved address, with the send timeouts from
+/// export_timeout_ms applied before connect (see below). Returns the
+/// connected fd or null after reporting the connect error via failSend.
+fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
+    const conn_fd = c.socket(@intCast(family), 1, 0); // SOCK_STREAM, default protocol
+    if (conn_fd < 0) return null;
+    // A silent receiver (accepted connect, never answers; hung LB,
+    // black-hole route) must not hang the single worker loop — with no
+    // timeout, the status recv blocks forever: drain stops, the ring
+    // overflows, /metrics and SIGHUP go unserved. Set before connect:
+    // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
+    // return EAGAIN, which flows into the ordinary failSend →
+    // retry/fallback path like any dead receiver.
+    const tv = Timeval{
+        .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
+        .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
+    };
+    _ = net.setsockopt(conn_fd, 1, 20, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
+    _ = net.setsockopt(conn_fd, 1, 21, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
+    if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
+    const err = std.c._errno().*;
+    _ = c.close(conn_fd);
+    _ = failSend("connect", err);
     return null;
 }
 
