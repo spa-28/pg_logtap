@@ -46,14 +46,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
-    # glibc caches the resolver's UDP socket in the process; docker's embedded
-    # DNS can leave that session answering NXDOMAIN long after a peer
-    # container restarts and its name is back — the worker keeps failing
-    # resolution while fresh processes resolve fine (e2e-kill's stop/start of
-    # the receiver container triggers exactly this). A fresh socket per query
-    # sidesteps the stuck session; the cost is nothing at our dial rate.
-    dns_opt:
-      - single-request-reopen
 
   vector:
     image: timberio/vector:0.57.0-alpine
