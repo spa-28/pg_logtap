@@ -814,16 +814,21 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
         // separating "the name is really gone" from in-process rot.
         const code: c_int = if (gai == -1) std.c._errno().* else gai;
         fail_reason = std.fmt.bufPrint(&fail_reason_buf, "dns errno={d} host='{s}' ({d} bytes)", .{ code, host[0..@min(host.len, 24)], host.len }) catch "dns";
-        // glibc's resolver can wedge permanently in this process: a lookup
-        // interrupted at the wrong internal moment (the latch's SIGUSR1s are
-        // dense exactly while events flow) leaves every later getaddrinfo
-        // failing fast with EAI_AGAIN/EAI_NONAME, fresh processes resolve
-        // fine. res_init() re-parses resolv.conf and clears the state —
-        // harmless while the name is really gone, curative when it wedged.
+        // glibc's resolver can wedge in this process: a lookup interrupted at
+        // the wrong internal moment (the latch's SIGUSR1s are dense exactly
+        // while events flow) leaves later getaddrinfos failing fast with
+        // EAI_AGAIN/EAI_NONAME while fresh processes resolve fine — and the
+        // wedge RE-FORMS right after a successful delivery, because the
+        // delivery's own transition event wakes the worker into the next
+        // lookup 1ms later. One re-init per episode is not enough: re-init
+        // every 10th consecutive failure so a wedged episode gets repeated
+        // chances. Harmless while the name is really gone (res_init just
+        // re-parses resolv.conf), curative when the resolver wedged.
         dns_fail_streak += 1;
-        if (dns_fail_streak == 20) {
+        if (dns_fail_streak >= 10 and dns_fail_streak % 10 == 0) {
             _ = __res_init();
-            elog.Log(@src(), "pg_logtap resolver re-initialized after {d} consecutive dns failures", .{dns_fail_streak});
+            if (dns_fail_streak == 10)
+                elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
         }
         return null;
     }
