@@ -10,7 +10,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,hook-chain}
+PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,robust,hook-chain,metrics}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e
 mkdir -p "$OUT"
@@ -188,9 +188,21 @@ phase_slow() { # <v>: slow-but-answering receiver: export_slow_ms parks live
   scripts/e2e-slow-receiver.sh "pglogtap-mx$1"
 }
 
+phase_robust() { # <v>: robustness classes beyond the happy path — fields past
+  # their ring slots, a logging backend SIGKILLed mid-emit (the PANIC/
+  # emergency-restart path), and the RAM backlog's memory bound under a
+  # receiver-dead storm.
+  scripts/e2e-robust.sh "pglogtap-mx$1"
+}
+
 phase_hook_chain() { # <v>: another emit_log_hook extension preloaded first:
   # pg_logtap must chain to it, not replace it.
   scripts/e2e-hook-chain.sh "pglogtap-mx$1"
+}
+
+phase_metrics() { # <v>: worker serves /metrics, Vector prometheus_scrape
+  # reads it. Last on purpose: it opens metrics_addr to the stand network.
+  scripts/e2e-metrics.sh "pglogtap-mx$1"
 }
 
 for v in $VERSIONS; do
@@ -218,8 +230,14 @@ for v in $VERSIONS; do
   if [ "$ok" = 1 ] && has_phase slow; then
     phase_slow "$v" || { echo "pg$v: slow-receiver FAILED"; STATUS=1; ok=0; }
   fi
+  if [ "$ok" = 1 ] && has_phase robust; then
+    phase_robust "$v" || { echo "pg$v: robust FAILED"; STATUS=1; ok=0; }
+  fi
   if [ "$ok" = 1 ] && has_phase hook-chain; then
     phase_hook_chain "$v" || { echo "pg$v: hook-chain FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase metrics; then
+    phase_metrics "$v" || { echo "pg$v: metrics FAILED"; STATUS=1; ok=0; }
   fi
   [ "$ok" = 1 ] && echo "  pg$v: OK"
   # Failed jobs keep the container for post-mortem; success cleans up.
