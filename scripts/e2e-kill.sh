@@ -41,6 +41,11 @@ fail() {
   docker exec "$PG_CT" psql -U postgres -Atc \
     "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
   docker logs "$PG_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2 || true
+  # Receiver state: a vector that died mid-scenario (observed in CI: silent
+  # death ~1s after docker start) leaves the worker's dials failing fast while
+  # every count comes up short — name the killer.
+  docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2 || true
+  docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2 || true
   docker logs --tail 8 "$VEC" >&2 2>&1 || true
   exit 1
 }
@@ -117,6 +122,17 @@ gen outage3 100; sleep 3 # failed cycles → events buffer in the worker backlog
 docker start "$VEC" >/dev/null; wait_vector
 gen outage4 20
 wait_for outage3 100; wait_for outage4 20
+# A vector that dies right after docker start (seen in CI: silent exit ~1s in,
+# the name leaves docker DNS, every dial fails fast) is a receiver-infra
+# failure, not an extension loss — the worker correctly buffers outage4. Revive
+# it and let the backlog drain; only a live receiver with short counts is loss.
+if ! { [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ]; }; then
+  if ! docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null; then
+    echo "  receiver died mid-scenario — restarting, buffered backlog should drain"
+    docker start "$VEC" >/dev/null; wait_vector
+    wait_for outage3 100; wait_for outage4 20
+  fi
+fi
 dups=$(grep 'logtap kill' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$(received outage1)" = 20 ] && [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ] \
   || fail "receiver outage: loss (outage1=$(received outage1) outage3=$(received outage3) outage4=$(received outage4))"

@@ -724,7 +724,10 @@ fn logFallback(active: bool) void {
 }
 
 fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
-    const conn_fd = dialTcp(h.host, h.port) orelse return failSend("dial", 0);
+    // dialTcp has already set the specific reason (dns / connect errno=N);
+    // a generic "dial errno=0" here would overwrite it and hide which stage
+    // failed.
+    const conn_fd = dialTcp(h.host, h.port) orelse return false;
     defer _ = c.close(conn_fd);
     var head_buf: [512]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
@@ -744,7 +747,8 @@ fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
 }
 
 fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
-    const conn_fd = fd_opt orelse return failSend("dial", 0);
+    // As sendHttp: the dial path already recorded why it failed.
+    const conn_fd = fd_opt orelse return false;
     defer _ = c.close(conn_fd);
     if (!writeAll(conn_fd, body)) return failSend("write body", std.c._errno().*);
     return true;
