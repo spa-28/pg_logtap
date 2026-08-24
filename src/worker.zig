@@ -791,8 +791,12 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     hints.family = 0; // AF_UNSPEC: IPv4 or IPv6
     hints.socktype = 1; // SOCK_STREAM
     var res: ?*net.addrinfo = null;
-    if (@intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res)) != 0) {
-        _ = failSend("dns", 0);
+    const gai = @intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res));
+    if (gai != 0) {
+        // The code separates the failure classes: -2 NONAME (name genuinely
+        // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
+        // the real cause in errno — report that instead.
+        _ = failSend("dns", if (gai == -1) std.c._errno().* else gai);
         return null;
     }
     defer if (res) |r| net.freeaddrinfo(r);
