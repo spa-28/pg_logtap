@@ -787,7 +787,10 @@ var dns_fail_streak: u32 = 0;
 // postgres too.
 var dns_good_host: [255]u8 = undefined;
 var dns_good_host_len: usize = 0;
-var dns_good_addr: [128]u8 = undefined; // sockaddr bytes as getaddrinfo made them
+// sockaddr bytes as getaddrinfo made them. align(8) = sockaddr_storage grade:
+// dialAddr's connect casts this to *sockaddr, and an odd .bss slot trips the
+// alignment check (ReleaseSafe aborts the worker, taking the postmaster down).
+var dns_good_addr: [128]u8 align(8) = undefined;
 var dns_good_addr_len: u32 = 0;
 var dns_good_family: c_int = 0;
 
