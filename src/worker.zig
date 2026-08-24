@@ -805,8 +805,11 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     if (gai != 0) {
         // The code separates the failure classes: -2 NONAME (name genuinely
         // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
-        // the real cause in errno — report that instead.
-        _ = failSend("dns", if (gai == -1) std.c._errno().* else gai);
+        // the real cause in errno — report that instead. The host goes into
+        // the reason verbatim: a corrupted slice shows up as garbage here,
+        // separating "the name is really gone" from in-process rot.
+        const code: c_int = if (gai == -1) std.c._errno().* else gai;
+        fail_reason = std.fmt.bufPrint(&fail_reason_buf, "dns errno={d} host='{s}' ({d} bytes)", .{ code, host[0..@min(host.len, 24)], host.len }) catch "dns";
         return null;
     }
     defer if (res) |r| net.freeaddrinfo(r);
