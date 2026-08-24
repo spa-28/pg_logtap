@@ -45,6 +45,16 @@ fail() {
   # death ~1s after docker start) leaves the worker's dials failing fast while
   # every count comes up short — name the killer.
   docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2 || true
+  # Ground truth on the name at the moment of failure: a fresh glibc lookup
+  # (what the bash probe uses) vs the worker's wedged one, plus the container's
+  # actual network registration — repeated, because the wedge sets in AFTER a
+  # brief good window following docker start.
+  n=1; while [ "$n" -le 3 ]; do
+    docker exec "$PG_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
+    n=$((n + 1)); sleep 2
+  done
+  docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2 || true
+  docker exec "$PG_CT" getent hosts "$PG_CT" >&2 || true
   docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2 || true
   docker logs --tail 8 "$VEC" >&2 2>&1 || true
   exit 1
