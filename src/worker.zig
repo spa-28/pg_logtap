@@ -788,10 +788,20 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return null;
 
     var hints = std.mem.zeroes(net.addrinfo);
-    hints.family = 0; // AF_UNSPEC: IPv4 or IPv6
     hints.socktype = 1; // SOCK_STREAM
     var res: ?*net.addrinfo = null;
-    const gai = @intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res));
+    // AF_UNSPEC makes glibc query A and AAAA on one resolver socket. Docker's
+    // embedded DNS has no AAAA for container names and can fail that half
+    // instantly — glibc then reports EAI_AGAIN (-3) for the whole lookup,
+    // persistently, while other processes in the same netns resolve fine.
+    // EAI_AGAIN is the transient class, so retry with the A family alone
+    // before believing it.
+    var gai: c_int = 0;
+    inline for (.{ 0, 2 }) |fam| { // AF_UNSPEC, then AF_INET
+        hints.family = fam;
+        gai = @intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res));
+        if (gai != -3) break;
+    }
     if (gai != 0) {
         // The code separates the failure classes: -2 NONAME (name genuinely
         // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
