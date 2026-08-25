@@ -203,6 +203,12 @@ echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 setguc log_min_duration_statement 0; reload
 # -i is idempotent; the storm phase may not have run before this suite.
 docker exec "$PG_CT" pgbench -i -q -U postgres postgres >/dev/null 2>&1 || true
+# premax BEFORE pgbench starts: scanning the accumulated output file can take
+# seconds, and pgbench's whole run is 30s — grep first, kill while the backend
+# is guaranteed alive (the race killed a pg18 run: backend exited, "kill: No
+# such process").
+premax=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" 2>/dev/null | cut -d: -f2 | sort -n | tail -1)
+[ -n "$premax" ] || premax=0 # every seq ever flushed before the kill
 docker exec -d "$PG_CT" pgbench -U postgres -c 4 -T 30 postgres
 bepid=''
 n=0; while [ -z "$bepid" ] && [ "$n" -lt 15 ]; do
@@ -211,8 +217,6 @@ n=0; while [ -z "$bepid" ] && [ "$n" -lt 15 ]; do
   [ -n "$bepid" ] || { n=$((n + 1)); sleep 1; }
 done
 [ -n "$bepid" ] || fail "backend-kill: no pgbench backend appeared"
-premax=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" 2>/dev/null | cut -d: -f2 | sort -n | tail -1)
-[ -n "$premax" ] || premax=0 # every seq ever flushed before the kill
 docker exec "$PG_CT" bash -c "kill -9 $bepid" # abnormal death: postmaster takes the PANIC path
 sleep 2; wait_ready # emergency restart: teardown, shmem rebuild, recovery
 setguc log_min_duration_statement -1; reload

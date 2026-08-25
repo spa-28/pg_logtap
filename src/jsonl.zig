@@ -32,7 +32,12 @@ pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, names: Names) !
     try optJsonStr(w, fixed(&e.hint));
     try w.print(",\"context\":", .{});
     try optJsonStr(w, fixed(&e.context));
-    try w.print(",\"sqlerrcode\":\"{s}\",\"filename\":", .{sqlState(e.sqlerrcode)});
+    // sqlState maps 6-bit groups onto '0'..'o' — a garbage sqlerrcode can
+    // land on '\\' (0x5C) or a control-range char, so this field goes
+    // through the escaper like every other string (fuzz-caught).
+    try w.writeAll(",\"sqlerrcode\":");
+    try jsonStr(w, &sqlState(e.sqlerrcode));
+    try w.print(",\"filename\":", .{});
     try optJsonStr(w, fixed(&e.filename));
     try w.print(",\"lineno\":{d},\"funcname\":", .{e.lineno});
     try optJsonStr(w, fixed(&e.funcname));
@@ -239,6 +244,66 @@ test "sqlstate unpacking" {
     try std.testing.expectEqualStrings("22012", &sqlState(33816706));
     try std.testing.expectEqualStrings("23505", &sqlState(83906754));
     try std.testing.expectEqualStrings("00000", &sqlState(0));
+}
+
+test "fuzz: random bytes in every field stay one valid JSON line" {
+    // The wire contract, hammered: whatever a backend put into the fields —
+    // control chars, quotes, backslashes, invalid UTF-8, lengths past the
+    // slot caps — writeEntry must emit exactly one line of valid JSON with
+    // valid UTF-8 (the sanitizer), or the receiver (Vector, VictoriaLogs)
+    // drops the whole line.
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rand = prng.random();
+    for (0..256) |i| {
+        var entry = std.mem.zeroes(ring.ShmLogEntry);
+        entry.seq = i;
+        entry.timestamp_us = rand.int(i64);
+        entry.elevel = rand.intRangeAtMost(i32, 10, 23);
+        entry.sqlerrcode = rand.int(i32);
+        entry.lineno = rand.int(i32);
+        entry.pid = rand.int(i32);
+        rand.bytes(std.mem.asBytes(&entry.truncated_mask));
+        fill(&entry, .message, rand);
+        fill(&entry, .detail, rand);
+        fill(&entry, .hint, rand);
+        fill(&entry, .context, rand);
+        fill(&entry, .filename, rand);
+        fill(&entry, .funcname, rand);
+        fill(&entry, .query, rand);
+        fill(&entry, .backend_type, rand);
+        fill(&entry, .app, rand);
+        fill(&entry, .client_host, rand);
+
+        var scratch: [ring.msg_len + 16]u8 = undefined;
+        rand.bytes(&scratch);
+        const names: Names = .{
+            .database = scratch[0..rand.intRangeLessThan(usize, 0, 32)],
+            .user = scratch[64..][0..rand.intRangeLessThan(usize, 0, 32)],
+        };
+
+        var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer line_w.deinit();
+        try writeEntry(&line_w.writer, &entry, names);
+        const line = line_w.written();
+
+        if (!try std.json.validate(std.testing.allocator, line)) {
+            std.debug.print("invalid JSON line (iteration {d}):\n{s}\n", .{ i, line });
+            return error.InvalidJsonLine;
+        }
+        try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    }
+}
+
+/// Fill a fixed field with random non-NUL bytes; ~1/3 of runs exceed the
+/// slot cap so the setStr truncation path is exercised alongside.
+fn fill(entry: *ring.ShmLogEntry, comptime field: ring.TruncField, rand: std.Random) void {
+    var buf: [ring.msg_len + 64]u8 = undefined;
+    const n = rand.intRangeLessThan(usize, 0, buf.len);
+    for (buf[0..n]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255);
+    switch (field) {
+        inline else => |f| ring.setStr(&@field(entry, @tagName(f)), &entry.truncated_mask, field, buf[0..n]),
+    }
 }
 
 test "full entry json" {

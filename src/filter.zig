@@ -262,3 +262,73 @@ test "clip cuts at a UTF-8 boundary and reports itself" {
 test "invalid redactor pattern rejected" {
     try std.testing.expect(Redactor.compile("[unclosed") == null);
 }
+
+// --- fuzz ---------------------------------------------------------------------
+//
+// Random inputs through both redaction layers. Invariants the capture path
+// depends on: the pass terminates (bounded by dst), never writes past
+// dst.len-1, NUL-terminates its output (the next layer regexecs to that
+// terminator), and on valid-UTF-8 input the password cut — whose cut points
+// surround an ASCII token, and whose clip backs off to a lead byte — keeps
+// the text on character boundaries. The regex layer is byte-oriented: a
+// match may split a multibyte character, so its output is NOT promised to
+// be valid UTF-8 — the jsonl sanitizer owns that (see its fuzz test).
+
+test "fuzz: redactPassword over random valid UTF-8" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    // token variants and boundary misses share the pool with plain text
+    const pieces = [_][]const u8{
+        "a",        "Z",        "0",        "_",              " ",              "\t",  "\"",
+        "\\",
+        "é",
+        "δ",
+        "€",
+        "ж",
+        "password", "Password", "PASSWORD", "password_audit", "user_passwords", "'s'", "--",
+    };
+    var src: [600]u8 = undefined;
+    var dst: [65]u8 = undefined; // smaller than some inputs: exercise the clip
+    for (0..512) |_| {
+        var n: usize = 0;
+        while (n + 24 < src.len) {
+            const p = pieces[rand.intRangeLessThan(usize, 0, pieces.len)];
+            if (n + p.len > src.len) break;
+            @memcpy(src[n..][0..p.len], p);
+            n += p.len;
+        }
+        const input = src[0..n];
+        const m = redactPassword(&dst, input);
+        if (m.text.ptr == dst[0..].ptr) { // masked: lives in dst
+            try std.testing.expect(m.text.len < dst.len);
+            try std.testing.expect(dst[m.text.len] == 0);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(m.text));
+            if (!m.clipped) try std.testing.expect(std.mem.endsWith(u8, m.text, " " ++ redacted));
+        } else { // no token: returned untouched
+            try std.testing.expect(m.text.ptr == input.ptr);
+            try std.testing.expect(!m.clipped);
+        }
+    }
+}
+
+test "fuzz: Redactor.apply over random bytes" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    const patterns = [_][:0]const u8{ "x*", "(|a)", ".*", "[a-z]+", "^", "é", "password" };
+    var src: [600]u8 = undefined;
+    var dst: [512]u8 = undefined;
+    for (0..512) |_| {
+        const pat = patterns[rand.intRangeLessThan(usize, 0, patterns.len)];
+        var r = Redactor.compile(pat) orelse return error.CompileFailed;
+        defer r.deinit();
+        const n = rand.intRangeLessThan(usize, 0, src.len);
+        for (src[0..n]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255); // C string: no NUL
+        src[n] = 0; // apply's contract: regexec reads to the terminator
+        const m = r.apply(&dst, src[0..n]);
+        // apply always rewrites into dst (the tail copy); output stays inside
+        // the buffer and NUL-terminated for the next pass
+        try std.testing.expect(m.text.ptr == dst[0..].ptr);
+        try std.testing.expect(m.text.len < dst.len);
+        try std.testing.expect(dst[m.text.len] == 0);
+    }
+}
