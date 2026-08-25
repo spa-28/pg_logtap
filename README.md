@@ -31,7 +31,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
 - **Capture-time redaction** — the `password` token in statement text is cut before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
-- **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~29k events/s, and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
+- **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~45k events/s sustained for 5 minutes (OLTP overhead and latency percentiles, measured before/after the extension: [docs/bench.md](docs/bench.md)), and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
@@ -417,6 +417,7 @@ scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
+PHASES=stand,bench scripts/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
 scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
 scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
 ```

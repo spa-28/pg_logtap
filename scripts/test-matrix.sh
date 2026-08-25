@@ -5,7 +5,8 @@
 # Usage: scripts/test-matrix.sh [storm_secs] [version ...]   (default: all vendored)
 # PHASES=storm,kill scripts/test-matrix.sh [secs] [version ...] runs a subset
 # of the pipeline (comma list, order as below) against a stand the full run
-# brought up — for load-shaped local research. Default: every phase.
+# brought up — for load-shaped local research. Default: every phase except
+# bench (opt-in: PHASES=stand,bench runs the overhead benchmark locally).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
@@ -208,6 +209,13 @@ phase_metrics() { # <v>: worker serves /metrics, Vector prometheus_scrape
   scripts/e2e-metrics.sh "pglogtap-mx$1"
 }
 
+phase_bench() { # <v> <secs>: formal overhead benchmark (docs/bench.md) —
+  # pgbench before/after the extension, TPS/CPU/events/s/latency report. Not
+  # in the default PHASES: benchmark numbers from shared CI runners are
+  # garbage; run locally on a performance-governor box.
+  scripts/bench-overhead.sh "$2" "pglogtap-mx$1"
+}
+
 for v in $VERSIONS; do
   echo "===== pg$v ====="
   ok=1
@@ -241,6 +249,9 @@ for v in $VERSIONS; do
   fi
   if [ "$ok" = 1 ] && has_phase metrics; then
     phase_metrics "$v" || { echo "pg$v: metrics FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase bench; then
+    phase_bench "$v" "$SECS" || { echo "pg$v: bench FAILED"; STATUS=1; ok=0; }
   fi
   [ "$ok" = 1 ] && echo "  pg$v: OK"
   # Failed jobs keep the container for post-mortem; success cleans up.
