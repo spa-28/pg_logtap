@@ -18,7 +18,10 @@ pub fn FixedStr(comptime cap: usize) type {
     };
 }
 
-/// Bits of ShmLogEntry.truncated_mask: which fields were cut on copy.
+/// Bits of ShmLogEntry.truncated_mask / redacted_mask: which fields were cut
+/// on copy. The two masks carry different causes for the same cut and stay
+/// independent: truncated = the text did not fit its slot, redacted = a
+/// redaction layer clipped at its scratch size.
 pub const TruncField = enum(u4) { message, detail, hint, context, query, filename, funcname, backend_type, app, client_host };
 
 /// One captured log event. Fixed layout: lives in shared memory as-is.
@@ -42,6 +45,10 @@ pub const ShmLogEntry = extern struct {
     funcname: FixedStr(aux_len),
     query: FixedStr(aux_len),
     truncated_mask: u16 = 0,
+    /// Set by the redaction layers (capture.copyText), not by setStr. Lives in
+    /// what used to be tail padding: the slot size (and so the shmem request)
+    /// is unchanged at 3416 bytes.
+    redacted_mask: u16 = 0,
 };
 
 /// Control block; entries array is a separate shmem chunk (keeps this small
@@ -156,6 +163,15 @@ pub fn setStr(dst: anytype, mask: *u16, field: TruncField, src: []const u8) void
     @memcpy(dst.bytes[0..n], src[0..n]);
     dst.len = @intCast(n);
     if (truncated) mask.* |= @as(u16, 1) << @intCast(@intFromEnum(field));
+}
+
+test "redacted_mask fits in the entry without growing the slot" {
+    // The second mask occupies the struct's former tail padding: slot size —
+    // and therefore the shmem request for any capacity — must not move. A
+    // change here means every receiver's layout assumption moved with it.
+    try std.testing.expectEqual(@as(usize, 3416), @sizeOf(ShmLogEntry));
+    try std.testing.expectEqual(@as(usize, 3408), @offsetOf(ShmLogEntry, "truncated_mask"));
+    try std.testing.expectEqual(@as(usize, 3410), @offsetOf(ShmLogEntry, "redacted_mask"));
 }
 
 test "push/pop/overflow with seq gapless" {

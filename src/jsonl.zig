@@ -60,19 +60,26 @@ pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, names: Names) !
     try w.print(",\"query\":", .{});
     try optJsonStr(w, fixed(&e.query));
     try w.writeAll(",\"truncated\":[");
-    var first = true;
-    inline for (std.meta.fields(ring.TruncField)) |f| {
-        if (e.truncated_mask & (@as(u16, 1) << @intCast(f.value)) != 0) {
-            if (!first) try w.writeAll(",");
-            first = false;
-            try w.print("\"{s}\"", .{f.name});
-        }
-    }
+    try maskList(w, e.truncated_mask);
+    try w.writeAll("],\"redacted\":[");
+    try maskList(w, e.redacted_mask);
     try w.writeAll("]}");
 }
 
 fn fixed(fs: anytype) []const u8 {
     return fs.bytes[0..fs.len];
+}
+
+/// The field names whose bit is set in a truncation/redaction mask.
+fn maskList(w: *std.Io.Writer, mask: u16) !void {
+    var first = true;
+    inline for (std.meta.fields(ring.TruncField)) |f| {
+        if (mask & (@as(u16, 1) << @intCast(f.value)) != 0) {
+            if (!first) try w.writeAll(",");
+            first = false;
+            try w.print("\"{s}\"", .{f.name});
+        }
+    }
 }
 
 fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
@@ -263,6 +270,7 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
         entry.lineno = rand.int(i32);
         entry.pid = rand.int(i32);
         rand.bytes(std.mem.asBytes(&entry.truncated_mask));
+        rand.bytes(std.mem.asBytes(&entry.redacted_mask));
         fill(&entry, .message, rand);
         fill(&entry, .detail, rand);
         fill(&entry, .hint, rand);
@@ -306,6 +314,35 @@ fn fill(entry: *ring.ShmLogEntry, comptime field: ring.TruncField, rand: std.Ran
     }
 }
 
+test "truncated and redacted are independent arrays" {
+    // Two different causes for a cut field, two separate signals: truncated =
+    // the text did not fit its slot, redacted = a redaction layer clipped at
+    // its scratch size. An auditor reading `redacted` knows PII context may
+    // be gone; `truncated` alone must never imply that.
+    const cases = [_]struct { truncated: u16, redacted: u16, want: []const u8 }{
+        // slot overflow only
+        .{ .truncated = 1 << @intFromEnum(ring.TruncField.message), .redacted = 0, .want = "\"truncated\":[\"message\"],\"redacted\":[]" },
+        // redaction clip only (result fit the slot)
+        .{ .truncated = 0, .redacted = 1 << @intFromEnum(ring.TruncField.message), .want = "\"truncated\":[],\"redacted\":[\"message\"]" },
+        // both, on different fields
+        .{ .truncated = 1 << @intFromEnum(ring.TruncField.detail), .redacted = 1 << @intFromEnum(ring.TruncField.query), .want = "\"truncated\":[\"detail\"],\"redacted\":[\"query\"]" },
+    };
+    for (cases) |c| {
+        var entry = std.mem.zeroes(ring.ShmLogEntry);
+        entry.seq = 1;
+        entry.elevel = 19;
+        ring.setStr(&entry.message, &entry.truncated_mask, .message, "text");
+        entry.truncated_mask = c.truncated;
+        entry.redacted_mask = c.redacted;
+        var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer line_w.deinit();
+        try writeEntry(&line_w.writer, &entry, .{});
+        const line = line_w.written();
+        try std.testing.expect(std.mem.find(u8, line, c.want) != null);
+        try std.testing.expect(try std.json.validate(std.testing.allocator, line));
+    }
+}
+
 test "full entry json" {
     var entry = std.mem.zeroes(ring.ShmLogEntry);
     entry.seq = 184;
@@ -346,6 +383,7 @@ test "full entry json" {
     try std.testing.expect(std.mem.find(u8, got, "\"app\":\"pgbench\"") != null);
     try std.testing.expect(std.mem.find(u8, got, "\"client_host\":\"10.0.0.7\"") != null);
     try std.testing.expect(std.mem.find(u8, got, "\"truncated\":[]") != null);
+    try std.testing.expect(std.mem.find(u8, got, "\"redacted\":[]") != null);
     // The whole line must be valid JSON — Vector rejects it otherwise.
     try std.testing.expect(try std.json.validate(std.testing.allocator, got));
 }

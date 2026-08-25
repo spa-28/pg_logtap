@@ -324,17 +324,22 @@ One JSON object per line:
   "pid": 12345,
   "backend_type": "client backend",
   "query": null,
-  "truncated": []
+  "truncated": [],
+  "redacted": []
 }
 ```
 
 Notes: `sqlerrcode` is the canonical 5-char SQLSTATE string. `app` /
 `client_host` come from the session (`[local]` for unix sockets). `host` /
 `cluster` / `pgdata` identify the sending server. Fields are copied into
-fixed-size slots — `message` up to 1024 bytes, other fields up to 256 — and
-`truncated` lists the fields that were cut; the cut backs off to a UTF-8
-character boundary, invalid bytes become U+FFFD. One event per log record,
-never split.
+fixed-size slots — `message` up to 1024 bytes, other fields up to 256; invalid
+bytes become U+FFFD. One event per log record, never split. A field can be cut
+for two different reasons, reported as separate arrays:
+`truncated` names fields that did not fit their slot (the tail is gone —
+fetch the full record from the server log if needed); `redacted` names fields
+a redaction layer had to clip at its scratch size — PII context beyond the
+clip may be gone. Both cuts back off to a UTF-8 character boundary, and a
+field can appear in both arrays.
 
 ## Monitoring
 

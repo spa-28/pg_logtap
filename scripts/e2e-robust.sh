@@ -8,7 +8,10 @@
 #                   (pgaudit semantics, always on), a plain message merely
 #                   mentioning the word is NOT touched, and redact_pattern
 #                   matches become <REDACTED> — both at capture, so the
-#                   secret is never on the wire nor in the fallback file
+#                   secret is never on the wire nor in the fallback file.
+#                   A redaction that clips and a slot that overflows are
+#                   reported separately: "truncated" (slot) vs "redacted"
+#                   (clip), each naming its fields
 #   backend-kill  : a logging backend SIGKILLed mid-emit — the emergency
 #                   restart path a PANIC takes (postmaster tears the cluster
 #                   down and rebuilds it, logging through the hook chain).
@@ -191,6 +194,43 @@ for line in whole.splitlines():  # the role's duration line has no red marker
         role = True
 assert q and p and role, "probe events missing (q=%s p=%s role=%s)" % (q, p, role)
 EOF
+# truncated vs redacted are two different causes for a cut field (LT-1): a
+# redaction that expands past the scratch cap clips WITHOUT slot-truncating
+# (the clip result fits the slot exactly) → redacted only; a DETAIL past its
+# 256-byte slot whose redaction also clips → both arrays name it.
+setguc pg_logtap.redact_pattern 'ZZ'; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redclip$SUF 0 %', repeat('ZZ ', 316);
+  END \$do\$" >/dev/null 2>&1 || true
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redboth$SUF 0 x' USING DETAIL = repeat('ZZ ', 400);
+  END \$do\$" >/dev/null 2>&1 || true
+wait_for redclip 1 20; wait_for redboth 1 20
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+clip = both = False
+for line in open(path, encoding="utf-8"):
+    if "logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if m.startswith("logtap robust redclip" + suf):
+        # 978-byte message, every ZZ expands by 8 bytes: the redaction clips
+        # at 1024 — the slot cap — so the slot itself never truncated it
+        assert "message" in e["redacted"] and "message" not in e["truncated"], e
+        assert len(m.encode()) == 1024 and "<REDACTED>" in m, len(m.encode())
+        clip = True
+    if m.startswith("logtap robust redboth" + suf):
+        # 1200-byte DETAIL: redaction clip at the scratch cap AND the 256-byte
+        # slot cut — both causes, both arrays
+        d = e.get("detail") or ""
+        assert "detail" in e["truncated"] and "detail" in e["redacted"], e
+        assert len(d.encode()) <= 256 and "<REDACTED>" in d, len(d.encode())
+        both = True
+assert clip and both, "probes missing (clip=%s both=%s)" % (clip, both)
+EOF
+ok "redaction clip and slot overflow reported separately (redacted vs truncated)"
 docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"

@@ -212,8 +212,8 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
 /// cut (pw — query field always, statement-embedded message lines) into one
 /// scratch buffer, then the redact_pattern regex over the result into the
 /// other. Layers that cannot change the text copy nothing. A layer that had
-/// to clip sets the field's truncated bit itself: setStr cannot, because the
-/// clipped result fits the slot.
+/// to clip sets the field's redacted bit itself: setStr cannot, because the
+/// clipped result fits the slot — and the cause is the clip, not the slot.
 fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool) void {
     if (src == null) return;
     var text: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(src)));
@@ -229,7 +229,7 @@ fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src:
         clipped = clipped or m.clipped;
     }
     ring.setStr(dst, &entry.truncated_mask, field, text);
-    if (clipped) entry.truncated_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    if (clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
 // --- worker side ---------------------------------------------------------------
