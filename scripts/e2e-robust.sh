@@ -237,10 +237,14 @@ echo "== backlog bound: 60k events into a dead receiver, no fallback file =="
 # Without a fallback file a dead receiver is DOCUMENTED loss (that is what
 # the file is for): the RAM backlog and the ring absorb what they hold, the
 # rest is dropped/trimmed and COUNTED. The contract under test: the worker's
-# memory stays at the bound instead of growing with the storm, every lost
-# event is accounted (captured == sent + dropped + lost once drained), and
-# delivery resumes the moment the receiver returns.
+# memory stays at the bound instead of growing with the storm — enforced by
+# a hard cgroup ceiling with no swap, under which an unbounded backlog (~all
+# 60k events ≈ 200MB over baseline) would push the server into the kernel
+# OOM path — every lost event is accounted (captured == sent + dropped + lost
+# once drained), and delivery resumes the moment the receiver returns.
+OOM_LIMIT_MB=256
 setguc pg_logtap.export_backlog_max 8192; reload; sleep 1 # the GUC minimum = ring capacity
+docker update --memory ${OOM_LIMIT_MB}m --memory-swap ${OOM_LIMIT_MB}m "$PG_CT" >/dev/null
 bcap=$(statf events_captured); bsent=$(statf events_sent); bdrp=$(statf events_dropped); blost=$(statf events_lost)
 rss0=$(vmrss_kb)
 docker stop "$VEC" >/dev/null
@@ -251,6 +255,15 @@ rss1=$(vmrss_kb)
 [ -n "$rss0" ] && [ -n "$rss1" ] || fail "backlog-bound: worker RSS unreadable (worker dead?)"
 [ "$rss1" -lt $((rss0 + 102400)) ] \
   || fail "backlog-bound: worker RSS grew past the bound (baseline=${rss0}kB after=${rss1}kB)"
+[ "$(docker inspect -f '{{.State.OOMKilled}}' "$PG_CT")" = false ] \
+  || fail "backlog-bound: pg container OOM-killed under the ${OOM_LIMIT_MB}MB ceiling"
+# High-water mark of the whole container (cgroup v2, v1 fallback): the wall
+# must never even be touched — no reclaim storms, no OOM victim of any kind.
+peak=$(docker exec "$PG_CT" cat /sys/fs/cgroup/memory.peak 2>/dev/null || \
+       docker exec "$PG_CT" cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null || true)
+[ -z "$peak" ] || [ "$peak" -lt $((OOM_LIMIT_MB * 1024 * 1024)) ] \
+  || fail "backlog-bound: cgroup memory peak ${peak}B touched the ${OOM_LIMIT_MB}MB ceiling"
+docker update --memory 0 --memory-swap 0 "$PG_CT" >/dev/null
 docker start "$VEC" >/dev/null; wait_vector
 gen oom4 20; wait_for oom4 20
 [ "$(received oom4)" = 20 ] || fail "backlog-bound: no delivery after recovery (oom4=$(received oom4)/20)"
@@ -277,8 +290,7 @@ drpd=$(( $(statf events_dropped) - bdrp )); lostd=$(( $(statf events_lost) - blo
   || fail "backlog-bound: the storm is not accounted (captured=$capd dropped=$drpd of 60000)"
 [ $((drpd + lostd)) -ge 40000 ] \
   || fail "backlog-bound: the bound was never exercised (dropped=$drpd lost=$lostd of 60000)"
-[ "$(docker inspect -f '{{.State.OOMKilled}}' "$PG_CT")" = false ] || fail "backlog-bound: pg container OOM-killed"
-ok "worker RSS ${rss0}→${rss1}kB (bounded), accounted: emitted=$((capd + drpd)) = captured=$capd + dropped=$drpd, captured = sent=$sentd + lost=$lostd, delivery resumed"
+ok "worker RSS ${rss0}→${rss1}kB (bounded), cgroup ceiling ${OOM_LIMIT_MB}MB never touched (peak ${peak:-?}B), accounted: emitted=$((capd + drpd)) = captured=$capd + dropped=$drpd, captured = sent=$sentd + lost=$lostd, delivery resumed"
 
 dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "$dups duplicate seqs across the suite"
