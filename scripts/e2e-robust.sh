@@ -4,6 +4,11 @@
 #   huge-fields   : a message and detail far past their ring slots (1024/256
 #                   bytes) arrive as ONE event, cut at a UTF-8 char boundary,
 #                   named in "truncated", still valid JSON at the receiver
+#   redact        : the password token in logged statement text is cut
+#                   (pgaudit semantics, always on), a plain message merely
+#                   mentioning the word is NOT touched, and redact_pattern
+#                   matches become <REDACTED> — both at capture, so the
+#                   secret is never on the wire nor in the fallback file
 #   backend-kill  : a logging backend SIGKILLed mid-emit — the emergency
 #                   restart path a PANIC takes (postmaster tears the cluster
 #                   down and rebuilds it, logging through the hook chain).
@@ -104,6 +109,10 @@ EOF
 }
 
 echo "== huge fields: message and detail past their ring slots =="
+# Reset every GUC a previous (possibly failed) run may have left armed — the
+# scenarios below set their own; a leftover redact_pattern or field_query
+# changes what this one must observe.
+setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 # 8k multibyte chars (16 KB into a 1024-byte slot) + a 2 KB detail (256-byte
 # slot): the cut points land mid-character — the copy must back off to the
@@ -129,6 +138,62 @@ for line in open(path, encoding="utf-8"):
         break
 EOF
 ok "one event, message ≤1024B cut at a char boundary, truncated=[message,detail], valid JSON"
+
+echo "== redaction: password token cut + redact_pattern =="
+# Statement logging on: duration lines carry the raw SQL in message, and
+# field_query captures it separately. Three probes: a CREATE ROLE with a
+# password (the pgaudit case — token cut must fire in both message and
+# query), a DO whose text embeds the token in a trailing comment (query cut)
+# while its WARNING message merely contains the word (must stay verbatim),
+# and a redact_pattern match inside a message.
+setguc log_min_duration_statement 0; setguc pg_logtap.field_query on; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc \
+  "CREATE ROLE \"tmp_red$SUF\" PASSWORD 'SECRET-query$SUF-abc123'" >/dev/null
+# token only in the statement text (trailing comment), not in the message
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redq$SUF 0 benign password note'; END \$do\$; -- password 'SECRET-do$SUF-abc123'" \
+  >/dev/null 2>&1 || true
+setguc pg_logtap.redact_pattern 'SECRET-[a-z0-9-]+'; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redp$SUF 0 token=SECRET-msg$SUF-abc123'; END \$do\$" \
+  >/dev/null 2>&1 || true
+wait_for redq 1 20; wait_for redp 1 20
+# vector-out.jsonl accumulates across runs BY DESIGN: the secrets carry this
+# run's suffix so stale lines from earlier runs cannot fail this one.
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: contract"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123"):
+    assert secret not in whole, secret + " reached the receiver unmasked"
+q = p = role = False
+for line in whole.splitlines():
+    if "logtap robust red" not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if m.startswith("logtap robust redq" + suf):
+        # message path: the word alone is not statement text — verbatim
+        assert "<REDACTED>" not in m and "benign password note" in m, m
+        # query path: the token cut fired on the comment-carried token
+        assert "<REDACTED>" in (e.get("query") or ""), repr(e.get("query"))
+        q = True
+    if m.startswith("logtap robust redp" + suf):
+        assert "<REDACTED>" in m, m  # redact_pattern fired at capture
+        p = True
+for line in whole.splitlines():  # the role's duration line has no red marker
+    if "tmp_red" + suf not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if "CREATE ROLE" in m:
+        assert "<REDACTED>" in m, m
+        role = True
+assert q and p and role, "probe events missing (q=%s p=%s role=%s)" % (q, p, role)
+EOF
+docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true
+setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
+ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
 
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a

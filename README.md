@@ -30,6 +30,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
+- **Capture-time redaction** — the `password` token in statement text is cut before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~29k events/s, and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
@@ -101,10 +102,11 @@ GUCs and restart again.
 
 | Option | Default | Context | Description |
 |---|---|---|---|
-| `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 22=PANIC). |
+| `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 23=PANIC — see the level table below). |
 | `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at the 1024-byte message cap; matching runs in every logging backend). |
 | `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching messages. |
-| `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. |
+| `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. ⚠ sensitive — see below. |
+| `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; avoid backreferences (see `pattern`). |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
 | `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
@@ -116,6 +118,150 @@ GUCs and restart again.
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot (~3.4 KB), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 | `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
+
+### Setting the minimum level
+
+`pg_logtap.level_min` is the numeric PostgreSQL elevel; every event at or
+above it is exported, everything below is dropped at capture (before the
+ring — it never occupies memory, never counts in the stats):
+
+| value | level | what you get |
+|---|---|---|
+| `10`–`14` | DEBUG5 … DEBUG1 | everything, including per-statement debug noise — storm volumes, use for troubleshooting only |
+| `15` | LOG | server operational messages: connections, checkpoints, autovacuum, duration lines from `log_min_duration_statement` — **the default** |
+| `16`–`18` | LOG_SERVER_ONLY / INFO / NOTICE | user-facing informational messages (RAISE INFO/NOTICE) plus LOG |
+| `19` | WARNING | warnings and everything above — the usual "no noise" export |
+| `21` | ERROR | errors only |
+| `22`/`23` | FATAL / PANIC | crash-level events only |
+
+Two filters stack, and both must let an event through: the server's own
+`log_min_messages` decides whether a line reaches the hook at all, then
+`level_min` decides whether pg_logtap exports it. So an export of
+`level_min = 21` (ERROR) with the default `log_min_messages = warning`
+works as expected, but `level_min = 15` (LOG) exports LOG lines only if the
+server also logs them (`log_min_messages = log` or lower). One PostgreSQL
+quirk to keep in mind: in `log_min_messages` the server ranks `LOG` between
+`ERROR` and `FATAL` for its own output, while `level_min` uses the raw
+elevel numbers, where LOG is 15.
+
+Apply without a restart — both settings reload on SIGHUP:
+
+```sql
+ALTER SYSTEM SET pg_logtap.level_min = 19;   -- WARNING and up
+SELECT pg_reload_conf();
+```
+
+Only `ring_capacity` (postmaster context) and `shared_preload_libraries`
+itself need a restart. On PostgreSQL ≤ 16, the first `ALTER SYSTEM SET
+pg_logtap.*` is rejected until the extension has loaded once — preload,
+restart, then set GUCs.
+
+A typical first setup, end to end:
+
+```ini
+# postgresql.conf (or ALTER SYSTEM): the tap itself
+shared_preload_libraries = 'pg_logtap'
+```
+
+```sql
+-- after restart:
+CREATE EXTENSION pg_logtap;
+ALTER SYSTEM SET pg_logtap.export_url = 'http://vector:8686';
+ALTER SYSTEM SET pg_logtap.level_min = 19;            -- warnings and up
+ALTER SYSTEM SET pg_logtap.pattern_exclude = 'checkpoint complete:.*';
+SELECT pg_reload_conf();
+
+-- verify: emit a warning, watch it arrive, then check the counters
+DO $$ BEGIN RAISE WARNING 'hello from pg_logtap'; END $$;
+SELECT pg_logtap_stats();
+```
+
+### Sizing the ring buffer
+
+`pg_logtap.ring_capacity` (postmaster — a restart applies it) is how many
+events fit between the logging backends and the worker: backends push into
+the ring under an LWLock, the worker drains it every `flush_interval`. It is
+a **spike absorber, not a queue** — the worker sustains tens of thousands of
+events per second, so the default `1024` only has to cover what accumulates
+between two push cycles. When it fills, new events are refused and counted
+in `events_dropped` — a live receiver should never get there.
+
+Leave it alone unless `/metrics` shows `events_dropped` growing while the
+receiver is up (spiky capture, e.g. `level_min = 10` debug storms or
+connection bursts on `log_connections`). Memory cost is `capacity × slot
+(≈3.4 KB)`: `8192` (the max) ≈ 28 MB of shared memory, paid at boot. A slow
+or dead receiver is *not* a ring problem — that is what `export_backlog_max`
+and the fallback file absorb (next section).
+
+### Tuning delivery
+
+All SIGHUP — re-tune on a running cluster:
+
+- `flush_interval` — the push cycle. Lower = fresher events at the receiver,
+  higher = larger batches (less HTTP overhead). 1000 ms suits most setups.
+- `export_timeout_ms` — connect/send/receive timeout for export sockets; a
+  receiver that accepts but never answers fails a batch after this instead
+  of stalling the worker.
+- `export_slow_ms` — once a live send takes at least this long, live batches
+  park on the `export_fallback_file` instead of piling up in RAM while the
+  receiver limps; `0` disables the parking.
+- `export_backlog_max` — RAM backlog depth before the oldest events are
+  trimmed (`events_lost`). Ceiling cost ≈ depth × 3.4 KB, paid only while
+  parking falls behind.
+
+The full delivery contract — what is guaranteed, what is counted, and the
+loss boundaries per failure scenario — is
+[docs/delivery.md](docs/delivery.md).
+
+### Sensitive data in events
+
+Query text can carry secrets — passwords (`CREATE ROLE ... PASSWORD`),
+tokens, personal data — and two independent paths ship it: `field_query`
+(whole query as a field) and `log_min_duration_statement` / `log_statement`
+(query text inside the `message` of duration lines, regardless of
+`field_query`). PostgreSQL itself logs those statements the same way, so the
+exposure follows your existing logging posture — but an export destination
+extends the audience. Two layers mask such text **at capture** — the ring,
+the fallback file and the receiver all hold the masked form only:
+
+- **Password cut, always on.** When the captured `query` field, or a
+  `message` line that embeds a statement (`statement: ...` from
+  `log_statement` / `log_min_duration_statement`), contains the standalone
+  word `password` (case-insensitive, word boundaries respected —
+  `user_passwords` does not trigger it), everything after that word is
+  dropped and replaced with `<REDACTED>`:
+
+  ```
+  duration: 3.2 ms  statement: CREATE ROLE app PASSWORD 'hunter2'
+  → duration: 3.2 ms  statement: CREATE ROLE app PASSWORD <REDACTED>
+  ```
+
+  A message that merely mentions the word (a warning, an app-level line) is
+  not statement text and passes verbatim. The cut covers the common
+  `PASSWORD '...'` shapes, not every way a secret can be encoded in SQL.
+- **`pg_logtap.redact_pattern`** — a POSIX ERE applied to
+  `message`/`detail`/`hint`/`context`/`query`; every match becomes
+  `<REDACTED>`:
+
+  ```sh
+  ALTER SYSTEM SET pg_logtap.redact_pattern = 'sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]+';
+  SELECT pg_reload_conf();
+  ```
+
+  Empty (the default) disables the layer. It runs in every logging backend,
+  so keep the pattern plain (see the backreference note under `pattern`), and
+  treat it as damage reduction: any single pattern can be evaded by a
+  determined writer, and a masked field is still evidence that something
+  sensitive was there.
+
+On top of that, the operational knobs:
+
+- keep `field_query` off (the default) and be deliberate about
+  `log_min_duration_statement`;
+- `pg_logtap.pattern_exclude` suppresses whole events at capture — e.g.
+  `'PASSWORD|IDENTIFIED BY'` never leaves the server at all;
+- scrub at the collector — Vector's `redact` transform (built-in filters for
+  emails/SSNs/custom regex) still applies to whatever else slips through.
 
 `export_url` schemes (gzip applies to the `http://` scheme only):
 

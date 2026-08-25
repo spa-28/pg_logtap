@@ -29,3 +29,27 @@ void lt_regex_free(lt_regex *r) {
 int lt_regex_matches(const lt_regex *r, const char *s) {
     return regexec(&r->re, s, 0, NULL, 0) == 0;
 }
+
+// Sub-expression variant for redaction: compiled without REG_NOSUB so
+// regexec reports the match span.
+lt_regex *lt_regex_compile_sub(const char *pattern) {
+    lt_regex *r = calloc(1, sizeof(lt_regex));
+    if (r == NULL) return NULL;
+    if (regcomp(&r->re, pattern, REG_EXTENDED) != 0) {
+        free(r);
+        return NULL;
+    }
+    return r;
+}
+
+// First match in s as (start,end) byte offsets from s; 1 = no match. notbol
+// keeps '^' anchored to the true string start when scanning resumes
+// mid-string (REG_NOTBOL is in POSIX).
+int lt_regex_find(const lt_regex *r, const char *s, int notbol,
+                  size_t *start, size_t *end) {
+    regmatch_t m[1];
+    if (regexec(&r->re, s, 1, m, notbol ? REG_NOTBOL : 0) != 0) return 1;
+    *start = (size_t) m[0].rm_so;
+    *end = (size_t) m[0].rm_eo;
+    return 0;
+}

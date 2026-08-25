@@ -67,7 +67,10 @@ phase_stand() { # <v>: build, compose stand, deploy + install the extension
   # stand rolls back every recreated container (compose's dependency
   # teardown), and the pg boot log dies with it — with nothing depending on
   # a lone pg, a boot crash leaves the container for the post-mortem dump.
-  docker rm -f "$C" >/dev/null 2>&1 || true # stale same-name container
+  # -v: the anon data volume follows the compose project, not the major —
+  # without it a full local run hands pg16 a data dir initdb'd by pg15
+  # ("database files are incompatible with server") and the stand never boots.
+  docker rm -f -v "$C" >/dev/null 2>&1 || true # stale same-name container
   if ! PG_MAJOR=$v PG_CT=$C $COMPOSE up -d --no-deps pg >/dev/null; then
     echo "pg$v: compose could not start pg" >&2
     docker logs "$C" >&2 || true
