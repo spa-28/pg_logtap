@@ -28,6 +28,7 @@ const c = struct {
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
+    extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
 };
 const net = std.c;
 
@@ -43,7 +44,17 @@ var guc_cluster_name: [*c]u8 = null;
 var guc_export_gzip: bool = false;
 var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
+var guc_export_timeout_ms: c_int = 5000;
+var guc_export_slow_ms: c_int = 250;
+var guc_export_backlog_max: c_int = 65_536;
+/// Receiver liveness probe: set when a live send answered but took at least
+/// export_slow_ms — such a receiver cannot keep up (256 events per slow
+/// round trip), so live batches park on the fallback file instead of piling
+/// up in the RAM backlog and being trimmed. Cleared by a fast send on the
+/// drain path once the receiver recovers.
+var receiver_slow = false;
 var guc_metrics_port: c_int = 0;
+var guc_metrics_addr: [*c]u8 = null;
 
 var got_sigterm = interrupts.Signal.new(0);
 var got_sighup = interrupts.Signal.new(0);
@@ -54,7 +65,11 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.metrics_addr", "Bind address for the /metrics and /healthz listener, as an IP literal (v4 or v6). Loopback by default — the counters name the host, cluster and data directory, so keep them off the network unless something scrapes them; 0.0.0.0 exposes to every interface.", null, &guc_metrics_addr, "127.0.0.1", pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
     // are not visible yet in _PG_init, so we cannot decide here. With an empty
     // URL the worker just sleeps on its latch (no drain, no export).
@@ -70,21 +85,24 @@ pub fn workerMain() void {
     if (comptime pg.PG_VERSION_NUM >= 180000) {
         pg.pqsignal_be(@intFromEnum(std.posix.SIG.TERM), handleTerm);
         pg.pqsignal_be(@intFromEnum(std.posix.SIG.HUP), handleHup);
+        pg.pqsignal_be(@intFromEnum(std.posix.SIG.USR1), handleUsr1);
     } else {
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.TERM), handleTerm);
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.HUP), handleHup);
+        _ = pg.pqsignal(@intFromEnum(std.posix.SIG.USR1), handleUsr1);
     }
     // Catalog access for database/user name resolution.
     pg.BackgroundWorkerInitializeConnection("postgres", null, 0);
     pg.BackgroundWorkerUnblockSignals();
 
     const alloc = std.heap.c_allocator;
-    var pending: std.ArrayList(ring.ShmLogEntry) = .empty;
+    var pending: Backlog = .{};
     defer pending.deinit(alloc);
     var names = NameCache{};
     capture.setWorkerLatch(); // backends wake this worker on the first event
     syncMetricsListener();
     refreshSourceId();
+    fbCreditBacklog(alloc);
 
     while (!got_sigterm.isSet()) {
         pg.ResetLatch(pg.MyLatch);
@@ -94,19 +112,43 @@ pub fn workerMain() void {
             syncMetricsListener();
             refreshSourceId();
         }
-        flushAll(alloc, &pending, &names);
+        // Absorb procsignal barriers (see handleUsr1). Errors here have no
+        // better handler than the next cycle — the barrier itself doesn't
+        // ereport.
+        interrupts.CheckForInterrupts() catch {};
+        flushAll(alloc, &pending, &names, false);
+        // Return a storm-swollen backlog buffer: parking keeps the ArrayList
+        // capacity, so a one-off million-event storm would otherwise pin GiB
+        // of RSS for the worker's whole life (measured: 6.6GiB retained).
+        if (pending.len() == 0 and pending.list.capacity > 4096) {
+            pending.deinit(alloc);
+            pending = .{};
+        }
         scrapeAll();
         _ = pg.WaitLatch(pg.MyLatch, pg.WL_LATCH_SET | pg.WL_TIMEOUT | pg.WL_EXIT_ON_PM_DEATH, @intCast(guc_flush_interval), 0);
     }
-    flushAll(alloc, &pending, &names); // graceful shutdown: hand off what we can
-    pg.proc_exit(0);
+    flushAll(alloc, &pending, &names, true); // graceful shutdown: hand off what we can
+    // Exit code 1, not 0: the postmaster treats a zero exit of a static
+    // bgworker as "work done, never restart" (rw_terminate), so anything
+    // except a postmaster-ordered stop — a stray SIGTERM from an operator,
+    // a supervisor — would silently disable export until the next cluster
+    // restart. Code 1 is the expected bgworker failure code: restart after
+    // bgw_restart_time (1 s), no cluster crash (only death by signal does
+    // that). During a real shutdown the postmaster is exiting itself and
+    // does not respawn.
+    pg.proc_exit(1);
 }
 
 /// One cycle: interleave ring drains with chunk pushes. A slow POST no longer
 /// lets the ring fill up mid-cycle — the backlog absorbs the burst instead.
 /// While the fallback file holds undelivered events it IS the backlog: live
 /// events append to it and it drains to the receiver in order.
-fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry), names: *NameCache) void {
+/// `final` (worker SIGTERM) ignores got_sigterm: the main loop already exited
+/// on it, so without this the "graceful shutdown: hand off what we can" call
+/// skipped its loop entirely and every clean stop silently dropped the ring
+/// contents and the RAM backlog. Still bounded: the 1s cycle deadline plus one
+/// send timeout (~export_timeout_ms worst case) with a dead receiver.
+fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, final: bool) void {
     if (guc_export_url == null or guc_export_url[0] == 0) return;
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
     const dest = dest_mod.parseUrl(url) orelse {
@@ -124,8 +166,18 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
     // honors SIGHUP/TERM. 64 members ≈ 16k events per flush_interval.
     var gzip_buf: ?[]u8 = null; // reused across chunks, freed on cycle exit
     defer if (gzip_buf) |z| alloc.free(z);
-    while (!got_sigterm.isSet()) {
-        drainInto(alloc, pending);
+    // Bound one flushAll call to ~1s of wall clock. The direct-send branch
+    // has no members cap (only the fallback branch does), so a receiver that
+    // answers slower than the capture rate keeps this loop running for the
+    // whole outage: counters bump, /metrics and SIGHUP handling only happen
+    // between flushAll calls — all three froze mid-storm while trims piled
+    // up in a local and flushed minutes late. The next cycle resumes 100ms
+    // later; a fast receiver still drains a full backlog in one call.
+    const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
+    var drained_total: usize = 0; // live inflow this flushAll call
+    while (final or !got_sigterm.isSet()) {
+        if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+        drained_total += drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
 
         if (fbQueued()) {
@@ -137,27 +189,51 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
             // rate; logFallback(true) fires only on a failed send, never on
             // these appends — a transition line per append would feed itself
             // back through the hook into the queue, forever.
-            while (pending.items.len > 0) {
-                const count = @min(pending.items.len, chunk_max);
-                const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+            var appended = false;
+            while (pending.len() > 0) {
+                // The park loop obeys the outer loop's disciplines PER CHUNK:
+                // under a sustained storm pending never empties, and without
+                // these one flushAll call runs for the whole storm — counters,
+                // /metrics and SIGHUP freeze, the ring starves (3.7M events
+                // dropped at capture in a 7-min 15k/s storm) and the RAM
+                // backlog grows GiB-scale because trimBacklog never runs.
+                if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+                drained_total += drainInto(alloc, pending);
+                lost += trimBacklog(pending);
+                const count = @min(pending.len(), chunk_max);
+                const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
                 if (!fbAppend(alloc, body, false)) { // disk full → RAM-backlog semantics for the rest
                     failed += 1;
                     break;
                 }
-                dropFront(pending, count);
+                pending.dropFront(count);
                 queued += count;
+                appended = true;
             }
-            fbFsync();
+            if (appended) fbFsync();
+            // Capture outranks replay: a member send to a slow receiver blocks
+            // this loop for hundreds of milliseconds, and at high inflow the
+            // ring fills and drops events at capture before the next drain.
+            // While the receiver is slow AND this cycle saw any live inflow,
+            // park-only: fsync and hand the loop back to drainInto; members
+            // resume once inflow quiets or it recovers.
+            if (receiver_slow and drained_total > 0) continue;
             const m = fbNextMember(alloc) orelse {
                 lost += fb_lost;
                 fb_lost = 0;
-                failed += @intFromBool(pending.items.len > 0); // append failed above
+                failed += @intFromBool(pending.len() > 0); // append failed above
                 break;
             };
             lost += fb_lost;
             fb_lost = 0;
             const gz = gzipPayload(alloc, dest, m.body, &gzip_buf);
+            const m_sent_at = pg.GetCurrentTimestamp();
             if (send(dest, url, gz.payload, gz.on)) {
+                // Drain-path round trip is the receiver liveness probe: a slow
+                // answer re-arms the park (receiver_slow), a fast one clears
+                // it — this also arms it after a restart into a slow receiver
+                // where the live-send probe never ran.
+                if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
                 logFallback(false);
                 // counted queued at append time; this is its delivery
                 replayed += std.mem.countScalar(u8, m.body, '\n');
@@ -172,18 +248,45 @@ fn flushAll(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry),
             break; // retry the queue next cycle
         }
 
-        if (pending.items.len == 0) break;
-        const count = @min(pending.items.len, chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.items[0..count], names) orelse break;
+        if (pending.len() == 0) break;
+        const count = @min(pending.len(), chunk_max);
+        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
+        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, body, true)) {
+            // Slow-but-alive receiver (receiver_slow): park coming batches on
+            // disk — left live, they pile up in the RAM backlog until trimmed.
+            // Same as the failed-send divert below, minus failed: nothing
+            // failed; the queue path owns catch-up from the next iteration.
+            // A park that cannot append (no fallback file, disk full) falls
+            // through to the live send below: that send is also the only
+            // probe that clears receiver_slow — parking into nowhere while
+            // the flag is set livelocks delivery forever.
+            logFallback(true);
+            pending.dropFront(count);
+            queued += count;
+            continue;
+        }
         const gz = gzipPayload(alloc, dest, body, &gzip_buf);
+        const sent_at = pg.GetCurrentTimestamp();
         if (send(dest, url, gz.payload, gz.on)) {
             logFallback(false);
-            dropFront(pending, count);
+            pending.dropFront(count);
             sent += count;
+            // Liveness probe, both ways: an answer this slow cannot keep up
+            // with capture; a fast one clears the park — the live path must
+            // clear it too, or a slow answer with no fallback file set parks
+            // every later batch with no way back.
+            if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000;
         } else if (fbAppend(alloc, body, true)) {
             logFallback(true);
-            dropFront(pending, count);
+            pending.dropFront(count);
             queued += count; // durably parked: counted replayed on delivery
+            failed += 1; // the send DID fail — without this a diverting storm
+            // reports send_cycles_failed=0 (the receiver-down signal) while
+            // actively losing events
+            break; // return to the main loop: flush counters, serve /metrics
+            // and the latch; the queue path (the file is non-empty now) owns
+            // catch-up from the next cycle — without the break one flushAll
+            // call loops for the whole outage with stats frozen mid-loss
         } else {
             failed += 1; // counts failed flush CYCLES, not events
             break; // retry the backlog next cycle
@@ -209,31 +312,69 @@ fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, na
 }
 
 /// Ring → backlog. OOM counts the drained events as lost (ring is already drained).
-fn drainInto(alloc: std.mem.Allocator, pending: *std.ArrayList(ring.ShmLogEntry)) void {
+fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
+    var drained: usize = 0;
     var batch: [drain_batch]ring.ShmLogEntry = undefined;
     while (true) {
         const count = capture.drainBatch(&batch);
-        if (count == 0) return;
-        pending.appendSlice(alloc, batch[0..count]) catch {
+        if (count == 0) return drained;
+        pending.append(alloc, batch[0..count]) catch {
             capture.bumpExport(0, 0, 0, 0, count);
-            return;
+            return drained;
         };
+        drained += count;
     }
 }
 
-/// Backlog bound: keep the newest ring_capacity events, return what fell off.
-fn trimBacklog(pending: *std.ArrayList(ring.ShmLogEntry)) u64 {
-    if (pending.items.len <= capture.capacity()) return 0;
-    const lost: u64 = pending.items.len - capture.capacity();
-    dropFront(pending, lost);
+/// Backlog bound: keep the newest export_backlog_max events, return what fell
+/// off. The bound only matters when parking sustains a real deficit — spikes
+/// (fsync, scheduler contention) must fit inside it, or events that would park
+/// a second later get trimmed; ring_capacity (~0.5s of storm inflow) was that
+/// tight, so trim fired in bursts while sustained parking matched inflow.
+fn trimBacklog(pending: *Backlog) u64 {
+    const cap: usize = @max(guc_export_backlog_max, capture.capacity());
+    if (pending.len() <= cap) return 0;
+    const lost: u64 = pending.len() - cap;
+    pending.dropFront(lost);
     return lost;
 }
 
-fn dropFront(list: *std.ArrayList(ring.ShmLogEntry), count: usize) void {
-    const rest = list.items.len - count;
-    std.mem.copyForwards(ring.ShmLogEntry, list.items[0..rest], list.items[count..]);
-    list.items.len = rest;
-}
+/// Front-consumable RAM backlog: appended at the tail (ring drains), consumed
+/// from the head (chunk parks / sends). dropFront is O(1) — a head index, with
+/// the dead prefix compacted inside append once it dominates. The old
+/// shift-per-chunk copyForwards moved up to 27MB (8192 × 3.4KB) per 256-event
+/// chunk and capped park throughput at ~14k events/s: below storm inflow, so
+/// the trim fired continuously and lost events even with the fallback file on.
+const Backlog = struct {
+    list: std.ArrayList(ring.ShmLogEntry) = .empty,
+    head: usize = 0,
+
+    fn len(self: *const Backlog) usize {
+        return self.list.items.len - self.head;
+    }
+
+    fn live(self: *const Backlog) []ring.ShmLogEntry {
+        return self.list.items[self.head..];
+    }
+
+    fn append(self: *Backlog, alloc: std.mem.Allocator, items: []const ring.ShmLogEntry) !void {
+        if (self.head > 0 and self.head * 2 >= self.list.items.len) {
+            const rest = self.list.items.len - self.head;
+            std.mem.copyForwards(ring.ShmLogEntry, self.list.items[0..rest], self.list.items[self.head..]);
+            self.list.items.len = rest;
+            self.head = 0;
+        }
+        try self.list.appendSlice(alloc, items);
+    }
+
+    fn dropFront(self: *Backlog, count: usize) void {
+        self.head = @min(self.head + count, self.list.items.len);
+    }
+
+    fn deinit(self: *Backlog, alloc: std.mem.Allocator) void {
+        self.list.deinit(alloc);
+    }
+};
 
 // --- failures in the server log: on transition only, not every cycle ----------
 
@@ -539,6 +680,39 @@ fn fbTruncate() void {
     if (c.ftruncate(fd, 0) == 0) fb_offset = 0;
 }
 
+/// The fallback file can outlive the shmem counters: a postmaster restart
+/// zeroes queued/replayed/…, the disk queue does not. Credit this epoch's
+/// queued with what the file already holds so backlog (queued − replayed)
+/// stays a real number and replayed ≤ queued holds. One decompress pass at
+/// worker start; fb_offset is restored afterwards — the drain replays from
+/// the top as before (at-least-once contract unchanged).
+/// A worker restart (postmaster alive, counters intact) must credit nothing:
+/// its predecessor already counted every append now in the file, and a
+/// re-credit would inflate backlog (queued − replayed) forever — the file
+/// draining does not repair a counter difference. Every append this epoch
+/// bumped queued, so `file events −| queued` is exactly the uncounted part:
+/// zero after a worker restart, the whole file after a postmaster restart.
+fn fbCreditBacklog(alloc: std.mem.Allocator) void {
+    const saved_offset = fb_offset;
+    const saved_lost = fb_lost;
+    var lines: u64 = 0;
+    while (true) {
+        const before = fb_offset;
+        const m = fbNextMember(alloc) orelse {
+            // null without advancing = drained, torn tail or foreign file;
+            // null WITH advancing = unreadable member skipped — keep walking
+            if (fb_offset == before) break;
+            continue;
+        };
+        lines += std.mem.countScalar(u8, m.body, '\n');
+        fb_offset += m.advance;
+    }
+    fb_offset = saved_offset;
+    fb_lost = saved_lost;
+    const due = lines -| capture.snapshot().queued;
+    if (due > 0) capture.bumpExport(0, due, 0, 0, 0);
+}
+
 /// Fallback on/off transitions only — same discipline as export failures.
 var was_fallback = false;
 
@@ -553,7 +727,10 @@ fn logFallback(active: bool) void {
 }
 
 fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
-    const conn_fd = dialTcp(h.host, h.port) orelse return failSend("dial", 0);
+    // dialTcp has already set the specific reason (dns / connect errno=N);
+    // a generic "dial errno=0" here would overwrite it and hide which stage
+    // failed.
+    const conn_fd = dialTcp(h.host, h.port) orelse return false;
     defer _ = c.close(conn_fd);
     var head_buf: [512]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
@@ -573,7 +750,8 @@ fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
 }
 
 fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
-    const conn_fd = fd_opt orelse return failSend("dial", 0);
+    // As sendHttp: the dial path already recorded why it failed.
+    const conn_fd = fd_opt orelse return false;
     defer _ = c.close(conn_fd);
     if (!writeAll(conn_fd, body)) return failSend("write body", std.c._errno().*);
     return true;
@@ -595,7 +773,33 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     return c.fdatasync(conn_fd) == 0;
 }
 
+extern fn __res_init() c_int;
+
+var dns_fail_streak: u32 = 0;
+
+// The last address a dial actually reached, keyed by its host. When dns
+// later fails in-process — the wedged-resolver state below, outliving every
+// res_init re-arm on some cores — dialing this address keeps delivery alive.
+// Container names keep their IP across docker stop/start, which is exactly
+// the outage shape. Ceiling: a name that moves to a new IP while dns also
+// fails in-process stays unreachable until the resolver heals or the worker
+// restarts; recreating the receiver recreates the stand, which restarts
+// postgres too.
+var dns_good_host: [255]u8 = undefined;
+var dns_good_host_len: usize = 0;
+// sockaddr bytes as getaddrinfo made them. align(8) = sockaddr_storage grade:
+// dialAddr's connect casts this to *sockaddr, and an odd .bss slot trips the
+// alignment check (ReleaseSafe aborts the worker, taking the postmaster down).
+var dns_good_addr: [128]u8 align(8) = undefined;
+var dns_good_addr_len: u32 = 0;
+var dns_good_family: c_int = 0;
+
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.
+/// getaddrinfo is blocking with NO timeout knob — export_timeout_ms bounds
+/// only connect/send/recv (set below). A wedged resolver stalls the worker
+/// for the resolver's own timeouts (resolv.conf: ~5s × attempts × servers);
+/// the failure mode is the same as a dead receiver (ring absorbs, then
+/// events_lost), never a permanent hang. IP literals skip resolution.
 fn dialTcp(host: []const u8, port: u16) ?c_int {
     if (host.len >= 256) {
         _ = failSend("host too long", 0);
@@ -608,26 +812,97 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     const port_str = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return null;
 
     var hints = std.mem.zeroes(net.addrinfo);
-    hints.family = 0; // AF_UNSPEC: IPv4 or IPv6
     hints.socktype = 1; // SOCK_STREAM
     var res: ?*net.addrinfo = null;
-    if (@intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res)) != 0) {
-        _ = failSend("dns", 0);
+    // AF_UNSPEC makes glibc query A and AAAA on one resolver socket. Docker's
+    // embedded DNS has no AAAA for container names and can fail that half
+    // instantly — glibc then reports EAI_AGAIN (-3) for the whole lookup,
+    // persistently, while other processes in the same netns resolve fine.
+    // EAI_AGAIN is the transient class, so retry with the A family alone
+    // before believing it.
+    var gai: c_int = 0;
+    inline for (.{ 0, 2 }) |fam| { // AF_UNSPEC, then AF_INET
+        hints.family = fam;
+        gai = @intFromEnum(net.getaddrinfo(@ptrCast(&host_buf), port_str.ptr, &hints, &res));
+        if (gai != -3) break;
+    }
+    if (gai != 0) {
+        // glibc's resolver can wedge in this process: a lookup interrupted at
+        // the wrong internal moment (the latch's SIGUSR1s are dense exactly
+        // while events flow) leaves later getaddrinfos failing fast with
+        // EAI_AGAIN/EAI_NONAME while fresh processes resolve fine — and the
+        // wedge RE-FORMS right after a successful delivery, because the
+        // delivery's own transition event wakes the worker into the next
+        // lookup 1ms later. Re-init every 10th consecutive failure so a
+        // wedged episode gets repeated chances; harmless while the name is
+        // really gone (res_init just re-parses resolv.conf). On some cores
+        // the wedge outlives every re-init — the cached-address dial below
+        // carries delivery through those.
+        dns_fail_streak += 1;
+        if (dns_fail_streak >= 10 and dns_fail_streak % 10 == 0) {
+            _ = __res_init();
+            if (dns_fail_streak == 10)
+                elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
+        }
+        if (dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {
+            if (dialAddr(&dns_good_addr, dns_good_addr_len, dns_good_family)) |conn_fd| return conn_fd;
+        }
+        // The code separates the failure classes: -2 NONAME (name genuinely
+        // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
+        // the real cause in errno — report that instead. The host goes into
+        // the reason verbatim: a corrupted slice shows up as garbage here,
+        // separating "the name is really gone" from in-process rot.
+        const code: c_int = if (gai == -1) std.c._errno().* else gai;
+        fail_reason = std.fmt.bufPrint(&fail_reason_buf, "dns errno={d} host='{s}' ({d} bytes)", .{ code, host[0..@min(host.len, 24)], host.len }) catch "dns";
         return null;
     }
+    dns_fail_streak = 0;
     defer if (res) |r| net.freeaddrinfo(r);
 
     var it = res;
     while (it) |ai| : (it = ai.next) {
-        const conn_fd = c.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
-        if (conn_fd < 0) continue;
-        if (net.connect(conn_fd, ai.addr.?, ai.addrlen) == 0) return conn_fd;
-        const err = std.c._errno().*;
-        _ = c.close(conn_fd);
-        _ = failSend("connect", err);
+        if (dialAddr(ai.addr.?, ai.addrlen, ai.family)) |conn_fd| {
+            if (host.len <= dns_good_host.len and ai.addrlen <= dns_good_addr.len) {
+                @memcpy(dns_good_host[0..host.len], host);
+                dns_good_host_len = host.len;
+                @memcpy(dns_good_addr[0..ai.addrlen], @as([*]const u8, @ptrCast(ai.addr.?))[0..ai.addrlen]);
+                dns_good_addr_len = ai.addrlen;
+                dns_good_family = ai.family;
+            }
+            return conn_fd;
+        }
     }
     return null;
 }
+
+/// socket + connect for one resolved address, with the send timeouts from
+/// export_timeout_ms applied before connect (see below). Returns the
+/// connected fd or null after reporting the connect error via failSend.
+fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
+    const conn_fd = c.socket(@intCast(family), 1, 0); // SOCK_STREAM, default protocol
+    if (conn_fd < 0) return null;
+    // A silent receiver (accepted connect, never answers; hung LB,
+    // black-hole route) must not hang the single worker loop — with no
+    // timeout, the status recv blocks forever: drain stops, the ring
+    // overflows, /metrics and SIGHUP go unserved. Set before connect:
+    // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
+    // return EAGAIN, which flows into the ordinary failSend →
+    // retry/fallback path like any dead receiver.
+    const tv = Timeval{
+        .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
+        .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
+    };
+    _ = net.setsockopt(conn_fd, 1, 20, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
+    _ = net.setsockopt(conn_fd, 1, 21, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
+    if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
+    const err = std.c._errno().*;
+    _ = c.close(conn_fd);
+    _ = failSend("connect", err);
+    return null;
+}
+
+/// timeval(3type) for setsockopt: both fields c_long on linux x86-64/arm64.
+const Timeval = extern struct { sec: i64, usec: i64 };
 
 /// Remember why the last send failed; surfaces in the transition log line.
 fn failSend(stage: []const u8, err: c_int) bool {
@@ -653,40 +928,72 @@ fn writeAll(conn_fd: c_int, buf: []const u8) bool {
 }
 
 fn recvSome(conn_fd: c_int, buf: []u8) usize {
-    const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
-    return if (count > 0) @intCast(count) else 0;
+    while (true) {
+        const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
+        if (count > 0) return @intCast(count);
+        // A signal (SIGUSR1 latch poke, SIGHUP) arriving mid-read is not a
+        // receiver fault — retry like writeAll does, or every reload aborts
+        // a healthy in-flight request ("status read errno=4").
+        if (count == -1 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+        return 0; // real fault: EAGAIN (timeout) flows into failSend
+    }
 }
 
 // --- Prometheus /metrics (M4): scrapes served from the worker loop, no threads --
 
 var metrics_fd: c_int = -1;
-var metrics_port_open: c_int = -1; // port the socket currently reflects
+var metrics_open_port: c_int = -1; // port the socket currently reflects
+var metrics_open_addr_buf: [64]u8 = undefined; // …and the address it reflects
+var metrics_open_addr: []const u8 = "";
 
-/// (Re)open the listening socket when the configured port changed (SIGHUP).
+/// (Re)open the listening socket when port or address changed (SIGHUP).
 fn syncMetricsListener() void {
-    if (metrics_port_open == guc_metrics_port) return;
-    metrics_port_open = guc_metrics_port;
+    const addr = if (guc_metrics_addr == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(guc_metrics_addr)));
+    if (metrics_open_port == guc_metrics_port and std.mem.eql(u8, metrics_open_addr, addr)) return;
+    metrics_open_port = guc_metrics_port;
+    if (addr.len <= metrics_open_addr_buf.len) {
+        @memcpy(metrics_open_addr_buf[0..addr.len], addr);
+        metrics_open_addr = metrics_open_addr_buf[0..addr.len];
+    } else metrics_open_addr = addr; // overlong: listenOn will reject it anyway
     if (metrics_fd >= 0) {
         _ = c.close(metrics_fd);
         metrics_fd = -1;
     }
     if (guc_metrics_port <= 0) return;
-    metrics_fd = listenOn(@intCast(guc_metrics_port)) orelse {
-        elog.Log(@src(), "pg_logtap.metrics_port {d} failed to listen, metrics disabled", .{guc_metrics_port});
+    metrics_fd = listenOn(addr, @intCast(guc_metrics_port)) orelse {
+        elog.Log(@src(), "pg_logtap.metrics_port {d} on \"{s}\" failed to listen, metrics disabled", .{ guc_metrics_port, addr });
         return;
     };
-    elog.Log(@src(), "pg_logtap metrics serving /metrics and /healthz on port {d}", .{guc_metrics_port});
+    elog.Log(@src(), "pg_logtap metrics serving /metrics and /healthz on {s}:{d}", .{ addr, guc_metrics_port });
 }
 
-fn listenOn(port: u16) ?c_int {
-    const listen_fd = c.socket(2, 1 | 2048, 0); // AF_INET, SOCK_STREAM|SOCK_NONBLOCK
+fn listenOn(addr_str: []const u8, port: u16) ?c_int {
+    if (addr_str.len >= 64) return null;
+    var str_buf: [64]u8 = undefined;
+    @memcpy(str_buf[0..addr_str.len], addr_str);
+    str_buf[addr_str.len] = 0;
+    // inet_pton, not DNS: a bind address is an IP literal or a config error —
+    // a name would silently bind to whatever it resolved to at open time.
+    var v4 = std.mem.zeroes(net.sockaddr.in);
+    v4.family = 2; // AF_INET
+    v4.port = std.mem.nativeToBig(u16, port);
+    var v6 = std.mem.zeroes(net.sockaddr.in6);
+    v6.family = 10; // AF_INET6
+    v6.port = std.mem.nativeToBig(u16, port);
+    var family: c_uint = undefined;
+    var sa: []const u8 = undefined;
+    if (c.inet_pton(2, @ptrCast(&str_buf), &v4.addr) == 1) { // AF_INET
+        family = 2;
+        sa = std.mem.asBytes(&v4);
+    } else if (c.inet_pton(10, @ptrCast(&str_buf), &v6.addr) == 1) { // AF_INET6
+        family = 10;
+        sa = std.mem.asBytes(&v6);
+    } else return null;
+    const listen_fd = c.socket(family, 1 | 2048, 0); // SOCK_STREAM|SOCK_NONBLOCK
     if (listen_fd < 0) return null;
     const one: c_int = 1;
     _ = net.setsockopt(listen_fd, 1, 2, &one, @sizeOf(c_int)); // SOL_SOCKET, SO_REUSEADDR
-    var addr = std.mem.zeroes(net.sockaddr.in);
-    addr.family = 2; // AF_INET
-    addr.port = std.mem.nativeToBig(u16, port);
-    if (net.bind(listen_fd, @ptrCast(&addr), @sizeOf(net.sockaddr.in)) != 0 or net.listen(listen_fd, 8) != 0) {
+    if (net.bind(listen_fd, @ptrCast(@alignCast(sa.ptr)), @intCast(sa.len)) != 0 or net.listen(listen_fd, 8) != 0) {
         _ = c.close(listen_fd);
         return null;
     }
@@ -728,5 +1035,21 @@ fn handleTerm(sig: c_int) callconv(.c) void {
 fn handleHup(sig: c_int) callconv(.c) void {
     _ = sig;
     got_sighup.set(1);
+    if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
+}
+
+/// procsignal (SIGUSR1) carries cross-backend events; the one that matters
+/// here is the barrier: DROP DATABASE waits until every backend holding a
+/// ProcSignal slot absorbs it, and this worker connects to a database, so it
+/// holds a slot. Without this handler (plus CheckForInterrupts in the main
+/// loop) it never absorbs — DROP DATABASE hangs forever on any cluster with
+/// pg_logtap loaded, worker idle the whole time. The barrier flag is set
+/// unconditionally: absorbing an already-absorbed generation is a no-op, and
+/// the other procsignal reasons (notify, parallel message) don't apply to a
+/// worker with no client.
+fn handleUsr1(sig: c_int) callconv(.c) void {
+    _ = sig;
+    interrupts.Pending.ProcSignalBarrier.set(1);
+    interrupts.Pending.Interrupt.set(1);
     if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
 }

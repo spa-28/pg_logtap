@@ -19,12 +19,13 @@ jobs:
       # The pgzx dependency runs pg_config at configure time (any zig build
       # invocation) and links libpq; any server-dev version will do here.
       - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev libkrb5-dev
-      # Version lives in control + sql filename + build.zig.zon; fail early
-      # if they drift apart (the release job names packages from the tag).
+      # Version lives in control + sql filename + build.zig.zon + version.zig;
+      # fail early if they drift apart (the release job names packages from the tag).
       - run: |
           v=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
           [ -f "sql/pg_logtap--$v.sql" ] || { echo "sql/pg_logtap--$v.sql missing"; exit 1; }
           grep -q "\"$v\"" build.zig.zon || { echo "build.zig.zon version != $v"; exit 1; }
+          grep -q "\"$v\"" src/version.zig || { echo "src/version.zig version != $v"; exit 1; }
       - run: zig build fmt --summary all
       - run: zig build lint --summary all
       - run: zig build test --summary all
@@ -34,16 +35,30 @@ jobs:
       - run: zig build --summary all
 
   matrix:
-    runs-on: ubuntu-latest
+    # Fast-fail: check (fmt/lint/test/version sync, ~2.5 min) gates the eight
+    # build legs so a trivial break doesn't burn the whole matrix.
+    needs: check
     strategy:
       fail-fast: false
       matrix:
         pg: ["15", "16", "17", "18"]
+        arch: [amd64, arm64]
+        # arm64 builds natively on GitHub's arm runners — same PGDG repo
+        # (apt.postgresql.org publishes arm64), same zig, same glibc 2.28
+        # baseline; the whole docker-based e2e below runs there as-is.
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+            zig_arch: x86_64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            zig_arch: aarch64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install zig 0.16.0
         run: |
-          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
           mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
           echo "/opt/zig" >> "$GITHUB_PATH"
       # ubuntu ships only one server-dev major; the rest come from PGDG
@@ -58,17 +73,23 @@ jobs:
             sudo apt-get update
           fi
           sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev libkrb5-dev
+      # The check job runs the unit tests on amd64 only; run them per arch
+      # too — the regex shim and the ring layout are the arch-sensitive parts.
+      - run: zig build test --summary all
+        env:
+          PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
       - run: scripts/test-matrix.sh 5 ${{ matrix.pg }}
         env:
           PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
       - uses: actions/upload-artifact@v4
         with:
-          name: pg_logtap-pg${{ matrix.pg }}-amd64
+          name: pg_logtap-pg${{ matrix.pg }}-${{ matrix.arch }}
           path: dist/pg${{ matrix.pg }}/lib/pg_logtap.so
           if-no-files-found: error
 
   # On a published release: rebuild via the jobs above, then attach one
-  # installable package per PG major, named pg_logtap-<version>-pg<N>-amd64.tar.gz
+  # installable package per PG major × arch, named
+  # pg_logtap-<version>-pg<N>-<amd64|arm64>.tar.gz
   # (lib/ + extension/ layout, ready to untar into the PG install).
   release:
     needs: [check, matrix]
@@ -86,9 +107,11 @@ jobs:
           ctl=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
           [ "$V" = "$ctl" ] || { echo "tag v$V != control default_version $ctl"; exit 1; }
           mkdir rel
-          for d in dist/pg_logtap-pg*-amd64; do
-            pg=${d#dist/pg_logtap-pg}; pg=${pg%-amd64}
-            pkg=pg_logtap-$V-pg$pg-amd64
+          for d in dist/pg_logtap-pg*-*; do
+            rest=${d#dist/pg_logtap-pg}
+            pg=${rest%%-*}
+            arch=${rest##*-}
+            pkg=pg_logtap-$V-pg$pg-$arch
             mkdir -p pkg/lib pkg/extension rel
             cp "$d/pg_logtap.so" pkg/lib/
             cp pg_logtap.control sql/*.sql pkg/extension/

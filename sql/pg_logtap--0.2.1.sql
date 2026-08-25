@@ -1,4 +1,4 @@
-/* pg_logtap 0.2.0 */
+/* pg_logtap 0.2.1 */
 CREATE FUNCTION pg_logtap_version() RETURNS text
 AS 'MODULE_PATHNAME', 'pg_logtap_version'
 LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;

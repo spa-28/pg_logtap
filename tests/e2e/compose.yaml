@@ -1,0 +1,94 @@
+# E2E stand: one command brings up everything the suites need, gated on real
+# readiness —
+#   PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
+# The suites then run against it by container name (scripts/test-matrix.sh
+# brings it up per PG major). Standing infrastructure with a readiness
+# contract lives here; the failure choreography inside the suites (docker
+# kill/stop/start mid-scenario) stays imperative — compose brings the stand
+# up, the tests break it.
+#
+# ponytail: ONE stand per host — the fixed container names are the suites'
+# addressing contract. To run isolated stands side by side, drop every
+# container_name and resolve containers via the pg container's compose
+# labels (project) instead; nobody needs that yet.
+#
+# pg      postgres with the extension deployed after start (docker cp +
+#         ALTER SYSTEM + restart — test-matrix.sh / dev-deploy.sh). The
+#         container name comes from $PG_CT so the version matrix keeps one
+#         container per major (pglogtap-mx15..18) for post-mortem; the
+#         default is the interactive stand name.
+# vector  the logtap receiver (./vector.yaml), file sink into /tmp/logtap-e2e
+#         on the host; suites count distinct markers there, so the output
+#         file accumulates across runs by design
+# ready   one-shot gate, exits 0 only after vector accepts TCP: vector binds
+#         its port slowly on a loaded host (observed 30 s locally), and the
+#         pre-compose flakes were exactly generating before that bind.
+# vlogs   VictoriaLogs (the stand's vector fans every event out to it with
+#         the prod-shaped jsonline ingest); e2e-vlogs.sh asserts EXACT
+#         delivery counts through the whole chain via its select API
+# silent  long-running consumer of the gate: it starts only after ready
+#         completed successfully, so a plain `up -d` does not return until
+#         pg is healthy AND the receiver ports answer. "The stand is up" is
+#         then one checkable fact: pglogtap-ready exited 0 (the suites guard
+#         on exactly that).
+name: pglogtap-e2e
+
+services:
+  pg:
+    image: postgres:${PG_MAJOR:-18}
+    container_name: ${PG_CT:-pglogtap-e2e}
+    environment:
+      POSTGRES_PASSWORD: dev
+    healthcheck:
+      # TCP on purpose: the official image's temporary initdb server answers
+      # pg_isready on the unix socket before the real server exists.
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  vector:
+    image: timberio/vector:0.57.0-alpine
+    container_name: pglogtap-vector
+    command: --config /etc/vector/vector.yaml
+    volumes:
+      - ./vector.yaml:/etc/vector/vector.yaml:ro
+      - /tmp/logtap-e2e:/var/log
+    # No healthcheck of its own: the image ships no shell to probe with —
+    # `ready` probes the port from its own netns instead.
+
+  vlogs:
+    image: victoriametrics/victoria-logs:v1.52.0
+    container_name: pglogtap-vlogs-e2e # NOT ...-vlogs: that name belongs to
+    # the long-lived manual receiver some dev hosts keep running
+    # No healthcheck of its own (no shell in the image): `ready` probes 9428.
+
+  ready:
+    image: alpine:3.20
+    container_name: pglogtap-ready
+    depends_on:
+      pg:
+        condition: service_healthy
+      vector:
+        condition: service_started
+      vlogs:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    # pg itself is already guaranteed healthy by the depends_on above; what
+    # it cannot express is the receivers' PORTS, so probe them here.
+    command:
+      - |
+        n=0
+        until nc -z vector 8686 && nc -z vlogs 9428; do
+          n=$$((n+1)); [ "$$n" -gt 60 ] && { echo "receivers not accepting after 60s" >&2; exit 1; }
+          sleep 1
+        done
+
+  silent:
+    image: alpine/socat
+    container_name: pglogtap-silent
+    # socat is the image entrypoint; the SYSTEM arg is one argv element.
+    command: ["TCP-LISTEN:9499,reuseaddr,fork", "SYSTEM:cat >/dev/null"]
+    depends_on:
+      ready:
+        condition: service_completed_successfully

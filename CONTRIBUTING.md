@@ -22,8 +22,11 @@ scripts/build.sh 18 test            # unit tests (standalone, no server needed)
 ```
 
 Anything touching the export path also deserves a run of the e2e scripts
-(`scripts/e2e-vector.sh`, `scripts/e2e-kill.sh`) — they need a container with
-the extension deployed.
+(`scripts/e2e-vector.sh`, `scripts/e2e-kill.sh`, `scripts/e2e-robust.sh`) —
+they need a container with the extension deployed. The full pipeline per
+PostgreSQL major, including the pgbench storm and every failure-mode suite:
+`scripts/test-matrix.sh`; a subset against a stand the full run brought up:
+`PHASES=storm,kill scripts/test-matrix.sh 5 18`.
 
 ## Rules of the road
 

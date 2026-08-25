@@ -27,16 +27,27 @@ var guc_level_min: c_int = 15; // LOG
 var guc_pattern: [*c]u8 = null;
 var guc_pattern_exclude: [*c]u8 = null;
 var guc_field_query: bool = false;
+var guc_redact_pattern: [*c]u8 = null;
 var guc_ring_capacity: c_int = 1024;
 
 /// Compiled from the GUCs on every assign; read-only in the hook (E1).
 var filter_cache = filter.Filter{};
+/// Compiled pg_logtap.redact_pattern; null unless the GUC is set.
+var redactor: ?filter.Redactor = null;
+
+/// Redaction scratch: the password-token cut writes one buffer, the regex
+/// pass the other, so the hook never allocates. One byte over the message
+/// slot — the largest text field — so a full-length field still gets its
+/// NUL terminator without losing a byte to it.
+var redact_a: [ring.msg_len + 1]u8 = undefined;
+var redact_b: [ring.msg_len + 1]u8 = undefined;
 
 pub fn init() void {
-    pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5 .. 22=PANIC).", null, &guc_level_min, 15, 10, 22, pg.PGC_SIGHUP, 0, null, assignLevel, null);
+    pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5, 15=LOG, 19=WARNING, 21=ERROR, 23=PANIC). Filters export only — stderr/log_destination output is governed by the server's own log_min_messages.", null, &guc_level_min, 15, 10, 23, pg.PGC_SIGHUP, 0, null, assignLevel, null);
     pg.DefineCustomStringVariable("pg_logtap.pattern", "POSIX ERE; capture only matching messages (empty = all).", null, &guc_pattern, "", pg.PGC_SIGHUP, 0, null, assignPattern, null);
     pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching messages.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, null, assignPatternExclude, null);
-    pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting. Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
+    pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event. SECURITY: queries can embed tokens and personal data beyond passwords (literals in INSERTs) — the standalone password token is cut always and redact_pattern masks its matches, but everything else ships as written; leave off unless the receiver is trusted. log_min_duration_statement puts query text into message regardless of this setting; pattern_exclude suppresses whole events at capture.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
 
     pg.shmem_request_hook = shmemRequestHook;
@@ -55,20 +66,26 @@ fn assignLevel(newval: c_int, extra: ?*anyopaque) callconv(.c) void {
 fn assignPattern(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
     if (filter_cache.include) |*re| re.deinit();
-    filter_cache.include = compileOrWarn(newval, "pg_logtap.pattern");
+    filter_cache.include = compileOrWarn(filter.Regex, newval, "pg_logtap.pattern");
 }
 
 fn assignPatternExclude(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
     if (filter_cache.exclude) |*re| re.deinit();
-    filter_cache.exclude = compileOrWarn(newval, "pg_logtap.pattern_exclude");
+    filter_cache.exclude = compileOrWarn(filter.Regex, newval, "pg_logtap.pattern_exclude");
 }
 
-fn compileOrWarn(pattern: [*c]const u8, guc: [*:0]const u8) ?filter.Regex {
+fn assignRedact(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
+    _ = extra;
+    if (redactor) |*r| r.deinit();
+    redactor = compileOrWarn(filter.Redactor, newval, "pg_logtap.redact_pattern");
+}
+
+fn compileOrWarn(comptime T: type, pattern: [*c]const u8, guc: [*:0]const u8) ?T {
     if (pattern == null) return null;
     const span = std.mem.span(@as([*:0]const u8, @ptrCast(pattern)));
     if (span.len == 0) return null;
-    return filter.Regex.compile(span) orelse {
+    return T.compile(span) orelse {
         std.log.warn("invalid regex in {s}, ignoring", .{guc}); // no ereport inside GUC machinery
         return null;
     };
@@ -77,8 +94,10 @@ fn compileOrWarn(pattern: [*c]const u8, guc: [*:0]const u8) ?filter.Regex {
 fn rebuildFilter() void {
     filter_cache.deinit();
     filter_cache.level_min = guc_level_min;
-    filter_cache.include = compileOrWarn(guc_pattern, "pg_logtap.pattern");
-    filter_cache.exclude = compileOrWarn(guc_pattern_exclude, "pg_logtap.pattern_exclude");
+    filter_cache.include = compileOrWarn(filter.Regex, guc_pattern, "pg_logtap.pattern");
+    filter_cache.exclude = compileOrWarn(filter.Regex, guc_pattern_exclude, "pg_logtap.pattern_exclude");
+    if (redactor) |*r| r.deinit();
+    redactor = compileOrWarn(filter.Redactor, guc_redact_pattern, "pg_logtap.redact_pattern");
 }
 
 // --- shared memory -----------------------------------------------------------
@@ -159,13 +178,18 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     const port: ?*pg.Port = @ptrCast(pg.MyProcPort);
     if (port) |p| copyStr(&entry.client_host, &entry, .client_host, p.remote_host);
 
-    copyStr(&entry.message, &entry, .message, d.message);
-    copyStr(&entry.detail, &entry, .detail, d.detail);
-    copyStr(&entry.hint, &entry, .hint, d.hint);
-    copyStr(&entry.context, &entry, .context, d.context);
+    // Statement-embedded text (log_statement / log_min_duration_statement
+    // lines) carries the raw SQL, passwords included; the token cut is gated
+    // on that marker so an ordinary message mentioning the word is untouched.
+    const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
+    const stmt_line = std.mem.indexOf(u8, msg_span, "statement: ") != null;
+    copyText(&entry.message, &entry, .message, d.message, stmt_line);
+    copyText(&entry.detail, &entry, .detail, d.detail, false);
+    copyText(&entry.hint, &entry, .hint, d.hint, false);
+    copyText(&entry.context, &entry, .context, d.context, false);
     copyStr(&entry.filename, &entry, .filename, d.filename);
     copyStr(&entry.funcname, &entry, .funcname, d.funcname);
-    if (guc_field_query) copyStr(&entry.query, &entry, .query, pg.debug_query_string);
+    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, true);
 
     lockRing();
     const was_empty = state.count == 0;
@@ -182,6 +206,30 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
 fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8) void {
     if (src == null) return;
     ring.setStr(dst, &entry.truncated_mask, field, std.mem.span(@as([*:0]const u8, @ptrCast(src))));
+}
+
+/// Copy a C string field through the redaction layers: the `password` token
+/// cut (pw — query field always, statement-embedded message lines) into one
+/// scratch buffer, then the redact_pattern regex over the result into the
+/// other. Layers that cannot change the text copy nothing. A layer that had
+/// to clip sets the field's truncated bit itself: setStr cannot, because the
+/// clipped result fits the slot.
+fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool) void {
+    if (src == null) return;
+    var text: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(src)));
+    var clipped = false;
+    if (pw) {
+        const m = filter.redactPassword(&redact_a, text);
+        text = m.text;
+        clipped = m.clipped;
+    }
+    if (redactor) |*r| {
+        const m = r.apply(&redact_b, text);
+        text = m.text;
+        clipped = clipped or m.clipped;
+    }
+    ring.setStr(dst, &entry.truncated_mask, field, text);
+    if (clipped) entry.truncated_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
 // --- worker side ---------------------------------------------------------------
@@ -240,21 +288,32 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
         return @intFromPtr(pg.construct_array_builtin(&none, 0, text_oid));
     }
 
-    var datums: [max_dump]pg.Datum = undefined;
+    // Under the lock: only the struct copy out of shmem. Everything that can
+    // elog (palloc, catalog lookups) runs below, outside — an elog between
+    // acquire/release longjmps past LWLockRelease, and every logging backend
+    // then blocks on the held lock: an OOM in dump would hang the cluster.
+    // The copy buffer itself is palloc'd BEFORE the lock for the same reason
+    // (elogs while the lock is still unheld); the query context owns it.
+    const copies: []ring.ShmLogEntry = (@as([*]ring.ShmLogEntry, @ptrCast(@alignCast(pg.palloc(@sizeOf(ring.ShmLogEntry) * limit)))))[0..limit];
     const ring_q = ring.Ring.init(state, entries);
     lockRing();
     const count = @min(ring.snapshot(ring_q).count, limit);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const entry = ring.peek(ring_q, i) orelse break;
-        var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
-        defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, &entry, resolveNames(&entry)) catch break;
-        const line = line_w.written();
-        datums[i] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+    var taken: u32 = 0;
+    while (taken < count) : (taken += 1) {
+        copies[taken] = ring.peek(ring_q, taken) orelse break;
     }
     unlockRing();
-    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(i), text_oid));
+
+    var datums: [max_dump]pg.Datum = undefined;
+    var n: u32 = 0;
+    while (n < taken) : (n += 1) {
+        var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer line_w.deinit();
+        jsonl.writeEntry(&line_w.writer, &copies[n], resolveNames(&copies[n])) catch break;
+        const line = line_w.written();
+        datums[n] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+    }
+    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(n), text_oid));
 }
 
 /// Catalog lookups run in the caller's memory context — palloc'd results are

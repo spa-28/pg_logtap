@@ -2,7 +2,8 @@
 
 What pg_logtap promises, per failure scenario, with numbers. The assumptions:
 `ring_capacity` = R (default 1024, max 8192, POSTMASTER), capture rate = r events/s,
-`flush_interval` = f (default 1000 ms). One event ≈ 3.4 KB of shared memory
+`flush_interval` = f (default 1000 ms), RAM backlog depth =
+`export_backlog_max` (default 65536, SIGHUP). One event ≈ 3.4 KB of shared memory
 (8192-slot ring ≈ 28 MB). Counters are **per cluster life** — shared memory dies
 with the postmaster, so `pg_logtap_stats()` (and the `pg_logtap_delivery`
 view) restarts from zero on every restart.
@@ -47,33 +48,38 @@ transforms:
 ## Loss boundaries per scenario
 
 Buffers: the shmem ring (≤ R events) + the worker RAM backlog (trimmed to the
-newest R events). Everything else is already delivered.
+newest `export_backlog_max` events, 65536 by default). Everything else is
+already delivered.
 
 ### Receiver down for T minutes
 
 Without a fallback file, events survive downtime only while they fit in
-ring + backlog. **Zero-loss downtime = R / r**:
+ring + backlog. **Zero-loss downtime ≈ export_backlog_max / r** (the ring is
+negligible next to it):
 
-| R | @100 ev/s | @1 k ev/s | @8 k ev/s (debug storm) |
+| export_backlog_max | @100 ev/s | @1 k ev/s | @8 k ev/s (debug storm) |
 |---|---|---|---|
-| 1024 (default) | 10 s | 1 s | 0.13 s |
-| 8192 (max) | 82 s | 8 s | 1 s |
+| 65536 (default) | 10.9 min | 65 s | 8 s |
+| 16384 (low-RAM box) | 2.7 min | 16 s | 2 s |
 
-Beyond that the backlog drops **oldest-first** (`export_lost`), and on recovery
-the newest R events are delivered. 10 min at 1 k ev/s ≈ 600k events → ~592k
-lost, 8192 delivered. With `export_fallback_file` set (below): **zero lost,
-for any T** — failed batches are diverted to a compressed on-disk queue and
-replayed when the receiver answers.
+Beyond that the backlog drops **oldest-first** (`events_lost`), and on recovery
+the newest `export_backlog_max` events are delivered. 10 min at 1 k ev/s ≈ 600k
+events → ~535k lost, 65536 delivered. With `export_fallback_file` set (below):
+**zero lost, for any T** — failed batches are diverted to a compressed
+on-disk queue and replayed when the receiver answers.
 
 ### Postmaster SIGKILL / node crash
 
 Without a fallback file, both buffers are volatile. Everything
-captured-but-not-yet-delivered is lost: **up to 2·R events, uncounted** (the
-counters die with the shmem). Graceful shutdown (SIGTERM/postmaster stop) runs
-one final flush cycle first; SIGKILL skips it. With `export_fallback_file` set,
-the queue is on disk and **survives the crash** — the restarted worker replays
-it; the exposure shrinks to roughly one `flush_interval` of events (in RAM at
-the moment of the kill) plus the in-flight chunk.
+captured-but-not-yet-delivered is lost: **up to R + export_backlog_max events,
+uncounted** (the counters die with the shmem). Graceful shutdown
+(SIGTERM/postmaster stop) runs one final flush cycle first — bounded: ~1 s of
+work plus one send timeout with a dead receiver — delivering or parking what it
+can; SIGKILL skips it.
+With `export_fallback_file` set, the queue is on disk and **survives the
+crash** — the restarted worker replays it; the exposure shrinks to roughly one
+`flush_interval` of events (in RAM at the moment of the kill) plus the
+in-flight chunk.
 
 ### Export worker crash
 
@@ -81,8 +87,8 @@ A bgworker dying by signal is treated by the postmaster like a backend crash:
 **emergency restart of the whole cluster** → identical to a postmaster crash. The capture path
 (emit_log_hook → ring) never touches the worker, so database logging is not
 blocked for an instant either way. A soft worker exit is auto-restarted after
-1 s: ring and counters survive (shmem intact), but the RAM backlog (≤ R events)
-vanishes uncounted.
+1 s: ring and counters survive (shmem intact), but the RAM backlog
+(≤ export_backlog_max events) vanishes uncounted.
 
 ### Disk full
 
@@ -90,7 +96,7 @@ pg_logtap uses no disk while exporting over the network — shmem, RAM and
 sockets only; capture and export are unaffected (PostgreSQL itself will fail
 on WAL writes first — a different failure domain). A full disk does close the
 fallback queue: appends fail, and events fall back to the RAM-backlog behavior
-above (oldest-first loss once the backlog is full, counted in `export_lost`).
+above (oldest-first loss once the backlog is full, counted in `events_lost`).
 A `file://` destination on a full disk behaves the same way.
 
 ## The fallback queue
@@ -112,9 +118,10 @@ appended to the queue — one **gzip member per batch** behind a length framing
 tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
-step is involved. On restart the same replay happens automatically (scenario C
-of `scripts/e2e-kill.sh`: SIGKILL with a full queue, receiver back after boot
-→ all events delivered, queue empty, zero duplicate seqs).
+step is involved. On restart the same replay happens automatically (the
+`fallback-queue` scenario of `scripts/e2e-kill.sh`: SIGKILL with a full
+queue, receiver back after boot → all events delivered, queue empty, zero
+duplicate seqs).
 
 Crash windows: a crash mid-append leaves a torn trailing member — detected and
 truncated on the next read. A crash mid-replay loses only the in-memory
@@ -169,15 +176,17 @@ ring wakes it immediately, so even a connection burst (~85k events/s from 16
 pgbench connects at debug1) is drained as it arrives instead of overflowing
 the ring during one sleep. The queue drains one gzip member per flush cycle
 (plus a bounded 64 members before the worker yields to counters/metrics/SIGHUP),
-so delivery resumes without a RAM-backlog loss path; `lost` can still grow
-only if the queue file itself becomes unreadable or the disk fills (then the
-RAM-backlog semantics apply to the excess).
+so delivery resumes without a RAM-backlog loss path. A receiver that answers
+but is too slow to keep up (`export_slow_ms`) parks live batches on the same
+file losslessly instead of stalling the worker, so `events_lost` there too
+grows only on sustained capture past export capacity, a full disk, or an
+unreadable queue member (then the RAM-backlog semantics apply to the excess).
 
 ## Alerting
 
 Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules.yml):
 
-- `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow, receiver too slow or down past R/r.
+- `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow — capture sustained past export capacity (receiver too slow or down longer than export_backlog_max/r).
 - `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
 - `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
 
