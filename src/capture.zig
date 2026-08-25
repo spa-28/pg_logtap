@@ -85,8 +85,9 @@ fn compileOrWarn(comptime T: type, pattern: [*c]const u8, guc: [*:0]const u8) ?T
     if (pattern == null) return null;
     const span = std.mem.span(@as([*:0]const u8, @ptrCast(pattern)));
     if (span.len == 0) return null;
-    return T.compile(span) orelse {
-        std.log.warn("invalid regex in {s}, ignoring", .{guc}); // no ereport inside GUC machinery
+    var diag = filter.CompileDiag{};
+    return T.compileDiag(span, &diag) orelse {
+        std.log.warn("regex in {s} did not compile, ignoring: {s}", .{ guc, diag.text() }); // no ereport inside GUC machinery
         return null;
     };
 }

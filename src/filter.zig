@@ -17,20 +17,50 @@ const std = @import("std");
 /// Allocated by src/c/regex_shim.c; size is the target libc's own.
 pub const LtRegex = opaque {};
 
-extern fn lt_regex_compile(pattern: [*:0]const u8) ?*LtRegex;
+extern fn lt_regex_compile(pattern: [*:0]const u8, errbuf: [*c]u8, errlen: usize) ?*LtRegex;
 extern fn lt_regex_free(re: *LtRegex) void;
 extern fn lt_regex_matches(re: *const LtRegex, s: [*:0]const u8) c_int;
-extern fn lt_regex_compile_sub(pattern: [*:0]const u8) ?*LtRegex;
+extern fn lt_regex_compile_sub(pattern: [*:0]const u8, errbuf: [*c]u8, errlen: usize) ?*LtRegex;
 /// s must be NUL-terminated at its end (our sources are C strings); reports
 /// the first match as byte offsets from s.
 extern fn lt_regex_find(re: *const LtRegex, s: [*]const u8, notbol: c_int, start: *usize, end: *usize) c_int;
+
+/// regerror's text for a failed compile: the operator sees why the pattern
+/// was rejected ("Unmatched [") instead of a generic "invalid regex" that
+/// misdiagnoses e.g. REG_ESPACE as a syntax error.
+pub const CompileDiag = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const CompileDiag) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Shared compile-with-diag: on failure the shim filled buf with regerror's
+/// NUL-terminated text, which is copied into the caller's diag if it wants it.
+fn compileInto(comptime f: anytype, pattern: [:0]const u8, diag: ?*CompileDiag) ?*LtRegex {
+    var buf: [128]u8 = undefined;
+    const re = f(pattern.ptr, &buf, buf.len) orelse {
+        if (diag) |d| {
+            d.len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+            @memcpy(d.buf[0..d.len], buf[0..d.len]);
+        }
+        return null;
+    };
+    return re;
+}
 
 pub const Regex = struct {
     re: *LtRegex,
 
     /// Returns null on invalid pattern (or OOM).
     pub fn compile(pattern: [:0]const u8) ?Regex {
-        return .{ .re = lt_regex_compile(pattern.ptr) orelse return null };
+        return compileDiag(pattern, null);
+    }
+
+    pub fn compileDiag(pattern: [:0]const u8, diag: ?*CompileDiag) ?Regex {
+        return .{ .re = compileInto(lt_regex_compile, pattern, diag) orelse return null };
     }
 
     pub fn deinit(self: *Regex) void {
@@ -88,6 +118,19 @@ test "empty pattern compiles to always-match" {
 
 test "invalid pattern rejected" {
     try std.testing.expect(Regex.compile("[unclosed") == null);
+}
+
+test "compile failure reports regerror's text" {
+    // The point is the operator-facing message: "invalid regex" hides a
+    // REG_ESPACE (memory) behind what reads like a syntax problem. Both
+    // libcs' texts for an unmatched bracket mention the bracket itself.
+    var diag = CompileDiag{};
+    try std.testing.expect(Regex.compileDiag("[unclosed", &diag) == null);
+    try std.testing.expect(diag.len > 0);
+    try std.testing.expect(std.mem.indexOfScalar(u8, diag.text(), '[') != null);
+    var diag2 = CompileDiag{};
+    try std.testing.expect(Redactor.compileDiag("a(", &diag2) == null);
+    try std.testing.expect(diag2.len > 0);
 }
 
 // --- redaction ----------------------------------------------------------------
@@ -161,7 +204,11 @@ pub const Redactor = struct {
     re: *LtRegex,
 
     pub fn compile(pattern: [:0]const u8) ?Redactor {
-        return .{ .re = lt_regex_compile_sub(pattern.ptr) orelse return null };
+        return compileDiag(pattern, null);
+    }
+
+    pub fn compileDiag(pattern: [:0]const u8, diag: ?*CompileDiag) ?Redactor {
+        return .{ .re = compileInto(lt_regex_compile_sub, pattern, diag) orelse return null };
     }
 
     pub fn deinit(self: *Redactor) void {
