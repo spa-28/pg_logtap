@@ -151,8 +151,16 @@ fn unlockRing() void {
 // --- the hook ----------------------------------------------------------------
 
 fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
+    // Re-entrancy guard first and total: prev_hook may be an extension that
+    // logs from inside its hook (audit hooks do), and forwarding — or
+    // capturing — the nested line re-enters hook → elog → hook without
+    // bound. The nested line still reaches the server log (elog prints it
+    // regardless); it is only exempt from hook processing.
+    if (in_hook) return;
+    in_hook = true;
+    defer in_hook = false;
     if (prev_hook) |p| p(edata);
-    if (!ready or in_hook) return;
+    if (!ready) return;
     // The postmaster runs this hook for its own lines too — and during an
     // emergency restart it logs from inside PGSharedMemoryCreate, after the
     // old segment is already unmapped: `state` dangles there and even a read
@@ -164,9 +172,6 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (d.message == null) return;
     const msg: [*:0]const u8 = @ptrCast(d.message);
     if (!filter_cache.accepts(d.elevel, msg)) return;
-
-    in_hook = true;
-    defer in_hook = false;
 
     var entry = std.mem.zeroes(ring.ShmLogEntry);
     entry.timestamp_us = pg.GetCurrentTimestamp();
