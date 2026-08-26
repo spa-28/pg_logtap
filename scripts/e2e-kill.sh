@@ -358,13 +358,22 @@ echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest 
 # lost, no duplicate replay.
 docker exec "$PG_CT" sh -c "rm -f '$FB_DIR/$FB_REL2'"
 setguc pg_logtap.fallback_max_mb 1
+# The default backlog depth (65536 × ~3.4KB ≈ 220MB of worker RAM, documented
+# ceiling) is legal but heavy: this container's memory.peak is later asserted
+# under a 256MB cgroup ceiling (robust backlog-bound), and peak accumulates
+# from birth — a full-depth transient here would trip that assert on a phase
+# that was not even running. The GUC floor keeps the storm at ~28MB; the
+# contract under test (file bound, newest tail, loss counting) needs the
+# backlog only as a conveyor to the file, not at depth.
+setguc pg_logtap.export_backlog_max 8192
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
 gen cap1 90000; sleep 6 # storm parks >1MB of members; compaction fires
 sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
 [ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
 L=$(statf events_lost)
 [ "$L" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count lost events (lost=$L)"
-setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb 512; reload
+setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb 512
+setguc pg_logtap.export_backlog_max 65536; reload
 n=0; while [ "$n" -lt 30 ]; do
   sleep 1; n=$((n + 1))
   backlog=$(( $(statf events_queued) - $(statf events_replayed) ))
