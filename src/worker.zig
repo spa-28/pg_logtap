@@ -336,6 +336,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     }
 
     capture.bumpExport(sent, queued, replayed, failed, lost);
+    // Every cycle, not on transitions: the worker-local originals die with
+    // the process, and a stale shmem copy would otherwise outlive a restart
+    // (e.g. fallback_broken=1 from a file the operator already fixed).
+    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fb_broken));
     logTransitions(sent + replayed, failed, lost);
 }
 
@@ -612,7 +616,11 @@ fn fbPread(fd: c_int, buf: []u8, offset: u64) isize {
 /// True while the fallback file holds undelivered events — flushAll then
 /// routes everything through it to keep global order.
 fn fbQueued() bool {
-    if (fb_broken or fallbackPath() == null) return false;
+    // fallbackPath() FIRST: while fb_broken, short-circuiting on it would
+    // never re-resolve the GUC, and the reset inside fallbackPath (path-string
+    // change) is the one way a broken queue recovers without a restart.
+    if (fallbackPath() == null) return false;
+    if (fb_broken) return false;
     const file_fd = fbOpen() orelse return false;
     defer _ = c.close(file_fd);
     const size = fbSize(file_fd) orelse return false;
@@ -910,8 +918,9 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
         // carries delivery through those.
         dns_fail_streak += 1;
         if (dns_fail_streak >= 10 and dns_fail_streak % 10 == 0) {
-            _ = __res_init();
-            if (dns_fail_streak == 10)
+            if (__res_init() != 0)
+                elog.Log(@src(), "pg_logtap resolver re-init failed, dns may stay wedged in this process", .{})
+            else if (dns_fail_streak == 10)
                 elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
         }
         if (dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {

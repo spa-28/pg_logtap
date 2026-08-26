@@ -34,3 +34,40 @@ groups:
             Sends to export_url have been failing for 5m. Events buffer in
             the bounded backlog (and the fallback queue, if set); they start
             dropping once it fills.
+      - alert: PgLogtapFallbackQueueBroken
+        expr: pg_logtap_fallback_broken == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_logtap fallback queue disabled on {{ $labels.instance }}"
+          description: >-
+            The fallback file has foreign or corrupt framing and is no longer
+            appended to or replayed: durability quietly degraded to the RAM
+            backlog bound. Remove or fix the file, then repoint
+            pg_logtap.export_fallback_file to a different path (a path-string
+            change re-checks the file and clears the flag) or restart the
+            worker.
+      - alert: PgLogtapDnsFailing
+        expr: pg_logtap_dns_fail_streak > 10
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "pg_logtap cannot resolve the export receiver on {{ $labels.instance }}"
+          description: >-
+            Consecutive failed getaddrinfo lookups for the export_url host.
+            Delivery continues via the last-known-good address while it stays
+            valid; check DNS/the receiver's network registration if it does
+            not recover.
+      - alert: PgLogtapRedactPatternFailed
+        expr: pg_logtap_redact_pattern_failed == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_logtap redact_pattern is invalid on {{ $labels.instance }}"
+          description: >-
+            pg_logtap.redact_pattern did not compile and redaction by that
+            layer is OFF (fail-open). The compile error text is in the server
+            log. Fix the pattern; the gauge clears on the next successful
+            compile.

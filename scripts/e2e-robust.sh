@@ -235,6 +235,15 @@ docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" 
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
 
+# An invalid redact_pattern fails OPEN (the layer turns off, logs flow) — the
+# only durable signal is the redact_pattern_failed gauge, probed both ways.
+# Empty pattern after reset is "layer off", not a failure: the flag reads 0.
+setguc pg_logtap.redact_pattern '[unclosed'; reload; sleep 1
+[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid redact_pattern did not set redact_pattern_failed=1"
+setguc pg_logtap.redact_pattern ''; reload; sleep 1
+[ "$(statf redact_pattern_failed)" = 0 ] || fail "pattern reset did not clear redact_pattern_failed"
+ok "redact_pattern_failed: invalid pattern → 1, reset → 0 (fail-open is visible)"
+
 # Extended protocol (JDBC, psycopg, pgbench -M extended): duration lines for
 # parse/bind/execute carry the raw SQL WITHOUT the "statement: " marker — the
 # cut must fire on the phase words too. The probe SQL puts the tag BEFORE the

@@ -322,6 +322,34 @@ wait_for stop1 300
 [ "$(received stop1)" = 300 ] || fail "postmaster stop: queue lost across graceful stop (stop1=$(received stop1)/300)"
 ok "graceful stop in ${stop_s}s (bounded), queue carried 300/300 across the shutdown"
 
+echo "== dns_fail_streak gauge: unresolvable host, then recovery =="
+setguc pg_logtap.export_fallback_file '' # this scenario is about dns, not the queue
+setguc pg_logtap.export_url "http://no-such-logtap-host$SUF:8686"
+reload; sleep 1
+gen dnsfail 5; sleep 2 # traffic forces a dial: getaddrinfo NONAME → streak ≥ 1
+# (the events buffer in the RAM backlog — no fallback file in this scenario)
+streak=$(statf dns_fail_streak)
+[ "$streak" -ge 1 ] 2>/dev/null || fail "dns-fail gauge: dns_fail_streak=$streak after failed lookups — not exported?"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for dnsfail 5 # the buffered events ride the recovery
+[ "$(statf dns_fail_streak)" = 0 ] || fail "dns-fail gauge: streak did not reset after recovery ($(statf dns_fail_streak))"
+ok "dns_fail_streak $streak→0, visible in pg_logtap_stats()"
+
+echo "== fallback_broken gauge: foreign file disables the queue, gauge says so =="
+docker exec "$PG_CT" sh -c "echo 'not a pg_logtap queue' > '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2 # queue scan hits the foreign magic → fb_broken
+[ "$(statf fallback_broken)" = 1 ] || fail "fallback_broken gauge: $(statf fallback_broken) with a foreign fallback file"
+# While broken the worker won't touch that path again. The flag (and the
+# queue) recover when the GUC points at a DIFFERENT path — the path-string
+# change resets consumer state and re-checks the file — or on a restart.
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+FB_REL2=pg_logtap-fallback2.bin
+setguc pg_logtap.export_fallback_file "$FB_REL2"; reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] || fail "fallback_broken gauge: did not clear on repoint to a fresh path ($(statf fallback_broken))"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
+
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.export_timeout_ms 5000; reload
 echo "e2e-kill: all scenarios passed"

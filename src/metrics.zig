@@ -10,7 +10,7 @@ pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Sta
     const method = parts.next() orelse "";
     const path = parts.next() orelse "";
 
-    var body_buf: [2048]u8 = undefined;
+    var body_buf: [4096]u8 = undefined;
     var body_w = std.Io.Writer.fixed(&body_buf);
     var is_ok = true;
     if (!std.mem.eql(u8, method, "GET")) {
@@ -63,11 +63,21 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_ring_capacity Ring capacity in events.
         \\# TYPE pg_logtap_ring_capacity gauge
         \\pg_logtap_ring_capacity {d}
+        \\# HELP pg_logtap_dns_fail_streak Consecutive failed getaddrinfo lookups for the export receiver host; reset by any success. Delivery continues via the last-known-good address while it stays valid.
+        \\# TYPE pg_logtap_dns_fail_streak gauge
+        \\pg_logtap_dns_fail_streak {d}
+        \\# HELP pg_logtap_fallback_broken 1 = the fallback queue file is foreign or corrupt and is neither appended to nor replayed: durability degraded to the RAM backlog bound until the GUC points at a different path or the worker restarts.
+        \\# TYPE pg_logtap_fallback_broken gauge
+        \\pg_logtap_fallback_broken {d}
+        \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern did not compile and that redaction layer is OFF (fail-open). The compile error text is in the server log.
+        \\# TYPE pg_logtap_redact_pattern_failed gauge
+        \\pg_logtap_redact_pattern_failed {d}
         \\
     , .{
-        snap.captured,    snap.dropped,  snap.sent,
-        snap.queued,      snap.replayed, snap.send_failed,
-        snap.export_lost, snap.count,    snap.capacity,
+        snap.captured,        snap.dropped,         snap.sent,
+        snap.queued,          snap.replayed,        snap.send_failed,
+        snap.export_lost,     snap.count,           snap.capacity,
+        snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
     });
 }
 
@@ -75,6 +85,9 @@ test "metrics response" {
     var snap = std.mem.zeroes(ring.Stats);
     snap.captured = 7;
     snap.capacity = 1024;
+    snap.dns_fail_streak = 12;
+    snap.fallback_broken = 1;
+    snap.redact_pattern_failed = 1;
     var wbuf: [4096]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&wbuf);
     try writeResponse(&resp_w, "GET /metrics HTTP/1.1", snap);
@@ -82,6 +95,10 @@ test "metrics response" {
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_captured_total 7\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_ring_capacity 1024\n") != null);
+    // health gauges render with their values and stay inside the body buffer
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_dns_fail_streak 12\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;

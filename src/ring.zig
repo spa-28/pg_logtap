@@ -73,6 +73,16 @@ pub const ShmState = extern struct {
     replayed: u64 = 0,
     send_failed: u64 = 0,
     export_lost: u64 = 0,
+    /// Consecutive failed getaddrinfo lookups in the export worker; 0 after
+    /// any success. The originals are worker-local — these copies are what
+    /// stats/metrics/alerts see.
+    dns_fail_streak: u32 = 0,
+    /// 1 = the fallback file is foreign/corrupt and neither appended to nor
+    /// replayed: durability is silently degraded to the RAM backlog bound.
+    fallback_broken: u8 = 0,
+    /// 1 = pg_logtap.redact_pattern did not compile; that redaction layer is
+    /// OFF (fail-open) until the pattern is fixed.
+    redact_pattern_failed: u8 = 0,
 };
 
 /// Ring handle: control block + backing store, capacity == entries.len.
@@ -93,6 +103,9 @@ pub const Stats = struct {
     replayed: u64,
     send_failed: u64,
     export_lost: u64,
+    dns_fail_streak: u32,
+    fallback_broken: u8,
+    redact_pattern_failed: u8,
     count: u32,
     capacity: u32,
     seq_next: u64,
@@ -144,6 +157,9 @@ pub fn snapshot(ring: Ring) Stats {
         .replayed = ring.state.replayed,
         .send_failed = ring.state.send_failed,
         .export_lost = ring.state.export_lost,
+        .dns_fail_streak = ring.state.dns_fail_streak,
+        .fallback_broken = ring.state.fallback_broken,
+        .redact_pattern_failed = ring.state.redact_pattern_failed,
         .count = ring.state.count,
         .capacity = ring.state.capacity,
         .seq_next = ring.state.seq_next,
