@@ -270,6 +270,40 @@ term_bl=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM 
 [ "$term_bl" = 0 ] || fail "worker SIGTERM: queue_backlog=$term_bl after replay — counter drift on worker restart"
 ok "worker TERM mid-send: shutdown flush parked the backlog, 700/700 replayed, queue_backlog=0"
 
+echo "== worker double-TERM vs mute receiver: final flush is abortable =="
+# A mute receiver with a 30s timeout pins the shutdown flush's writeAll/recv
+# per syscall; the first TERM starts that flush, the second must end it. The
+# parked fallback file carries the backlog across the restart (at-least-once).
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_timeout_ms 30000
+setguc pg_logtap.export_url "http://$SILENT:9499"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+[ -n "$wpid" ] || fail "double-TERM: worker not found"
+gen dterm 300; sleep 1
+docker exec "$PG_CT" kill -TERM "$wpid"
+sleep 2 # flush entered its recv against the mute receiver
+docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null || true # worker ignores? no: exit now
+gone_s=-1; n=0
+while [ "$n" -lt 10 ]; do
+  docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT 1 FROM pg_stat_activity WHERE pid = $wpid" | grep -q 1 || { gone_s=$n; break; }
+  n=$((n + 1)); sleep 0.5
+done
+[ "$gone_s" -ge 0 ] || fail "double-TERM: worker still alive ${n}x0.5s after the second TERM — final flush ignores it (stuck for the 30s timeout)"
+setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_timeout_ms 5000; reload; sleep 2
+# 40s, not the usual 15: the postmaster-restarted worker starts with the
+# stale auto.conf URL (silent, 30s timeout) and may sit one full stuck recv
+# out before the reload reaches it
+n=0; while [ "$n" -lt 40 ] && [ "$(received dterm)" -lt 300 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(received dterm)" = 300 ] || fail "double-TERM: $(received dterm)/300 delivered after restart — parked backlog lost"
+dups=$(grep "logtap kill dterm$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+[ "$dups" = 0 ] || fail "double-TERM: $dups duplicate seqs — replay re-sent delivered members"
+ok "second TERM ended the flush in $((gone_s / 2)).$(( (gone_s % 2) * 5 ))s, 300/300 replayed after restart, dup=0"
+
 echo "== postmaster graceful stop: bounded final flush, queue survives =="
 # delivery.md: a graceful stop runs ONE final flush cycle, bounded (~1 s of
 # work plus one send timeout). An unbounded flush would hang the stop until

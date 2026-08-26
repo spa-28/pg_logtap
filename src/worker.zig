@@ -59,6 +59,25 @@ var guc_metrics_addr: [*c]u8 = null;
 var got_sigterm = interrupts.Signal.new(0);
 var got_sighup = interrupts.Signal.new(0);
 
+/// The fd of an in-flight socket send (http/tcp), -1 when none. A second
+/// SIGTERM closes it: SO_SNDTIMEO/SO_RCVTIMEO cannot be shortened mid-syscall,
+/// so a mute receiver otherwise pins the shutdown flush for a full
+/// export_timeout_ms per send. close(2) wakes the blocked call (EBADF → the
+/// ordinary failure path); it is async-signal-safe, and the transports clear
+/// the slot before their own close, so a recycled fd number is never hit.
+var send_conn_fd: c_int = -1;
+
+/// Final-flush abort state: 0 outside a graceful-shutdown flush. The deadline
+/// bounds the whole flush to ~1s of work plus one send timeout; sendAborted()
+/// is checked between partial-write syscalls, which a per-syscall socket
+/// timeout alone cannot bound (a dribbling receiver makes ONE send unbounded).
+var send_deadline_us: i64 = 0;
+
+fn sendAborted() bool {
+    if (got_sigterm.read() >= 2) return true;
+    return send_deadline_us != 0 and pg.GetCurrentTimestamp() > send_deadline_us;
+}
+
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
@@ -146,8 +165,12 @@ pub fn workerMain() void {
 /// `final` (worker SIGTERM) ignores got_sigterm: the main loop already exited
 /// on it, so without this the "graceful shutdown: hand off what we can" call
 /// skipped its loop entirely and every clean stop silently dropped the ring
-/// contents and the RAM backlog. Still bounded: the 1s cycle deadline plus one
-/// send timeout (~export_timeout_ms worst case) with a dead receiver.
+/// contents and the RAM backlog. Bounded twice over: the whole flush gets
+/// ~1s of work plus one send timeout (send_deadline_us, enforced between
+/// syscalls by sendAborted), and a second SIGTERM closes the in-flight fd
+/// outright. Whatever the flush cannot send live is parked to the fallback
+/// file — parking is local-disk work, runs without a deadline, and loses
+/// nothing that the RAM backlog would otherwise carry into the restart.
 fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, final: bool) void {
     if (guc_export_url == null or guc_export_url[0] == 0) return;
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
@@ -155,6 +178,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         warnUrlOnce(url);
         return;
     };
+    defer send_deadline_us = 0; // zero for normal cycles regardless
+    if (final) send_deadline_us = pg.GetCurrentTimestamp() + 1_000_000 + @as(i64, guc_export_timeout_ms) * 1000;
 
     var sent: u64 = 0; // delivered by a live send
     var queued: u64 = 0; // durably appended to the fallback file
@@ -176,7 +201,14 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
     var drained_total: usize = 0; // live inflow this flushAll call
     while (final or !got_sigterm.isSet()) {
-        if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+        if (pg.GetCurrentTimestamp() > cycle_deadline) {
+            if (!final) break;
+            // Budget spent mid-shutdown: live sending is over (sendAborted
+            // enforces it from here on regardless) — park what is left
+            // instead of dropping it with the process.
+            parkAll(alloc, pending, names, &queued, &lost);
+            break;
+        }
         drained_total += drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
 
@@ -197,7 +229,9 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 // /metrics and SIGHUP freeze, the ring starves (3.7M events
                 // dropped at capture in a 7-min 15k/s storm) and the RAM
                 // backlog grows GiB-scale because trimBacklog never runs.
-                if (pg.GetCurrentTimestamp() > cycle_deadline) break;
+                // At final the deadline is waived: parking is lossless and
+                // the alternative is losing the backlog with the process.
+                if (!final and pg.GetCurrentTimestamp() > cycle_deadline) break;
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
                 const count = @min(pending.len(), chunk_max);
@@ -276,6 +310,14 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // clear it too, or a slow answer with no fallback file set parks
             // every later batch with no way back.
             if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000;
+        } else if (final) {
+            // Send failed during the shutdown flush: without this branch one
+            // chunk parked and the rest of the RAM backlog died silently with
+            // the process. Park everything — the file is local, the restart
+            // replays it (at-least-once).
+            failed += 1;
+            parkAll(alloc, pending, names, &queued, &lost);
+            break;
         } else if (fbAppend(alloc, body, true)) {
             logFallback(true);
             pending.dropFront(count);
@@ -295,6 +337,26 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
 
     capture.bumpExport(sent, queued, replayed, failed, lost);
     logTransitions(sent + replayed, failed, lost);
+}
+
+/// Park the whole remaining backlog to the fallback file; whatever cannot be
+/// parked (no file, disk full, OOM) is counted lost — with the process about
+/// to exit, RAM-backed events are otherwise silently dropped. Runs even after
+/// a second SIGTERM: that demand is about network time (a 30s pinned recv),
+/// while parking is local-disk work bounded by the RAM backlog bound itself.
+fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queued: *u64, lost: *u64) void {
+    var appended = false;
+    while (pending.len() > 0) {
+        const count = @min(pending.len(), chunk_max);
+        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
+        if (!fbAppend(alloc, body, false)) break;
+        pending.dropFront(count);
+        queued.* += count;
+        appended = true;
+    }
+    if (appended) fbFsync();
+    lost.* += pending.len();
+    pending.dropFront(pending.len());
 }
 
 /// pending slice → NDJSON body (one JSON line per event), built in a REUSED
@@ -568,7 +630,7 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     defer _ = c.close(fd);
     const size = fbSize(fd) orelse return false;
     if (size == 0) {
-        if (!writeAll(fd, fb_magic)) return false;
+        if (!writeAll(fd, fb_magic, false)) return false;
     } else {
         var magic: [fb_magic_len]u8 = undefined;
         if (size < fb_magic_len or fbPread(fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
@@ -581,7 +643,7 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     defer alloc.free(gz);
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(gz.len), .little);
-    if (!writeAll(fd, &len_buf) or !writeAll(fd, gz)) return false;
+    if (!writeAll(fd, &len_buf, false) or !writeAll(fd, gz, false)) return false;
     return !sync or c.fdatasync(fd) == 0;
 }
 
@@ -731,14 +793,18 @@ fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
     // a generic "dial errno=0" here would overwrite it and hide which stage
     // failed.
     const conn_fd = dialTcp(h.host, h.port) orelse return false;
-    defer _ = c.close(conn_fd);
+    send_conn_fd = conn_fd;
+    defer {
+        if (send_conn_fd == conn_fd) send_conn_fd = -1;
+        _ = c.close(conn_fd);
+    }
     var head_buf: [512]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
     if (gz) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
-    if (!writeAll(conn_fd, head.buffered())) return failSend("write head", std.c._errno().*);
-    if (!writeAll(conn_fd, body)) return failSend("write body", std.c._errno().*);
+    if (!writeAll(conn_fd, head.buffered(), true)) return failSend("write head", std.c._errno().*);
+    if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
     var status_buf: [32]u8 = undefined;
     const got = recvSome(conn_fd, &status_buf);
@@ -752,8 +818,12 @@ fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
 fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
     // As sendHttp: the dial path already recorded why it failed.
     const conn_fd = fd_opt orelse return false;
-    defer _ = c.close(conn_fd);
-    if (!writeAll(conn_fd, body)) return failSend("write body", std.c._errno().*);
+    send_conn_fd = conn_fd;
+    defer {
+        if (send_conn_fd == conn_fd) send_conn_fd = -1;
+        _ = c.close(conn_fd);
+    }
+    if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     return true;
 }
 
@@ -767,7 +837,7 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
     if (conn_fd < 0) return false;
     defer _ = c.close(conn_fd);
-    if (!writeAll(conn_fd, body)) return false;
+    if (!writeAll(conn_fd, body, false)) return false;
     // Durable per batch: the page cache survives process death but not OS
     // death. One fdatasync per flush cycle is cheap next to the write itself.
     return c.fdatasync(conn_fd) == 0;
@@ -913,9 +983,15 @@ fn failSend(stage: []const u8, err: c_int) bool {
 var fail_reason_buf: [64]u8 = undefined;
 var fail_reason: []const u8 = "";
 
-fn writeAll(conn_fd: c_int, buf: []const u8) bool {
+fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool) bool {
     var off: usize = 0;
     while (off < buf.len) {
+        // The abort check runs between syscalls: SO_SNDTIMEO bounds ONE
+        // write, so a dribbling receiver otherwise makes this loop unbounded
+        // during the shutdown flush. Socket sends only — a local file write
+        // (fallback queue, file:// destination) is bounded by disk speed, and
+        // exactly those writes carry the parked backlog through shutdown.
+        if (abortable and sendAborted()) return false;
         // write(2): works for both sockets and regular files (send does not).
         const count = net.write(conn_fd, buf.ptr + off, buf.len - off);
         if (count > 0) {
@@ -929,6 +1005,7 @@ fn writeAll(conn_fd: c_int, buf: []const u8) bool {
 
 fn recvSome(conn_fd: c_int, buf: []u8) usize {
     while (true) {
+        if (sendAborted()) return 0;
         const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
         if (count > 0) return @intCast(count);
         // A signal (SIGUSR1 latch poke, SIGHUP) arriving mid-read is not a
@@ -1021,14 +1098,21 @@ fn serveOne(conn_fd: c_int) void {
     var resp_buf: [4096]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
     metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
-    _ = writeAll(conn_fd, resp_w.buffered());
+    _ = writeAll(conn_fd, resp_w.buffered(), true);
 }
 
 // --- signals -------------------------------------------------------------------
 
 fn handleTerm(sig: c_int) callconv(.c) void {
     _ = sig;
-    got_sigterm.set(1);
+    // Counter, not flag: the first TERM asks for a graceful flush, a second
+    // demands immediate exit (see send_conn_fd).
+    const n = got_sigterm.read() + 1;
+    got_sigterm.set(n);
+    if (n >= 2 and send_conn_fd >= 0) {
+        _ = c.close(send_conn_fd);
+        send_conn_fd = -1;
+    }
     if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
 }
 
