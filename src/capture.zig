@@ -221,14 +221,14 @@ fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src:
     var text: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(src)));
     var clipped = false;
     if (pw) {
-        const m = filter.redactPassword(&redact_a, text);
-        text = m.text;
-        clipped = m.clipped;
+        const masked = filter.redactPassword(&redact_a, text);
+        text = masked.text;
+        clipped = masked.clipped;
     }
-    if (redactor) |*r| {
-        const m = r.apply(&redact_b, text);
-        text = m.text;
-        clipped = clipped or m.clipped;
+    if (redactor) |*red| {
+        const masked = red.apply(&redact_b, text);
+        text = masked.text;
+        clipped = clipped or masked.clipped;
     }
     ring.setStr(dst, &entry.truncated_mask, field, text);
     if (clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
@@ -307,15 +307,15 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
     unlockRing();
 
     var datums: [max_dump]pg.Datum = undefined;
-    var n: u32 = 0;
-    while (n < taken) : (n += 1) {
+    var out_rows: u32 = 0;
+    while (out_rows < taken) : (out_rows += 1) {
         var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, &copies[n], resolveNames(&copies[n])) catch break;
+        jsonl.writeEntry(&line_w.writer, &copies[out_rows], resolveNames(&copies[out_rows])) catch break;
         const line = line_w.written();
-        datums[n] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+        datums[out_rows] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
     }
-    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(n), text_oid));
+    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(out_rows), text_oid));
 }
 
 /// Catalog lookups run in the caller's memory context — palloc'd results are

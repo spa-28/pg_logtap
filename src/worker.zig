@@ -252,7 +252,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // park-only: fsync and hand the loop back to drainInto; members
             // resume once inflow quiets or it recovers.
             if (receiver_slow and drained_total > 0) continue;
-            const m = fbNextMember(alloc) orelse {
+            const member = fbNextMember(alloc) orelse {
                 lost += fb_lost;
                 fb_lost = 0;
                 failed += @intFromBool(pending.len() > 0); // append failed above
@@ -260,9 +260,9 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             };
             lost += fb_lost;
             fb_lost = 0;
-            const gz = gzipPayload(alloc, dest, m.body, &gzip_buf);
+            const gzipped = gzipPayload(alloc, dest, member.body, &gzip_buf);
             const m_sent_at = pg.GetCurrentTimestamp();
-            if (send(dest, url, gz.payload, gz.on)) {
+            if (send(dest, url, gzipped.payload, gzipped.enabled)) {
                 // Drain-path round trip is the receiver liveness probe: a slow
                 // answer re-arms the park (receiver_slow), a fast one clears
                 // it — this also arms it after a restart into a slow receiver
@@ -270,9 +270,9 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
                 logFallback(false);
                 // counted queued at append time; this is its delivery
-                replayed += std.mem.countScalar(u8, m.body, '\n');
-                fb_offset += m.advance;
-                if (fb_offset >= m.size) fbTruncate(); // fully delivered → back to direct sends
+                replayed += std.mem.countScalar(u8, member.body, '\n');
+                fb_offset += member.advance;
+                if (fb_offset >= member.size) fbTruncate(); // fully delivered → back to direct sends
                 members += 1;
                 if (members < 64) continue;
                 break; // hand the loop back: counters, metrics, latch
@@ -299,9 +299,9 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             queued += count;
             continue;
         }
-        const gz = gzipPayload(alloc, dest, body, &gzip_buf);
+        const gzipped = gzipPayload(alloc, dest, body, &gzip_buf);
         const sent_at = pg.GetCurrentTimestamp();
-        if (send(dest, url, gz.payload, gz.on)) {
+        if (send(dest, url, gzipped.payload, gzipped.enabled)) {
             logFallback(false);
             pending.dropFront(count);
             sent += count;
@@ -524,20 +524,20 @@ const NameCache = struct {
 /// bytes otherwise. OOM falls back to plain — compression is an
 /// optimization, not a guarantee. Frees the previous cached payload itself;
 /// the caller frees the last one (flushAll's defer).
-fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, out: *?[]u8) struct { payload: []const u8, on: bool } {
-    if (!guc_export_gzip or dest != .http) return .{ .payload = body, .on = false };
+fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, out: *?[]u8) struct { payload: []const u8, enabled: bool } {
+    if (!guc_export_gzip or dest != .http) return .{ .payload = body, .enabled = false };
     if (out.*) |old| alloc.free(old);
     out.* = gzip.compress(alloc, body) catch {
         out.* = null;
-        return .{ .payload = body, .on = false };
+        return .{ .payload = body, .enabled = false };
     };
-    return .{ .payload = out.*.?, .on = true };
+    return .{ .payload = out.*.?, .enabled = true };
 }
 
-fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gz: bool) bool {
+fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) bool {
     _ = url;
     return switch (dest) {
-        .http => |h| sendHttp(h, body, gz),
+        .http => |h| sendHttp(h, body, gzipped),
         .tcp => |t| sendRaw(dialTcp(t.host, t.port), body),
         .file => |path| sendFile(path, body),
     };
@@ -595,8 +595,8 @@ fn fbOpen() ?c_int {
     if (fallbackPath() == null) return null;
     // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
     // immune to the append position. 0600: not world-readable (C2).
-    const fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
-    return if (fd >= 0) fd else null;
+    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
+    return if (file_fd >= 0) file_fd else null;
 }
 
 fn fbSize(fd: c_int) ?u64 {
@@ -613,9 +613,9 @@ fn fbPread(fd: c_int, buf: []u8, offset: u64) isize {
 /// routes everything through it to keep global order.
 fn fbQueued() bool {
     if (fb_broken or fallbackPath() == null) return false;
-    const fd = fbOpen() orelse return false;
-    defer _ = c.close(fd);
-    const size = fbSize(fd) orelse return false;
+    const file_fd = fbOpen() orelse return false;
+    defer _ = c.close(file_fd);
+    const size = fbSize(file_fd) orelse return false;
     return if (fb_offset == 0) size > fb_magic_len else size > fb_offset;
 }
 
@@ -626,33 +626,33 @@ fn fbQueued() bool {
 /// (page cache survives postmaster death; an OS crash loses the unsynced tail).
 fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     if (fb_broken) return false;
-    const fd = fbOpen() orelse return false;
-    defer _ = c.close(fd);
-    const size = fbSize(fd) orelse return false;
+    const file_fd = fbOpen() orelse return false;
+    defer _ = c.close(file_fd);
+    const size = fbSize(file_fd) orelse return false;
     if (size == 0) {
-        if (!writeAll(fd, fb_magic, false)) return false;
+        if (!writeAll(file_fd, fb_magic, false)) return false;
     } else {
         var magic: [fb_magic_len]u8 = undefined;
-        if (size < fb_magic_len or fbPread(fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+        if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
             fb_broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{fallbackPath() orelse ""});
             return false;
         }
     }
-    const gz = gzip.compress(alloc, body) catch return false; // compression failed → RAM backlog retries
-    defer alloc.free(gz);
+    const comp = gzip.compress(alloc, body) catch return false; // compression failed → RAM backlog retries
+    defer alloc.free(comp);
     var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(gz.len), .little);
-    if (!writeAll(fd, &len_buf, false) or !writeAll(fd, gz, false)) return false;
-    return !sync or c.fdatasync(fd) == 0;
+    std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
+    if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) return false;
+    return !sync or c.fdatasync(file_fd) == 0;
 }
 
 /// Durability point for a cycle's deferred appends.
 fn fbFsync() void {
     if (fb_broken or fallbackPath() == null) return;
-    const fd = fbOpen() orelse return;
-    defer _ = c.close(fd);
-    _ = c.fdatasync(fd);
+    const file_fd = fbOpen() orelse return;
+    defer _ = c.close(file_fd);
+    _ = c.fdatasync(file_fd);
 }
 
 /// One queued batch: decompressed NDJSON, the byte size at read time, and how
@@ -679,13 +679,13 @@ fn bodyWriter(alloc: std.mem.Allocator) *std.Io.Writer.Allocating {
 /// appends resume at a member boundary.
 fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     if (fb_broken) return null;
-    const fd = fbOpen() orelse return null;
-    defer _ = c.close(fd);
-    const size = fbSize(fd) orelse return null;
+    const file_fd = fbOpen() orelse return null;
+    defer _ = c.close(file_fd);
+    const size = fbSize(file_fd) orelse return null;
     if (fb_offset == 0) {
         if (size <= fb_magic_len) return null;
         var magic: [fb_magic_len]u8 = undefined;
-        if (fbPread(fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+        if (fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
             fb_broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{fallbackPath() orelse ""});
             return null;
@@ -694,52 +694,52 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     }
     if (fb_offset >= size) return null;
     var len_buf: [4]u8 = undefined;
-    if (fbPread(fd, &len_buf, fb_offset) != 4) return null;
+    if (fbPread(file_fd, &len_buf, fb_offset) != 4) return null;
     const mlen = std.mem.readInt(u32, &len_buf, .little);
     if (mlen == 0 or mlen > 512 * 1024 * 1024) {
         fb_broken = true;
         elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{fb_offset});
         return null;
     }
-    const gz = alloc.alloc(u8, mlen) catch return null;
-    if (fbPread(fd, gz, fb_offset + 4) != mlen) { // torn tail
-        alloc.free(gz);
-        _ = c.ftruncate(fd, @intCast(fb_offset));
+    const comp = alloc.alloc(u8, mlen) catch return null;
+    if (fbPread(file_fd, comp, fb_offset + 4) != mlen) { // torn tail
+        alloc.free(comp);
+        _ = c.ftruncate(file_fd, @intCast(fb_offset));
         return null;
     }
-    defer alloc.free(gz);
+    defer alloc.free(comp);
     if (fb_dec == null) fb_dec = .{
         .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return null,
         .body = .init(alloc),
     };
-    const d = &fb_dec.?;
-    var src: std.Io.Reader = .fixed(gz);
-    var dec = std.compress.flate.Decompress.init(&src, .gzip, d.window);
-    d.body.writer.end = 0;
-    _ = dec.reader.streamRemaining(&d.body.writer) catch {
-        const at = fb_offset; // framing is intact: skip past, count as loss
+    const dec_state = &fb_dec.?;
+    var src: std.Io.Reader = .fixed(comp);
+    var dec = std.compress.flate.Decompress.init(&src, .gzip, dec_state.window);
+    dec_state.body.writer.end = 0;
+    _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {
+        const skip_at = fb_offset; // framing is intact: skip past, count as loss
         fb_offset += 4 + mlen;
         fb_lost += 1;
-        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{at});
+        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{skip_at});
         return null;
     };
-    if (d.body.writer.end > mlen * 64 + 65536) { // inflated absurdly: corrupt, skip
-        const at = fb_offset;
+    if (dec_state.body.writer.end > mlen * 64 + 65536) { // inflated absurdly: corrupt, skip
+        const skip_at = fb_offset;
         fb_offset += 4 + mlen;
         fb_lost += 1;
-        elog.Log(@src(), "pg_logtap fallback member at offset {d} inflated past sanity, skipped", .{at});
+        elog.Log(@src(), "pg_logtap fallback member at offset {d} inflated past sanity, skipped", .{skip_at});
         return null;
     }
-    return .{ .body = d.body.writer.buffer[0..d.body.writer.end], .size = size, .advance = 4 + @as(u64, mlen) };
+    return .{ .body = dec_state.body.writer.buffer[0..dec_state.body.writer.end], .size = size, .advance = 4 + @as(u64, mlen) };
 }
 
 /// Queue fully delivered: zero it (the next append re-creates the magic) and
 /// return to direct sends.
 fn fbTruncate() void {
-    const fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1, @as(c_uint, 0o600)); // O_WRONLY
-    if (fd < 0) return;
-    defer _ = c.close(fd);
-    if (c.ftruncate(fd, 0) == 0) fb_offset = 0;
+    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1, @as(c_uint, 0o600)); // O_WRONLY
+    if (file_fd < 0) return;
+    defer _ = c.close(file_fd);
+    if (c.ftruncate(file_fd, 0) == 0) fb_offset = 0;
 }
 
 /// The fallback file can outlive the shmem counters: a postmaster restart
@@ -760,14 +760,14 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     var lines: u64 = 0;
     while (true) {
         const before = fb_offset;
-        const m = fbNextMember(alloc) orelse {
+        const member = fbNextMember(alloc) orelse {
             // null without advancing = drained, torn tail or foreign file;
             // null WITH advancing = unreadable member skipped — keep walking
             if (fb_offset == before) break;
             continue;
         };
-        lines += std.mem.countScalar(u8, m.body, '\n');
-        fb_offset += m.advance;
+        lines += std.mem.countScalar(u8, member.body, '\n');
+        fb_offset += member.advance;
     }
     fb_offset = saved_offset;
     fb_lost = saved_lost;
@@ -788,7 +788,7 @@ fn logFallback(active: bool) void {
     }
 }
 
-fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
+fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // dialTcp has already set the specific reason (dns / connect errno=N);
     // a generic "dial errno=0" here would overwrite it and hide which stage
     // failed.
@@ -801,7 +801,7 @@ fn sendHttp(h: anytype, body: []const u8, gz: bool) bool {
     var head_buf: [512]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
-    if (gz) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
+    if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
     if (!writeAll(conn_fd, head.buffered(), true)) return failSend("write head", std.c._errno().*);
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
@@ -958,12 +958,12 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
     // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
     // return EAGAIN, which flows into the ordinary failSend →
     // retry/fallback path like any dead receiver.
-    const tv = Timeval{
+    const timeval = Timeval{
         .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
         .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
     };
-    _ = net.setsockopt(conn_fd, 1, 20, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
-    _ = net.setsockopt(conn_fd, 1, 21, &tv, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
+    _ = net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
+    _ = net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
     if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
     const err = std.c._errno().*;
     _ = c.close(conn_fd);
@@ -1051,26 +1051,26 @@ fn listenOn(addr_str: []const u8, port: u16) ?c_int {
     str_buf[addr_str.len] = 0;
     // inet_pton, not DNS: a bind address is an IP literal or a config error —
     // a name would silently bind to whatever it resolved to at open time.
-    var v4 = std.mem.zeroes(net.sockaddr.in);
-    v4.family = 2; // AF_INET
-    v4.port = std.mem.nativeToBig(u16, port);
-    var v6 = std.mem.zeroes(net.sockaddr.in6);
-    v6.family = 10; // AF_INET6
-    v6.port = std.mem.nativeToBig(u16, port);
+    var addr4 = std.mem.zeroes(net.sockaddr.in);
+    addr4.family = 2; // AF_INET
+    addr4.port = std.mem.nativeToBig(u16, port);
+    var addr6 = std.mem.zeroes(net.sockaddr.in6);
+    addr6.family = 10; // AF_INET6
+    addr6.port = std.mem.nativeToBig(u16, port);
     var family: c_uint = undefined;
-    var sa: []const u8 = undefined;
-    if (c.inet_pton(2, @ptrCast(&str_buf), &v4.addr) == 1) { // AF_INET
+    var sock_addr: []const u8 = undefined;
+    if (c.inet_pton(2, @ptrCast(&str_buf), &addr4.addr) == 1) { // AF_INET
         family = 2;
-        sa = std.mem.asBytes(&v4);
-    } else if (c.inet_pton(10, @ptrCast(&str_buf), &v6.addr) == 1) { // AF_INET6
+        sock_addr = std.mem.asBytes(&addr4);
+    } else if (c.inet_pton(10, @ptrCast(&str_buf), &addr6.addr) == 1) { // AF_INET6
         family = 10;
-        sa = std.mem.asBytes(&v6);
+        sock_addr = std.mem.asBytes(&addr6);
     } else return null;
     const listen_fd = c.socket(family, 1 | 2048, 0); // SOCK_STREAM|SOCK_NONBLOCK
     if (listen_fd < 0) return null;
     const one: c_int = 1;
     _ = net.setsockopt(listen_fd, 1, 2, &one, @sizeOf(c_int)); // SOL_SOCKET, SO_REUSEADDR
-    if (net.bind(listen_fd, @ptrCast(@alignCast(sa.ptr)), @intCast(sa.len)) != 0 or net.listen(listen_fd, 8) != 0) {
+    if (net.bind(listen_fd, @ptrCast(@alignCast(sock_addr.ptr)), @intCast(sock_addr.len)) != 0 or net.listen(listen_fd, 8) != 0) {
         _ = c.close(listen_fd);
         return null;
     }

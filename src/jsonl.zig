@@ -116,7 +116,7 @@ fn jsonChars(w: *std.Io.Writer, s: []const u8) !void {
 fn validSeqAt(s: []const u8, i: usize) ?u3 {
     const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
     if (i + len > s.len) return null;
-    return if (std.unicode.utf8Decode(s[i..][0..len])) |_| len else |_| null;
+    return if (std.unicode.utf8ValidateSlice(s[i..][0..len])) len else null;
 }
 
 /// Absent (null) or empty string → JSON null (copyStr skips null sources).
@@ -205,11 +205,11 @@ test "invalid utf-8 bytes sanitize to U+FFFD, line stays valid JSON" {
     const line = line_w.written();
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
-    try std.testing.expect(std.mem.indexOf(u8, line, "\u{FFFD}") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\u{FFFD}") != null);
     // valid sequences survive: é (U+00E9) not replaced
-    try std.testing.expect(std.mem.indexOf(u8, line, "\xC3\xA9") != null);
+    try std.testing.expect(std.mem.find(u8, line, "\xC3\xA9") != null);
     // structural sanity: control chars would be escaped by encodeJsonStringChars
-    try std.testing.expect(std.mem.indexOf(u8, line, "\n") == null);
+    try std.testing.expect(std.mem.find(u8, line, "\n") == null);
 }
 
 test "control characters in message escape correctly" {
@@ -224,9 +224,9 @@ test "control characters in message escape correctly" {
     const line = line_w.written();
 
     // still one line: no raw \n or \0 anywhere, quotes escaped
-    try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, line, 0) == null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "\\\"") != null);
+    try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, line, 0) == null);
+    try std.testing.expect(std.mem.find(u8, line, "\\\"") != null);
     try std.testing.expect(try std.json.validate(std.testing.allocator, line));
 }
 
@@ -299,7 +299,7 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
             return error.InvalidJsonLine;
         }
         try std.testing.expect(std.unicode.utf8ValidateSlice(line));
-        try std.testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+        try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
     }
 }
 
@@ -307,10 +307,10 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
 /// slot cap so the setStr truncation path is exercised alongside.
 fn fill(entry: *ring.ShmLogEntry, comptime field: ring.TruncField, rand: std.Random) void {
     var buf: [ring.msg_len + 64]u8 = undefined;
-    const n = rand.intRangeLessThan(usize, 0, buf.len);
-    for (buf[0..n]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255);
+    const fill_len = rand.intRangeLessThan(usize, 0, buf.len);
+    for (buf[0..fill_len]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255);
     switch (field) {
-        inline else => |f| ring.setStr(&@field(entry, @tagName(f)), &entry.truncated_mask, field, buf[0..n]),
+        inline else => |f| ring.setStr(&@field(entry, @tagName(f)), &entry.truncated_mask, field, buf[0..fill_len]),
     }
 }
 
