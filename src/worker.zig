@@ -26,6 +26,8 @@ const c = struct {
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
     extern "c" fn fsync(fd: c_int) c_int;
+    extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+    extern "c" fn unlink(path: [*:0]const u8) c_int;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
@@ -48,6 +50,7 @@ var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
 var guc_export_slow_ms: c_int = 250;
 var guc_export_backlog_max: c_int = 65_536;
+var guc_fallback_max_mb: c_int = 512;
 /// Receiver liveness probe: set when a live send answered but took at least
 /// export_slow_ms — such a receiver cannot keep up (256 events per slow
 /// round trip), so live batches park on the fallback file instead of piling
@@ -88,6 +91,7 @@ pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.fallback_max_mb", "Size cap for the fallback queue file. When an append pushes the file past the cap it is compacted to the newest half (atomic rewrite), and the undelivered events dropped by that count into events_lost — the EventsLost alert is the signal that the outage outlasted the queue. 0 = unlimited (pre-0.3.0 behavior: an unattended outage fills the disk). A cap smaller than one member (~a hundred KB compressed) can only bound the file at member granularity.", null, &guc_fallback_max_mb, 512, 0, 1_048_576, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.metrics_addr", "Bind address for the /metrics and /healthz listener, as an IP literal (v4 or v6). Loopback by default — the counters name the host, cluster and data directory, so keep them off the network unless something scrapes them; 0.0.0.0 exposes to every interface.", null, &guc_metrics_addr, "127.0.0.1", pg.PGC_SIGHUP, 0, null, null, null);
     // Registered unconditionally: custom-variable values from postgresql.conf
@@ -683,7 +687,11 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
     if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) return false;
-    return !sync or c.fdatasync(file_fd) == 0;
+    if (sync and c.fdatasync(file_fd) != 0) return false;
+    // Cap enforcement after the durable append: the member is safe on disk
+    // either way, and the compaction rewrite must never race a lost one.
+    fbCompact(alloc);
+    return true;
 }
 
 /// Durability point for a cycle's deferred appends.
@@ -812,6 +820,95 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     fb_lost = saved_lost;
     const due = lines -| capture.snapshot().queued;
     if (due > 0) capture.bumpExport(0, due, 0, 0, 0);
+}
+
+/// Enforce fallback_max_mb (0 = unlimited): once the file outgrew the cap,
+/// rewrite it keeping only the newest half of the cap — an unattended outage
+/// then turns over cap/2 bytes per compaction instead of filling the disk.
+/// Members below fb_offset were already delivered (dropping them is free);
+/// dropped undelivered members count into replayed AND lost: replayed keeps
+/// queue_backlog = queued − replayed truthful (they left the queue), lost
+/// records that they never arrived. Atomic (tmp + rename + directory fsync);
+/// any failure leaves the file as it was — the next append past the cap
+/// retries. Ceiling: a cap smaller than one member bounds the file only at
+/// member granularity, and decompressing the dropped prefix stalls this
+/// flush cycle (once per cap/2 of growth).
+fn fbCompact(alloc: std.mem.Allocator) void {
+    const cap_bytes: u64 = @as(u64, @intCast(@max(guc_fallback_max_mb, 0))) << 20;
+    if (cap_bytes == 0) return;
+    const file_fd = fbOpen() orelse return;
+    defer _ = c.close(file_fd);
+    const size = fbSize(file_fd) orelse return;
+    if (size <= cap_bytes) return;
+    const keep_bytes = cap_bytes / 2;
+
+    // Walk whole members from the top; a member is droppable only if what
+    // remains after it still holds the keep budget. Torn tail or framing we
+    // misread stops the walk — nothing is dropped on a guess.
+    var off: u64 = fb_magic_len;
+    var lost_events: u64 = 0;
+    while (off + 4 <= size) {
+        var len_buf: [4]u8 = undefined;
+        if (fbPread(file_fd, &len_buf, off) != 4) return;
+        const mlen = std.mem.readInt(u32, &len_buf, .little);
+        if (mlen == 0 or mlen > 512 * 1024 * 1024) return;
+        const end = off + 4 + mlen;
+        if (end > size) break; // torn tail
+        if (size - end < keep_bytes) break; // dropping would undercut the budget
+        if (off >= fb_offset) { // undelivered: count its events before dropping
+            const comp = alloc.alloc(u8, mlen) catch return;
+            defer alloc.free(comp);
+            if (fbPread(file_fd, comp, off + 4) != mlen) return;
+            if (fb_dec == null) fb_dec = .{
+                .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return,
+                .body = .init(alloc),
+            };
+            const dec_state = &fb_dec.?;
+            var src_reader: std.Io.Reader = .fixed(comp);
+            var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
+            dec_state.body.writer.end = 0;
+            // a member that will not inflate has no countable events; the
+            // replay path would skip it as a loss anyway
+            _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {};
+            lost_events += std.mem.countScalar(u8, dec_state.body.writer.buffer[0..dec_state.body.writer.end], '\n');
+        }
+        off = end;
+    }
+    const dropped = off - fb_magic_len;
+    if (dropped == 0) return; // first member alone exceeds the budget
+
+    // Rewrite: magic + [off, size) copied verbatim (gzip members are
+    // self-contained; no recompression).
+    var tmp_buf: [4096]u8 = undefined;
+    if (fb_path_len + 8 + 1 > tmp_buf.len) return;
+    @memcpy(tmp_buf[0..fb_path_len], fb_path_buf[0..fb_path_len]);
+    @memcpy(tmp_buf[fb_path_len..][0..8], ".compact");
+    tmp_buf[fb_path_len + 8] = 0;
+    const tmp_fd = c.open(@ptrCast(&tmp_buf), 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
+    if (tmp_fd < 0) return;
+    var copied_ok = writeAll(tmp_fd, fb_magic, false);
+    var pos: u64 = off;
+    var copy_buf: [64 * 1024]u8 = undefined;
+    while (copied_ok and pos < size) {
+        const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
+        const got = fbPread(file_fd, copy_buf[0..want], pos);
+        if (got == 0) {
+            copied_ok = false;
+            break;
+        }
+        copied_ok = writeAll(tmp_fd, copy_buf[0..@intCast(got)], false);
+        pos += @intCast(got);
+    }
+    if (copied_ok) copied_ok = c.fdatasync(tmp_fd) == 0;
+    _ = c.close(tmp_fd);
+    if (!copied_ok or c.rename(@ptrCast(&tmp_buf), @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
+        _ = c.unlink(@ptrCast(&tmp_buf));
+        return;
+    }
+    fsyncDirOf(fb_path_buf[0..fb_path_len]);
+    fb_offset = @max(fb_magic_len, fb_offset -| dropped);
+    if (lost_events > 0) capture.bumpExport(0, 0, lost_events, 0, lost_events);
+    elog.Log(@src(), "pg_logtap fallback file compacted to the newest {d} of {d} bytes; {d} undelivered events counted lost (outage outlasted the queue cap)", .{ size - off, size, lost_events });
 }
 
 /// Fallback on/off transitions only — same discipline as export failures.
