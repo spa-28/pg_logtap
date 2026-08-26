@@ -25,6 +25,7 @@ const c = struct {
     extern "c" fn accept4(conn_fd: c_int, addr: ?*anyopaque, len: ?*u32, flags: c_int) c_int;
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
+    extern "c" fn fsync(fd: c_int) c_int;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
@@ -381,7 +382,12 @@ fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, na
 fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
     var drained: usize = 0;
     var batch: [drain_batch]ring.ShmLogEntry = undefined;
-    while (true) {
+    // Round cap: drainBatch returning a full batch every time means capture
+    // is refilling the ring as fast as it drains — without the cap this loop
+    // holds the ring lock in bursts and the flush cycle (sends, /metrics,
+    // latch) never gets control back. 64 rounds ≈ 4k events per call.
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
         const count = capture.drainBatch(&batch);
         if (count == 0) return drained;
         pending.append(alloc, batch[0..count]) catch {
@@ -390,6 +396,7 @@ fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
         };
         drained += count;
     }
+    return drained; // ring non-empty: the next flush cycle drains the rest
 }
 
 /// Backlog bound: keep the newest export_backlog_max events, return what fell
@@ -599,8 +606,32 @@ fn fbOpen() ?c_int {
     if (fallbackPath() == null) return null;
     // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
     // immune to the append position. 0600: not world-readable (C2).
-    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
+    // Create via O_EXCL|O_CREAT (Linux: 128|64) first: its success is the
+    // only reliable "the file just came into existence" signal — the moment
+    // to fsync the directory, so the creation itself (not just the data,
+    // which fdatasync covers) survives a power loss.
+    var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 128, @as(c_uint, 0o600));
+    if (file_fd >= 0) {
+        fsyncDirOf(fb_path_buf[0..fb_path_len]);
+    } else { // EEXIST (the usual case) or a real error — plain open tells which
+        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
+    }
     return if (file_fd >= 0) file_fd else null;
+}
+
+/// fsync the parent of a path: makes a fresh directory entry durable. Best
+/// effort — a failure costs durability of the creation, not correctness.
+fn fsyncDirOf(path: []const u8) void {
+    const dir_end = std.mem.findScalarLast(u8, path, '/') orelse return;
+    var dir_buf: [4096]u8 = undefined;
+    const dir = if (dir_end == 0) "/" else path[0..dir_end]; // "/x" → "/"
+    if (dir.len >= dir_buf.len) return;
+    @memcpy(dir_buf[0..dir.len], dir);
+    dir_buf[dir.len] = 0;
+    const dir_fd = c.open(@ptrCast(&dir_buf), 0, @as(c_uint, 0)); // O_RDONLY
+    if (dir_fd < 0) return;
+    defer _ = c.close(dir_fd);
+    _ = c.fsync(dir_fd);
 }
 
 fn fbSize(fd: c_int) ?u64 {
@@ -845,7 +876,16 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
     if (conn_fd < 0) return false;
     defer _ = c.close(conn_fd);
-    if (!writeAll(conn_fd, body, false)) return false;
+    const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
+    if (end_before < 0) return false;
+    if (!writeAll(conn_fd, body, false)) {
+        // A partial write (ENOSPC mid-batch) leaves a torn line in the
+        // sink's NDJSON stream forever; with O_APPEND a plain retry would
+        // append the whole batch AGAIN after the torn prefix. Roll back to
+        // the last full batch — the next cycle rewrites it whole.
+        _ = c.ftruncate(conn_fd, @intCast(end_before));
+        return false;
+    }
     // Durable per batch: the page cache survives process death but not OS
     // death. One fdatasync per flush cycle is cheap next to the write itself.
     return c.fdatasync(conn_fd) == 0;
@@ -859,12 +899,16 @@ var dns_fail_streak: u32 = 0;
 // later fails in-process — the wedged-resolver state below, outliving every
 // res_init re-arm on some cores — dialing this address keeps delivery alive.
 // Container names keep their IP across docker stop/start, which is exactly
-// the outage shape. Ceiling: a name that moves to a new IP while dns also
-// fails in-process stays unreachable until the resolver heals or the worker
-// restarts; recreating the receiver recreates the stand, which restarts
-// postgres too.
+// the outage shape. The 60s TTL (dns_good_at_us) bounds the other failure
+// shape: environments that REUSE IPs (k8s services) would otherwise keep
+// shipping logs to whatever now owns the cached address. Ceiling: a name
+// that moves to a new IP while dns also fails in-process stays unreachable
+// until the resolver heals or the worker restarts; recreating the receiver
+// recreates the stand, which restarts postgres too.
 var dns_good_host: [255]u8 = undefined;
 var dns_good_host_len: usize = 0;
+// When dns_good_addr was cached (µs); 0 = never.
+var dns_good_at_us: i64 = 0;
 // sockaddr bytes as getaddrinfo made them. align(8) = sockaddr_storage grade:
 // dialAddr's connect casts this to *sockaddr, and an odd .bss slot trips the
 // alignment check (ReleaseSafe aborts the worker, taking the postmaster down).
@@ -924,7 +968,11 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
                 elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
         }
         if (dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {
-            if (dialAddr(&dns_good_addr, dns_good_addr_len, dns_good_family)) |conn_fd| return conn_fd;
+            // TTL, not forever: reused-IP environments would otherwise dial
+            // whatever service now owns the cached address.
+            if (pg.GetCurrentTimestamp() - dns_good_at_us <= 60_000_000) { // 60s in µs
+                if (dialAddr(&dns_good_addr, dns_good_addr_len, dns_good_family)) |conn_fd| return conn_fd;
+            }
         }
         // The code separates the failure classes: -2 NONAME (name genuinely
         // absent), -3 AGAIN (resolver timeout), -8 MEMORY; -1 SYSTEM parks
@@ -947,6 +995,7 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
                 @memcpy(dns_good_addr[0..ai.addrlen], @as([*]const u8, @ptrCast(ai.addr.?))[0..ai.addrlen]);
                 dns_good_addr_len = ai.addrlen;
                 dns_good_family = ai.family;
+                dns_good_at_us = pg.GetCurrentTimestamp();
             }
             return conn_fd;
         }
@@ -982,6 +1031,13 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
 
 /// timeval(3type) for setsockopt: both fields c_long on linux x86-64/arm64.
 const Timeval = extern struct { sec: i64, usec: i64 };
+comptime {
+    // Timeval above, the raw open(2) flag numbers and the page-size math all
+    // assume LP64. The project ships amd64/arm64; rather than a silent
+    // misbehaving 32-bit build, refuse it.
+    if (@sizeOf(usize) != 8)
+        @compileError("pg_logtap's worker assumes a 64-bit platform (timeval layout, raw O_ flags); not built or tested for 32-bit");
+}
 
 /// Remember why the last send failed; surfaces in the transition log line.
 fn failSend(stage: []const u8, err: c_int) bool {
@@ -1086,10 +1142,14 @@ fn listenOn(addr_str: []const u8, port: u16) ?c_int {
     return listen_fd;
 }
 
-/// Serve every queued scrape, then return to the main loop.
+/// Serve queued scrapes under a time budget, then return to the main loop.
+/// Unbounded serving let a scraper that reconnects every iteration (or a
+/// loopback client in a tight loop) starve the export cycle indefinitely —
+/// the socket backlog keeps the rest for the next cycle.
 fn scrapeAll() void {
     if (metrics_fd < 0) return;
-    while (true) {
+    const budget_until = pg.GetCurrentTimestamp() + 250_000; // µs
+    while (pg.GetCurrentTimestamp() <= budget_until) {
         const conn_fd = c.accept4(metrics_fd, null, null, 2048); // SOCK_NONBLOCK
         if (conn_fd < 0) return; // EAGAIN: backlog empty
         defer _ = c.close(conn_fd);
