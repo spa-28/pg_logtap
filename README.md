@@ -116,6 +116,7 @@ GUCs and restart again.
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
 | `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot (~3.4 KB), touched only when parking falls behind. Clamped up to `ring_capacity`. |
+| `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 | `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
 
@@ -385,10 +386,12 @@ events_replayed`, stuck in the file right now) and `delivered`
 
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
 events_sent,events_queued,events_replayed,send_cycles_failed,events_lost}_total`
-(counters) + `pg_logtap_ring_{events,capacity}` (gauges),
+(counters) + `pg_logtap_ring_{events,capacity}` and
+`pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
-dropped, export failing).
+dropped, export failing, fallback file broken, DNS failing, redact pattern
+failed).
 
 ## Development & Testing
 
@@ -516,30 +519,9 @@ amd64/arm64, each arch natively on its own runner) and attaches one package
 per combination as `pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` +
 `extension/` tree ready to untar into the PostgreSQL installation.
 
-## TODO
+## Roadmap
 
-Known ceilings and deferred designs — kept here so they are not re-derived
-from scratch when the need becomes real:
-
-- **Larger message slots** (`pg_logtap.message_max`, postmaster GUC): fields
-  are cut at 1024 (`message`) / 256 (others) bytes — measured fine for what
-  PostgreSQL itself emits (p99 ≈ 136 bytes in a debug-level storm), the
-  exception being `duration:` lines that embed full SQL text and chatty
-  applications. A GUC computed into the shmem slot layout at boot is the
-  cheap fix; the memory cost is visible up front
-  (`ring_capacity × (message_max + ~2.8 KB)`).
-- **Chained slots for oversized messages**: capture splits a long message
-  across continuation ring slots under one LWLock hold, the worker joins
-  them back into one event at export — no fixed per-slot tax, the ring pays
-  only for the long messages it actually carries. Deferred because the three
-  boundaries (ring overflow mid-chain, backlog trim at a chain head, backend
-  death between slots) are exactly the failure classes that took the longest
-  to stabilize; each needs its own e2e scenario before this lands.
-- **Regex backreferences**: `\1` drops glibc's regexec off its fast matcher
-  (~n²·⁶ measured, worst case ~20 s at the message cap); plain EREs are
-  linear. A pattern-length/input-length guard, or a linear-time matcher,
-  would make pathological patterns safe to accept. Until then the pattern
-  GUC docs carry the warning.
+Deferred designs and known ceilings live in [`docs/TODO.md`](docs/TODO.md).
 
 ## License
 

@@ -12,10 +12,21 @@ view) restarts from zero on every restart.
 
 | Scheme | Semantics | ACK | Duplicate window |
 |---|---|---|---|
-| `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
+| `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
 | `tcp://` | **at-most-once** | none — `write(2)` success counts as delivered | none; a receiver dying after accept loses silently. Use `http://` for loss-sensitive receivers |
-| `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write retries the whole batch → duplicate lines possible |
+| `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle |
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
+
+Three honesty notes on those ACKs. `http://`: **any 2xx** counts as
+delivered — the standard semantics of HTTP log receivers (Vector,
+VictoriaLogs, Fluent Bit), but a proxy that answers 200 without
+forwarding defeats any status check you could make. `tcp://`: the
+protocol has no framing or ACK, so a **partial write can tear the last
+line** mid-batch — the receiver's codec must tolerate or resync (a
+length-delimited codec does; a strict line parser will not). `file://`:
+the rollback above makes the file whole batches only — a receiver
+reading it concurrently may see a batch disappear for the length of
+the retry, then reappear complete.
 
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
@@ -45,11 +56,42 @@ transforms:
     cache.num_events: 100000   # ~one retry window of duplicates
 ```
 
+## What is never captured
+
+The hook skips lines logged by processes without a PGPROC — in practice the
+postmaster itself. This is not negotiable: during an emergency restart the
+postmaster logs from inside PGSharedMemoryCreate, after the old shared-memory
+segment is unmapped, and even reading the capture state SEGVs there. Its lines
+still reach the ordinary server log (stderr/csvlog) — they are just not
+exported: shutdown requests ("received fast shutdown request"), the shutdown
+sequence itself, fatal postmaster decisions ("terminating any other active
+server processes"), FATALs about missing sockets or lock files. The **startup
+process does have a PGPROC**, so crash-recovery lines — "database system was
+interrupted", "database system was ready to accept read-only connections" —
+**are** captured and exported like any backend line.
+
 ## Loss boundaries per scenario
 
 Buffers: the shmem ring (≤ R events) + the worker RAM backlog (trimmed to the
 newest `export_backlog_max` events, 65536 by default). Everything else is
 already delivered.
+
+### Worker pinned in one send
+
+While the worker sits in a single blocked send — up to `export_timeout_ms`
+against a receiver that accepted the connection but never answers — backends
+keep capturing, and only the ring absorbs it. Capture drops start when
+
+```
+r × export_timeout_ms > ring_capacity        (events/s × s > events)
+```
+
+With defaults (R = 1024, timeout 5 s) that is a mere ~205 ev/s; at 1 k ev/s
+either raise `ring_capacity` to 8192 (POSTMASTER, ~28 MB shmem — buys 8 s) or
+cut `export_timeout_ms` to a few hundred ms. This is the structural reason a
+mute-but-accepting receiver is the worst case for capture, worse than a dead
+one (connection refused fails in milliseconds and the batch parks on the
+fallback file).
 
 ### Receiver down for T minutes
 
@@ -134,6 +176,41 @@ members again — dedup by `(host, seq)` as above makes that harmless. Events
 may also appear twice because the failed send that queued them may have
 partially landed — same dedup.
 
+The truncate-when-drained order (ftruncate first, then the consumer offset
+resets) was chosen over the reverse deliberately: the offset is worker-local
+state, so it dies with the process in every crash scenario that could land
+between the two statements — the reverse order would instead create a *live*
+window where a failed ftruncate leaves an empty-looking file that gets
+re-flooded by replay of the whole queue, doubling it on every attempt.
+
+Two clusters must never share one fallback file (or one absolute path on a
+shared volume): both writers share the framing magic, and their interleaved
+appends tear each other's members — both queues then read as corrupt and
+disable themselves. One file per cluster; `cluster_name` keeps the events
+apart downstream.
+
+### Size cap: `fallback_max_mb`
+
+The queue grows without bound through an outage — by default until the disk
+is full (then the RAM-backlog loss semantics take over). `pg_logtap.
+fallback_max_mb` (default 512, `0` = unlimited) bounds it instead: once an
+append pushes the file past the cap, it is compacted to the **newest half of
+the cap** (atomic tmp+rename rewrite; the worker stalls for that one flush
+cycle). Delivered members at the head are dropped free; undelivered dropped
+members count into **both** `events_replayed` (they left the queue — keeps
+`queue_backlog = queued − replayed` truthful) and `events_lost` (they never
+arrived — `PgLogtapEventsLost` fires, correctly reading "the outage outlasted
+the queue"). After recovery the newest ≈ cap/2 of data is delivered in order.
+A cap smaller than one member (~a hundred KB compressed) bounds the file
+only at member granularity.
+
+A file the worker did not write (foreign content, or framing damaged past
+the readable) sets `fallback_broken=1`: the queue is disabled — neither
+appended to nor replayed — and durability degrades to the RAM-backlog bound
+until the GUC points at a **different** path or the worker restarts (the
+repoint re-checks the file; pointing back at the same bad path changes
+nothing).
+
 Placement caveat, measured (v0.2.0, one 16-core host, nvme, docker
 overlay; debug-level storm, 16 pgbench clients, duration logging on,
 receiver down for a full 10 minutes, queue on the same device as WAL):
@@ -193,6 +270,9 @@ Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules
 - `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow — capture sustained past export capacity (receiver too slow or down longer than export_backlog_max/r).
 - `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
 - `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
+- `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file failed its framing check (foreign content, or two clusters sharing one file) and delivery degraded to the RAM bound — needs an operator: point the GUC at a different path or restart.
+- `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile.
+- `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` did not compile; redaction is OFF (fail-open by design — a bad pattern must not stop export), fix the pattern.
 
 Counters reset on restart (per cluster life) — `increase()` handles that
 natively as long as the Prometheus scrape interval is shorter than the restart.
@@ -206,6 +286,14 @@ in-flight/ring`. Names are identical in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition; the view adds
 derived `queue_backlog` and `delivered`.
 
+One asymmetry: `events_replayed ≤ events_queued` holds within one worker
+life, but a soft worker exit resets the worker-local replay offset, and the
+restarted worker replays the queue from byte 0 — already-delivered members
+count as replayed again. At startup the offset is re-derived and the backlog
+credited (`fbCreditBacklog`), so `queue_backlog` stays truthful; only the
+cumulative `events_replayed` (and `delivered`) can exceed what that worker
+itself queued. Persisting the offset in the file header is on the roadmap.
+
 | counter | unit | grows when |
 |---|---|---|
 | `events_captured` | events | a log line entered the shared ring |
@@ -213,6 +301,6 @@ derived `queue_backlog` and `delivered`.
 | `events_sent` | events | delivered to the export URL by a live send |
 | `events_queued` | events | durably appended to the fallback file |
 | `events_replayed` | events | delivered out of the fallback file after the receiver recovered |
-| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, or an unreadable queue member skipped |
+| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable queue member skipped, or a `fallback_max_mb` compaction dropping undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |
