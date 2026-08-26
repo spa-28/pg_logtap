@@ -186,6 +186,49 @@ fn findWord(hay: []const u8, word: []const u8) ?usize {
 /// changed nothing) and whether it had to clip at the scratch size.
 pub const Masked = struct { text: []const u8, clipped: bool };
 
+/// True when the message line is statement-embedded SQL: the simple-protocol
+/// `statement: ` marker, or an extended-protocol phase line — postgres.c logs
+/// `parse <name>: <sql>`, `bind <name>...`, `execute <name>: <sql>` WITHOUT
+/// the "statement: " marker, each optionally behind a `duration: N ms  `
+/// prefix (log_min_duration_statement). The password cut is gated on this:
+/// an ordinary message merely mentioning a word stays verbatim.
+pub fn stmtLine(msg: []const u8) bool {
+    if (std.mem.indexOf(u8, msg, "statement: ") != null) return true;
+    var rest = msg;
+    if (std.mem.startsWith(u8, rest, "duration: ")) {
+        rest = rest["duration: ".len..];
+        var i: usize = 0;
+        while (i < rest.len and (std.ascii.isDigit(rest[i]) or rest[i] == '.')) : (i += 1) {}
+        if (!std.mem.startsWith(u8, rest[i..], " ms  ")) return false;
+        rest = rest[i + " ms  ".len ..];
+    }
+    return std.mem.startsWith(u8, rest, "parse ") or
+        std.mem.startsWith(u8, rest, "bind ") or
+        std.mem.startsWith(u8, rest, "execute ");
+}
+
+test "statement-embedded SQL markers, simple and extended protocol" {
+    // simple protocol
+    try std.testing.expect(stmtLine("statement: SELECT 1"));
+    try std.testing.expect(stmtLine("duration: 3.2 ms  statement: SELECT 1"));
+    // extended protocol (JDBC/psycopg/pgbench -M extended): phase lines
+    // carry the raw SQL without the "statement: " marker
+    try std.testing.expect(stmtLine("parse stmt_1: SELECT $1"));
+    try std.testing.expect(stmtLine("bind sd_1 to stmt_1"));
+    try std.testing.expect(stmtLine("execute S_1: SELECT $1"));
+    try std.testing.expect(stmtLine("duration: 1.2 ms  execute S_1: SELECT $1"));
+    try std.testing.expect(stmtLine("duration: 0.4 ms  parse sd_1: ALTER ROLE a PASSWORD 'x'"));
+    // ordinary lines that merely contain the words: verbatim
+    try std.testing.expect(!stmtLine("executor slow today"));
+    try std.testing.expect(!stmtLine("parser recovered"));
+    try std.testing.expect(!stmtLine("duration of the outage: parse errors"));
+    try std.testing.expect(!stmtLine("parsed the config"));
+    // a message literally starting with a phase verb is treated as a
+    // statement line: the gate errs toward cutting (over-redaction), and the
+    // cut itself still needs a standalone password token to change anything
+    try std.testing.expect(stmtLine("bind variable count"));
+}
+
 /// Everything from the end of a standalone `password` token on is dropped and
 /// replaced (pgaudit semantics). Returns src untouched when no token is
 /// present — the common case costs one scan, no copy.

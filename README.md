@@ -225,11 +225,14 @@ extends the audience. Two layers mask such text **at capture** — the ring,
 the fallback file and the receiver all hold the masked form only:
 
 - **Password cut, always on.** When the captured `query` field, or a
-  `message` line that embeds a statement (`statement: ...` from
-  `log_statement` / `log_min_duration_statement`), contains the standalone
-  word `password` (case-insensitive, word boundaries respected —
-  `user_passwords` does not trigger it), everything after that word is
-  dropped and replaced with `<REDACTED>`:
+  `message` line that embeds a statement — `statement: ...` from
+  `log_statement` / `log_min_duration_statement`, and the extended-protocol
+  phase lines `parse <name>: ...` / `bind ...` / `execute <name>: ...` that
+  JDBC, psycopg and `pgbench -M extended` produce (same GUCs, no
+  `statement:` marker) — contains the standalone word `password`
+  (case-insensitive, word boundaries respected — `user_passwords` does not
+  trigger it), everything after that word is dropped and replaced with
+  `<REDACTED>`:
 
   ```
   duration: 3.2 ms  statement: CREATE ROLE app PASSWORD 'hunter2'
@@ -258,6 +261,11 @@ On top of that, the operational knobs:
 
 - keep `field_query` off (the default) and be deliberate about
   `log_min_duration_statement`;
+- keep `log_parameter_max_length`/`log_parameter_max_length_on_error` at
+  `-1` (the default): when they are set, PostgreSQL puts **bind-parameter
+  values** into the event's `DETAIL` — and the password cut never fires
+  there (its statement-marker gate applies to `message`/`query`), so a
+  bound secret ships unless your `redact_pattern` catches it;
 - `pg_logtap.pattern_exclude` suppresses whole events at capture — e.g.
   `'PASSWORD|IDENTIFIED BY'` never leaves the server at all;
 - scrub at the collector — Vector's `redact` transform (built-in filters for

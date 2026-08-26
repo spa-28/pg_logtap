@@ -235,6 +235,41 @@ docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" 
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
 
+# Extended protocol (JDBC, psycopg, pgbench -M extended): duration lines for
+# parse/bind/execute carry the raw SQL WITHOUT the "statement: " marker — the
+# cut must fire on the phase words too. The probe SQL puts the tag BEFORE the
+# password token (survives the cut, marks the line) and the secret AFTER it
+# (a prepared statement's secret position). redact_pattern stays off so only
+# the token cut can mask.
+setguc log_min_duration_statement 0; reload; sleep 1
+docker exec "$PG_CT" sh -c "printf '%s\n' \"SELECT 'ext$SUF' AS tag, 'password' AS kw, 'SECRET-exec$SUF-abc123' AS val;\" > /tmp/probe-ext.sql"
+docker exec "$PG_CT" pgbench -U postgres -M extended -c 1 -t 1 -f /tmp/probe-ext.sql postgres >/dev/null 2>&1 || true
+n=0; while [ "$n" -lt 20 ]; do
+  # tail: vector-out.jsonl grows to GiB across runs, but this run's lines
+  # land at the end — grepping the tail keeps the wait cheap
+  [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "ext$SUF")" -gt 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: extended protocol password cut"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-exec" + suf not in whole, "secret reached the receiver via an extended-protocol line"
+saw = 0
+for line in whole.splitlines():
+    if "ext" + suf not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if m.startswith(("parse ", "execute ", "duration: ")):
+        # the token cut fired: everything after the password token is gone
+        assert "kw" not in m and "<REDACTED>" in m, m
+        saw += 1
+assert saw > 0, "no extended-protocol phase lines reached the receiver"
+EOF
+setguc log_min_duration_statement -1; reload
+ok "extended-protocol parse/execute duration lines get the password cut"
+
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a
 # captured event from a client backend); one of its backends is SIGKILLed

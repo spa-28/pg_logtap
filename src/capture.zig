@@ -180,10 +180,11 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (port) |p| copyStr(&entry.client_host, &entry, .client_host, p.remote_host);
 
     // Statement-embedded text (log_statement / log_min_duration_statement
-    // lines) carries the raw SQL, passwords included; the token cut is gated
-    // on that marker so an ordinary message mentioning the word is untouched.
+    // lines, simple AND extended protocol — see filter.stmtLine) carries the
+    // raw SQL, passwords included; the token cut is gated on that marker so
+    // an ordinary message mentioning the word is untouched.
     const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
-    const stmt_line = std.mem.indexOf(u8, msg_span, "statement: ") != null;
+    const stmt_line = filter.stmtLine(msg_span);
     copyText(&entry.message, &entry, .message, d.message, stmt_line);
     copyText(&entry.detail, &entry, .detail, d.detail, false);
     copyText(&entry.hint, &entry, .hint, d.hint, false);
