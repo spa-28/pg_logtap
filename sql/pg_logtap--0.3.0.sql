@@ -1,4 +1,4 @@
-/* pg_logtap 0.2.1 */
+/* pg_logtap 0.3.0 */
 CREATE FUNCTION pg_logtap_version() RETURNS text
 AS 'MODULE_PATHNAME', 'pg_logtap_version'
 LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
@@ -27,19 +27,26 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
      delivered       — sent + replayed, everything handed to a receiver
      events_lost     — permanently lost (no fallback file / unreadable member)
    send_cycles_failed counts failed send CYCLES, not events (receiver down).
-   ring_events/ring_capacity are gauges for capture-ring pressure. */
+   ring_events/ring_capacity are gauges for capture-ring pressure.
+   0.3.0 gauges: dns_fail_streak — consecutive failed DNS lookups for the
+   receiver host; fallback_broken — 1 = the fallback file is foreign/corrupt
+   and the queue is disabled; redact_pattern_failed — 1 = redact_pattern did
+   not compile, redaction is off (fail-open). */
 CREATE TYPE pg_logtap_stats_t AS (
-    events_captured    bigint,
-    events_dropped     bigint,
-    events_sent        bigint,
-    events_queued      bigint,
-    events_replayed    bigint,
-    queue_backlog      bigint,
-    delivered          bigint,
-    events_lost        bigint,
-    send_cycles_failed bigint,
-    ring_events        int,
-    ring_capacity      int
+    events_captured      bigint,
+    events_dropped       bigint,
+    events_sent          bigint,
+    events_queued        bigint,
+    events_replayed      bigint,
+    queue_backlog        bigint,
+    delivered            bigint,
+    events_lost          bigint,
+    send_cycles_failed   bigint,
+    ring_events          int,
+    ring_capacity        int,
+    dns_fail_streak      bigint,
+    fallback_broken      bigint,
+    redact_pattern_failed bigint
 );
 
 CREATE VIEW pg_logtap_delivery AS
