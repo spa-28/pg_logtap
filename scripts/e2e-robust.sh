@@ -386,6 +386,31 @@ drpd=$(( $(statf events_dropped) - bdrp )); lostd=$(( $(statf events_lost) - blo
   || fail "backlog-bound: the bound was never exercised (dropped=$drpd lost=$lostd of 60000)"
 ok "worker RSS ${rss0}→${rss1}kB (bounded), cgroup ceiling ${OOM_LIMIT_MB}MB never touched (peak ${peak:-?}B), accounted: emitted=$((capd + drpd)) = captured=$capd + dropped=$drpd, captured = sent=$sentd + lost=$lostd, delivery resumed"
 
+echo "== redact gauge assign under live lock traffic =="
+# The redact_pattern assign hook also runs in the postmaster on its own SIGHUP
+# reload, and the gauge update takes the ring LWLock — contended there, it
+# would PANIC ("cannot wait without a PGPROC structure") and take the whole
+# cluster down. The capture-side MyProc gate must keep the postmaster off the
+# lock; the window needs live lock traffic to matter, so flip an invalid
+# pattern through several reloads while backends push logged statements. Runs
+# AFTER the memory-peak assert on purpose: statement-rate logging at the
+# default backlog depth is what that assert exists to forbid.
+# Backlog is still clamped to 8192 by the scenario above, so the burst's RAM
+# cost is the documented ~28MB, not a GUC-default surprise.
+setguc log_min_duration_statement 0; reload
+docker exec "$PG_CT" sh -c "printf '%s\n' 'SELECT 1;' > /tmp/probe-load$SUF.sql"
+docker exec -d "$PG_CT" pgbench -U postgres -c 4 -T 12 -f "/tmp/probe-load$SUF.sql" postgres
+flip=0
+while [ "$flip" -lt 8 ]; do
+  setguc pg_logtap.redact_pattern "[reload-under-load-$flip"
+  reload; sleep 1
+  flip=$((flip + 1))
+done
+docker exec "$PG_CT" psql -U postgres -qc "SELECT 1" >/dev/null 2>&1 || fail "redact_pattern reload under load crashed the server"
+[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid pattern under load did not set redact_pattern_failed=1"
+setguc pg_logtap.redact_pattern ''; setguc log_min_duration_statement -1; reload; sleep 1
+ok "redact_pattern reloaded 8x under pgbench statement load: postmaster survived, gauge set"
+
 dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "$dups duplicate seqs across the suite"
 echo "e2e-robust: all scenarios passed"

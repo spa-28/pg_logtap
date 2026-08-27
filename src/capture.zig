@@ -333,8 +333,13 @@ pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8) void {
 /// Redaction compile health. Set from the GUC assign hook (SIGHUP runs in
 /// whichever backend reloads) and the startup rebuild: a pattern that does
 /// not compile leaves that layer OFF (fail-open) — the gauge is the signal.
+/// The postmaster also runs assign hooks on its own SIGHUP reload, and it
+/// has no PGPROC: waiting on a contended LWLock there PANICs the whole
+/// cluster. Skip in that process — every backend runs the same assign on
+/// its own reload a moment later, so the gauge still converges.
 pub fn setRedactPatternFailed(on: bool) void {
     if (!ready) return;
+    if (pg.MyProc == null) return;
     lockRing();
     state.redact_pattern_failed = @intFromBool(on);
     unlockRing();
