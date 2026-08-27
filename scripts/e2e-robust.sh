@@ -301,7 +301,17 @@ n=0; while [ -z "$bepid" ] && [ "$n" -lt 15 ]; do
   [ -n "$bepid" ] || { n=$((n + 1)); sleep 1; }
 done
 [ -n "$bepid" ] || fail "backend-kill: no pgbench backend appeared"
-docker exec "$PG_CT" bash -c "kill -9 $bepid" # abnormal death: postmaster takes the PANIC path
+# The pid can vanish between the lookup and the kill (seen in CI: a pgbench
+# client hitting its -T deadline, or finishing, right in the window) — "kill:
+# No such process" then aborts the whole suite under set -e. Re-find until
+# the kill lands: the scenario needs an abnormal death, not a specific pid.
+n=0; while [ "$n" -lt 10 ]; do
+  docker exec "$PG_CT" bash -c "kill -9 $bepid" 2>/dev/null && break
+  bepid=$(docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT pid FROM pg_stat_activity WHERE application_name = 'pgbench' LIMIT 1")
+  [ -n "$bepid" ] || sleep 1
+  n=$((n + 1))
+done
 sleep 2; wait_ready # emergency restart: teardown, shmem rebuild, recovery
 setguc log_min_duration_statement -1; reload
 docker logs "$PG_CT" 2>&1 | grep -q "was terminated by signal 9" \
