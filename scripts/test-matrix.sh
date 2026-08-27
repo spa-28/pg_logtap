@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,robust,hook-chain,metrics}
+PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,robust,hook-chain,metrics,wide}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e
 mkdir -p "$OUT"
@@ -205,8 +205,15 @@ phase_hook_chain() { # <v>: another emit_log_hook extension preloaded first:
 }
 
 phase_metrics() { # <v>: worker serves /metrics, Vector prometheus_scrape
-  # reads it. Last on purpose: it opens metrics_addr to the stand network.
+  # reads it. Opens metrics_addr to the stand network.
   scripts/e2e-metrics.sh "pglogtap-mx$1"
+}
+
+phase_wide() { # <v>: pg_logtap.message_max=8192 (POSTMASTER): whole messages
+  # past the 1024B default, char-boundary cut past the configured width, aux
+  # fields still 256B. Last on purpose: it ALTER SYSTEMs + restarts the pg
+  # container, so every earlier phase must have passed on the default config.
+  scripts/e2e-wide.sh "pglogtap-mx$1"
 }
 
 phase_bench() { # <v> <secs>: formal overhead benchmark (docs/bench.md) —
@@ -249,6 +256,9 @@ for v in $VERSIONS; do
   fi
   if [ "$ok" = 1 ] && has_phase metrics; then
     phase_metrics "$v" || { echo "pg$v: metrics FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase wide; then
+    phase_wide "$v" || { echo "pg$v: wide FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase bench; then
     phase_bench "$v" "$SECS" || { echo "pg$v: bench FAILED"; STATUS=1; ok=0; }
