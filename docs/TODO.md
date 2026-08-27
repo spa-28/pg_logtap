@@ -3,13 +3,6 @@
 Known ceilings and deferred designs — kept here so they are not re-derived
 from scratch when the need becomes real.
 
-- **Larger message slots** (`pg_logtap.message_max`, postmaster GUC): fields
-  are cut at 1024 (`message`) / 256 (others) bytes — measured fine for what
-  PostgreSQL itself emits (p99 ≈ 136 bytes in a debug-level storm), the
-  exception being `duration:` lines that embed full SQL text and chatty
-  applications. A GUC computed into the shmem slot layout at boot is the
-  cheap fix; the memory cost is visible up front
-  (`ring_capacity × (message_max + ~2.8 KB)`).
 - **Chained slots for oversized messages**: capture splits a long message
   across continuation ring slots under one LWLock hold, the worker joins
   them back into one event at export — no fixed per-slot tax, the ring pays

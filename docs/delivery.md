@@ -3,8 +3,11 @@
 What pg_logtap promises, per failure scenario, with numbers. The assumptions:
 `ring_capacity` = R (default 1024, max 8192, POSTMASTER), capture rate = r events/s,
 `flush_interval` = f (default 1000 ms), RAM backlog depth =
-`export_backlog_max` (default 65536, SIGHUP). One event ≈ 3.4 KB of shared memory
-(8192-slot ring ≈ 28 MB). Counters are **per cluster life** — shared memory dies
+`export_backlog_max` (default 65536, SIGHUP). One event's slot in shared memory
+is `message_max + ~2.4 KB` (default width ≈ 3.4 KB — an 8192-slot ring ≈ 28 MB;
+at `message_max = 1 MB` the same ring is ≈ 8.6 GB, and the RAM backlog ceiling
+likewise scales: `export_backlog_max × (message_max + ~2.4 KB)`). Counters are
+**per cluster life** — shared memory dies
 with the postmaster, so `pg_logtap_stats()` (and the `pg_logtap_delivery`
 view) restarts from zero on every restart.
 
