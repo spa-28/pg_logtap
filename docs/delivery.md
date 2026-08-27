@@ -28,6 +28,14 @@ the rollback above makes the file whole batches only — a receiver
 reading it concurrently may see a batch disappear for the length of
 the retry, then reappear complete.
 
+Measured end-to-end (v0.3.0, pg_logtap → Vector http → VictoriaLogs
+jsonline insert, docker stand, warning-size lines): a 1000-event batch
+becomes queryable in VictoriaLogs ~2 s after generation — one
+`flush_interval` plus Vector's sink batch (~1 s each); a 60 000-event
+burst is fully queryable within 3 s. The receiver chain absorbs
+capture-rate bursts; it is not the bottleneck (a dead-endpoint storm
+captures at ~12 k ev/s, above).
+
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
 
@@ -202,7 +210,12 @@ members count into **both** `events_replayed` (they left the queue — keeps
 arrived — `PgLogtapEventsLost` fires, correctly reading "the outage outlasted
 the queue"). After recovery the newest ≈ cap/2 of data is delivered in order.
 A cap smaller than one member (~a hundred KB compressed) bounds the file
-only at member granularity.
+only at member granularity. Fill rate measured (v0.3.0, one 16-core
+host, 8-client pgbench with every statement duration-logged into a dead
+endpoint — the debug-storm profile): 0.82 MB/s of queue at ~12.2k ev/s,
+~71 compressed bytes per event, so the default 512 MB cap is first
+reached after ~10 minutes of that storm; ordinary production rates (tens
+to hundreds of events/s) fill it over hours to days.
 
 A file the worker did not write (foreign content, or framing damaged past
 the readable) sets `fallback_broken=1`: the queue is disabled — neither
