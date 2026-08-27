@@ -376,7 +376,7 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
 fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, names: *NameCache) ?[]const u8 {
     w.writer.end = 0; // reset, keep capacity
     for (entries) |*e| {
-        jsonl.writeEntry(&w.writer, e, names.lookup(e)) catch return null;
+        jsonl.writeEntry(&w.writer, e, e.message.bytes[0..e.message.len], names.lookup(e)) catch return null;
         w.writer.writeByte('\n') catch return null;
     }
     return w.writer.buffer[0..w.writer.end];

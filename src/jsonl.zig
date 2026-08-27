@@ -20,12 +20,16 @@ pub var source_host: []const u8 = "";
 pub var source_cluster: []const u8 = "";
 pub var source_pgdata: []const u8 = "";
 
-pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, names: Names) !void {
+/// `msg` is the event's message bytes, passed separately from the fixed
+/// fields: it is the one variable-width part of an event (pg_logtap.
+/// message_max), so every owner of it — the ring slot, the RAM backlog
+/// record, the capture hold buffer — hands it in as a plain slice.
+pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, msg: []const u8, names: Names) !void {
     try w.print("{{\"seq\":{d},\"timestamp\":\"", .{e.seq});
     try writeTimestamp(w, e.timestamp_us);
     try w.writeAll("\"");
     try w.print(",\"level\":\"{s}\",\"message\":", .{levelName(e.elevel)});
-    try jsonStr(w, fixed(&e.message));
+    try jsonStr(w, msg);
     try w.print(",\"detail\":", .{});
     try optJsonStr(w, fixed(&e.detail));
     try w.print(",\"hint\":", .{});
@@ -201,7 +205,7 @@ test "invalid utf-8 bytes sanitize to U+FFFD, line stays valid JSON" {
 
     var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer line_w.deinit();
-    try writeEntry(&line_w.writer, &entry, .{});
+    try writeEntry(&line_w.writer, &entry, entry.message.bytes[0..entry.message.len], .{});
     const line = line_w.written();
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -220,7 +224,7 @@ test "control characters in message escape correctly" {
 
     var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer line_w.deinit();
-    try writeEntry(&line_w.writer, &entry, .{});
+    try writeEntry(&line_w.writer, &entry, entry.message.bytes[0..entry.message.len], .{});
     const line = line_w.written();
 
     // still one line: no raw \n or \0 anywhere, quotes escaped
@@ -291,7 +295,7 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
 
         var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer line_w.deinit();
-        try writeEntry(&line_w.writer, &entry, names);
+        try writeEntry(&line_w.writer, &entry, entry.message.bytes[0..entry.message.len], names);
         const line = line_w.written();
 
         if (!try std.json.validate(std.testing.allocator, line)) {
@@ -336,7 +340,7 @@ test "truncated and redacted are independent arrays" {
         entry.redacted_mask = c.redacted;
         var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer line_w.deinit();
-        try writeEntry(&line_w.writer, &entry, .{});
+        try writeEntry(&line_w.writer, &entry, entry.message.bytes[0..entry.message.len], .{});
         const line = line_w.written();
         try std.testing.expect(std.mem.find(u8, line, c.want) != null);
         try std.testing.expect(try std.json.validate(std.testing.allocator, line));
@@ -368,7 +372,7 @@ test "full entry json" {
         source_host = "";
         source_cluster = "";
     }
-    try writeEntry(&line_w.writer, &entry, .{ .database = "mydb", .user = "app" });
+    try writeEntry(&line_w.writer, &entry, entry.message.bytes[0..entry.message.len], .{ .database = "mydb", .user = "app" });
     const got = line_w.written();
 
     try std.testing.expect(std.mem.find(u8, got, "\"host\":\"pg1.example\"") != null);

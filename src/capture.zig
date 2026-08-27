@@ -340,9 +340,10 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
     var datums: [max_dump]pg.Datum = undefined;
     var out_rows: u32 = 0;
     while (out_rows < taken) : (out_rows += 1) {
+        const e = &copies[out_rows];
         var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, &copies[out_rows], resolveNames(&copies[out_rows])) catch break;
+        jsonl.writeEntry(&line_w.writer, e, e.message.bytes[0..e.message.len], resolveNames(e)) catch break;
         const line = line_w.written();
         datums[out_rows] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
     }
