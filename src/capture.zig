@@ -12,7 +12,10 @@ const state_name = "pg_logtap";
 const entries_name = "pg_logtap:entries";
 
 var state: *ring.ShmState = undefined;
-var entries: []ring.ShmLogEntry = undefined;
+/// Slot backing bytes: capacity × strideFor(state.message_max) of them. The
+/// stride lives in ShmState (not in each process's GUC copy) so every forked
+/// backend addresses the slots identically.
+var entries_base: [*]u8 = undefined;
 /// Set by the shmem startup hook in the postmaster; inherited by fork.
 var ready = false;
 var tranche_id: c_int = 0;
@@ -29,6 +32,7 @@ var guc_pattern_exclude: [*c]u8 = null;
 var guc_field_query: bool = false;
 var guc_redact_pattern: [*c]u8 = null;
 var guc_ring_capacity: c_int = 1024;
+var guc_message_max: c_int = 1024;
 
 /// Compiled from the GUCs on every assign; read-only in the hook (E1).
 var filter_cache = filter.Filter{};
@@ -37,10 +41,28 @@ var redactor: ?filter.Redactor = null;
 
 /// Redaction scratch: the password-token cut writes one buffer, the regex
 /// pass the other, so the hook never allocates. One byte over the message
-/// slot — the largest text field — so a full-length field still gets its
+/// width — the largest text field — so a full-length field still gets its
 /// NUL terminator without losing a byte to it.
-var redact_a: [ring.msg_len + 1]u8 = undefined;
-var redact_b: [ring.msg_len + 1]u8 = undefined;
+/// Sized at the BSS comptime maximum and sliced to message_max at use:
+/// demand-zero under fork means only touched pages go resident (the
+/// postmaster never touches them — the MyProc gate below exits first), and
+/// the hook still never allocates, through any number of emergency restarts.
+var redact_a: [ring.max_message + 1]u8 = undefined;
+var redact_b: [ring.max_message + 1]u8 = undefined;
+/// Hold for the layered message between copyMsg and ring.push: the layers
+/// leave their result in redact_b, and the very next copyText (.detail)
+/// overwrites it — the fixed fields were saved by setStr into the stack
+/// entry, the variable-width message needs this buffer. Same BSS sizing.
+var msg_hold: [ring.max_message]u8 = undefined;
+
+/// Runtime message width — shmem's value, not the local GUC copy.
+pub fn messageMax() usize {
+    return if (ready) state.message_max else ring.default_message;
+}
+
+fn ringQ() ring.Ring {
+    return ring.Ring.init(state, entries_base, ring.strideFor(state.message_max));
+}
 
 pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5, 15=LOG, 19=WARNING, 21=ERROR, 23=PANIC). Filters export only — stderr/log_destination output is governed by the server's own log_min_messages.", null, &guc_level_min, 15, 10, 23, pg.PGC_SIGHUP, 0, null, assignLevel, null);
@@ -49,6 +71,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting. Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
     pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event. SECURITY: queries can embed tokens and personal data beyond passwords (literals in INSERTs) — the standalone password token is cut always and redact_pattern masks its matches, but everything else ships as written; leave off unless the receiver is trusted. log_min_duration_statement puts query text into message regardless of this setting; pattern_exclude suppresses whole events at capture.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.message_max", "Width in bytes of each event's message field; longer messages are cut at a UTF-8 character boundary and named in truncated. Other fields stay 256 bytes. Shared memory cost is ring_capacity × (message_max + ~2.4 KB); restart required. Default keeps the slot byte-identical to 0.3.x (3.4 KB).", null, &guc_message_max, 1024, @intCast(ring.default_message), @intCast(ring.max_message), pg.PGC_POSTMASTER, 0, null, null, null);
 
     pg.shmem_request_hook = shmemRequestHook;
     pg.shmem_startup_hook = shmemStartupHook;
@@ -110,7 +133,7 @@ fn rebuildFilter() void {
 
 fn shmemRequestHook() callconv(.c) void {
     const cap: usize = @intCast(guc_ring_capacity);
-    pg.RequestAddinShmemSpace(@sizeOf(ring.ShmState) + @sizeOf(ring.ShmLogEntry) * cap);
+    pg.RequestAddinShmemSpace(@sizeOf(ring.ShmState) + @as(usize, ring.strideFor(@intCast(guc_message_max))) * cap);
 }
 
 fn shmemStartupHook() callconv(.c) void {
@@ -121,18 +144,19 @@ fn shmemStartupHook() callconv(.c) void {
     var found = false;
     state = @ptrCast(@alignCast(pg.ShmemInitStruct(state_name, @sizeOf(ring.ShmState), &found) orelse return));
     const cap: usize = @intCast(guc_ring_capacity);
-    const eptr = pg.ShmemInitStruct(entries_name, @sizeOf(ring.ShmLogEntry) * cap, &found);
-    const ebuf: [*]ring.ShmLogEntry = @ptrCast(@alignCast(eptr orelse return));
-    entries = ebuf[0..cap];
+    const stride = ring.strideFor(@intCast(guc_message_max));
+    const eptr = pg.ShmemInitStruct(entries_name, @as(usize, stride) * cap, &found);
+    entries_base = @ptrCast(eptr orelse return);
     if (!found) {
         state.* = std.mem.zeroes(ring.ShmState);
         state.capacity = @intCast(cap);
+        state.message_max = @intCast(guc_message_max);
         // Seed seq from the wall clock (µs since 2000-01-01): each second of
         // uptime advances the seed by 1e6 but consumes <1e6 values unless the
         // capture rate exceeds 1M events/s, so seq never repeats on a host
         // across restarts — receivers may dedup on (host, seq) long-term.
         state.seq_next = @intCast(pg.GetCurrentTimestamp());
-        @memset(entries, std.mem.zeroes(ring.ShmLogEntry));
+        @memset(entries_base[0 .. @as(usize, stride) * cap], 0);
     }
     pg.LWLockInitialize(@ptrCast(&state.lock), tranche_id);
     // Fence + magic last: backends treat the segment as usable once magic matches.
@@ -195,7 +219,7 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     // an ordinary message mentioning the word is untouched.
     const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
     const stmt_line = filter.stmtLine(msg_span);
-    copyText(&entry.message, &entry, .message, d.message, stmt_line);
+    const msg_bytes = copyMsg(&entry, d.message, stmt_line);
     copyText(&entry.detail, &entry, .detail, d.detail, false);
     copyText(&entry.hint, &entry, .hint, d.hint, false);
     copyText(&entry.context, &entry, .context, d.context, false);
@@ -205,7 +229,7 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
 
     lockRing();
     const was_empty = state.count == 0;
-    _ = ring.push(ring.Ring.init(state, entries), entry);
+    _ = ring.push(ringQ(), entry, msg_bytes);
     unlockRing();
     // Wake the worker the moment the ring goes non-empty: a connection burst
     // at debug1 (~85k events/s from 16 pgbench connects) fills the whole ring
@@ -220,43 +244,51 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
     ring.setStr(dst, &entry.truncated_mask, field, std.mem.span(@as([*:0]const u8, @ptrCast(src))));
 }
 
-/// Copy a C string field through the redaction layers: the `password` token
-/// cut (pw — query field always, statement-embedded message lines) into one
-/// scratch buffer, then the redact_pattern regex over the result into the
-/// other. Layers that cannot change the text copy nothing. A layer that had
-/// to clip sets the field's redacted bit itself: setStr cannot, because the
-/// clipped result fits the slot — and the cause is the clip, not the slot.
+/// Run text through the redaction layers: the `password` token cut (pw —
+/// query field always, statement-embedded message lines) into one scratch
+/// buffer, then the redact_pattern regex over the result into the other.
+/// Layers that cannot change the text copy nothing.
+fn maskThroughLayers(text: []const u8, pw: bool) filter.Masked {
+    var out = filter.Masked{ .text = text, .clipped = false };
+    if (pw) out = filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text);
+    if (redactor) |*red| out = red.apply(redact_b[0 .. messageMax() + 1], out.text);
+    return out;
+}
+
+/// Copy a C string field through the redaction layers into its fixed slot.
+/// A layer that had to clip sets the field's redacted bit itself: setStr
+/// cannot, because the clipped result fits the slot — and the cause is the
+/// clip, not the slot.
 fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool) void {
     if (src == null) return;
-    var text: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(src)));
-    var clipped = false;
-    if (pw) {
-        const masked = filter.redactPassword(&redact_a, text);
-        text = masked.text;
-        clipped = masked.clipped;
-    }
-    if (redactor) |*red| {
-        const masked = red.apply(&redact_b, text);
-        text = masked.text;
-        clipped = clipped or masked.clipped;
-    }
-    ring.setStr(dst, &entry.truncated_mask, field, text);
-    if (clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
+    ring.setStr(dst, &entry.truncated_mask, field, masked.text);
+    if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
+}
+
+/// The message variant of copyText: same layers, but the result lands in
+/// msg_hold via setMsg (the slot's message region is variable-width) and the
+/// copied slice is returned for ring.push — it must
+/// survive until push, and the layers' own buffer (redact_b) does not: the
+/// next copyText overwrites it.
+fn copyMsg(entry: *ring.ShmLogEntry, src: [*c]const u8, pw: bool) []const u8 {
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
+    const held = ring.setMsg(&entry.message_len, &entry.truncated_mask, masked.text, msg_hold[0..messageMax()]);
+    if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(ring.TruncField.message));
+    return held;
 }
 
 // --- worker side ---------------------------------------------------------------
 
-/// Pop up to batch.len events (allocation-free under the lock).
-pub fn drainBatch(batch: []ring.ShmLogEntry) usize {
-    if (!ready) return 0;
-    const ring_q = ring.Ring.init(state, entries);
+/// Pop one event: head into head_out, message bytes into msg_out (worker-
+/// owned, message_max-sized). One lock round per event — the same bytes move
+/// as the old 64-event batch under one hold, with the worst single hold 64×
+/// shorter, which is what a logging backend stuck behind the lock feels.
+pub fn drainOne(head_out: *ring.ShmLogEntry, msg_out: []u8) bool {
+    if (!ready) return false;
     lockRing();
     defer unlockRing();
-    var taken: usize = 0;
-    while (taken < batch.len) : (taken += 1) {
-        batch[taken] = ring.pop(ring_q) orelse break;
-    }
-    return taken;
+    return ring.pop(ringQ(), head_out, msg_out);
 }
 
 pub fn capacity() u32 {
@@ -325,25 +357,30 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
     // elog (palloc, catalog lookups) runs below, outside — an elog between
     // acquire/release longjmps past LWLockRelease, and every logging backend
     // then blocks on the held lock: an OOM in dump would hang the cluster.
-    // The copy buffer itself is palloc'd BEFORE the lock for the same reason
-    // (elogs while the lock is still unheld); the query context owns it.
-    const copies: []ring.ShmLogEntry = (@as([*]ring.ShmLogEntry, @ptrCast(@alignCast(pg.palloc(@sizeOf(ring.ShmLogEntry) * limit)))))[0..limit];
-    const ring_q = ring.Ring.init(state, entries);
+    // The copy buffers themselves are palloc'd BEFORE the lock for the same
+    // reason (elogs while the lock is still unheld); the query context owns
+    // them. The message area is capped at 64MiB total: at the message_max
+    // ceiling a full 1024-row dump would ask palloc for ~1GiB.
+    const mmax: usize = state.message_max;
+    const mb_cap: u32 = @intCast(@divTrunc(64 * 1024 * 1024, mmax));
+    const eff_limit: u32 = @min(limit, mb_cap);
+    const copies: []ring.ShmLogEntry = (@as([*]ring.ShmLogEntry, @ptrCast(@alignCast(pg.palloc(@sizeOf(ring.ShmLogEntry) * eff_limit)))))[0..eff_limit];
+    const msg_area: []u8 = @as([*]u8, @ptrCast(pg.palloc(mmax * eff_limit)))[0 .. mmax * eff_limit];
     lockRing();
-    const count = @min(ring.snapshot(ring_q).count, limit);
+    const count = @min(ring.snapshot(ringQ()).count, eff_limit);
     var taken: u32 = 0;
     while (taken < count) : (taken += 1) {
-        copies[taken] = ring.peek(ring_q, taken) orelse break;
+        if (!ring.peek(ringQ(), taken, &copies[taken], msg_area[taken * mmax ..][0..mmax])) break;
     }
     unlockRing();
 
     var datums: [max_dump]pg.Datum = undefined;
     var out_rows: u32 = 0;
     while (out_rows < taken) : (out_rows += 1) {
-        const e = &copies[out_rows];
+        const ent = &copies[out_rows];
         var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, e, e.message.bytes[0..e.message.len], resolveNames(e)) catch break;
+        jsonl.writeEntry(&line_w.writer, ent, msg_area[out_rows * mmax ..][0..ent.message_len], resolveNames(ent)) catch break;
         const line = line_w.written();
         datums[out_rows] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
     }
@@ -400,5 +437,5 @@ pub fn snapshot() ring.Stats {
     if (!ready) return std.mem.zeroes(ring.Stats);
     lockRing();
     defer unlockRing();
-    return ring.snapshot(ring.Ring.init(state, entries));
+    return ring.snapshot(ringQ());
 }

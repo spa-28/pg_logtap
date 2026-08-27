@@ -40,7 +40,14 @@ const chunk_max = 256; // events per request / queue member. 1024 measured
 // glibc's mmap threshold and every flush cycle munmaps ~1MB — TLB shootdown
 // IPIs tax every core, postgres backends included. 256 keeps allocations on
 // the malloc heap and 4x more fdatasyncs cost less than that.
-const drain_batch = 64; // popped per lock round; stack-sized
+const body_cap = 4 << 20; // byte ceiling per request body / queue member: at
+// message_max=1MB a full 256-event chunk would be ~67MB — past proxy body
+// limits and the flush cycle's time budget. buildBody stops at whichever
+// bound, events or bytes, comes first.
+
+/// Message staging for ring drains (capture.messageMax() bytes, allocated
+/// once at worker start, outside every lock).
+var drain_msg: []u8 = &.{};
 
 var guc_export_url: [*c]u8 = null;
 var guc_cluster_name: [*c]u8 = null;
@@ -120,6 +127,9 @@ pub fn workerMain() void {
     pg.BackgroundWorkerUnblockSignals();
 
     const alloc = std.heap.c_allocator;
+    // Drain-side message staging, sized to the slot's runtime width; without
+    // it there is nowhere to pop a message into.
+    drain_msg = alloc.alloc(u8, capture.messageMax()) catch pg.proc_exit(1);
     var pending: Backlog = .{};
     defer pending.deinit(alloc);
     var names = NameCache{};
@@ -144,7 +154,7 @@ pub fn workerMain() void {
         // Return a storm-swollen backlog buffer: parking keeps the ArrayList
         // capacity, so a one-off million-event storm would otherwise pin GiB
         // of RSS for the worker's whole life (measured: 6.6GiB retained).
-        if (pending.len() == 0 and pending.list.capacity > 4096) {
+        if (pending.len() == 0 and pending.buf.capacity >= 2 * body_cap) {
             pending.deinit(alloc);
             pending = .{};
         }
@@ -239,14 +249,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 if (!final and pg.GetCurrentTimestamp() > cycle_deadline) break;
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
-                const count = @min(pending.len(), chunk_max);
-                const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-                if (!fbAppend(alloc, body, false)) { // disk full → RAM-backlog semantics for the rest
+                const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+                if (!fbAppend(alloc, chunk.body, false)) { // disk full → RAM-backlog semantics for the rest
                     failed += 1;
                     break;
                 }
-                pending.dropFront(count);
-                queued += count;
+                pending.dropFront(chunk.consumed);
+                queued += chunk.consumed;
                 appended = true;
             }
             if (appended) fbFsync();
@@ -288,9 +297,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         }
 
         if (pending.len() == 0) break;
-        const count = @min(pending.len(), chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, body, true)) {
+        const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, chunk.body, true)) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
@@ -300,16 +308,16 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // probe that clears receiver_slow — parking into nowhere while
             // the flag is set livelocks delivery forever.
             logFallback(true);
-            pending.dropFront(count);
-            queued += count;
+            pending.dropFront(chunk.consumed);
+            queued += chunk.consumed;
             continue;
         }
-        const gzipped = gzipPayload(alloc, dest, body, &gzip_buf);
+        const gzipped = gzipPayload(alloc, dest, chunk.body, &gzip_buf);
         const sent_at = pg.GetCurrentTimestamp();
         if (send(dest, url, gzipped.payload, gzipped.enabled)) {
             logFallback(false);
-            pending.dropFront(count);
-            sent += count;
+            pending.dropFront(chunk.consumed);
+            sent += chunk.consumed;
             // Liveness probe, both ways: an answer this slow cannot keep up
             // with capture; a fast one clears the park — the live path must
             // clear it too, or a slow answer with no fallback file set parks
@@ -323,10 +331,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             failed += 1;
             parkAll(alloc, pending, names, &queued, &lost);
             break;
-        } else if (fbAppend(alloc, body, true)) {
+        } else if (fbAppend(alloc, chunk.body, true)) {
             logFallback(true);
-            pending.dropFront(count);
-            queued += count; // durably parked: counted replayed on delivery
+            pending.dropFront(chunk.consumed);
+            queued += chunk.consumed; // durably parked: counted replayed on delivery
             failed += 1; // the send DID fail — without this a diverting storm
             // reports send_cycles_failed=0 (the receiver-down signal) while
             // actively losing events
@@ -356,11 +364,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
 fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queued: *u64, lost: *u64) void {
     var appended = false;
     while (pending.len() > 0) {
-        const count = @min(pending.len(), chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-        if (!fbAppend(alloc, body, false)) break;
-        pending.dropFront(count);
-        queued.* += count;
+        const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+        if (!fbAppend(alloc, chunk.body, false)) break;
+        pending.dropFront(chunk.consumed);
+        queued.* += chunk.consumed;
         appended = true;
     }
     if (appended) fbFsync();
@@ -368,37 +375,47 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
     pending.dropFront(pending.len());
 }
 
-/// pending slice → NDJSON body (one JSON line per event), built in a REUSED
+/// pending → NDJSON body (one JSON line per event), built in a REUSED
 /// buffer: a fresh ~100KB chunk body sits above glibc's mmap threshold, and
 /// the per-chunk mmap/munmap + TLB shootdowns stall every core — measured as
 /// ring drops under a 16-client storm. The slice is valid until the next call.
-/// null = formatting failed (OOM); the caller retries the chunk next cycle.
-fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, names: *NameCache) ?[]const u8 {
+/// Stops at chunk_max events or body_cap bytes, whichever comes first, and
+/// reports how many events it consumed — the caller drops exactly those.
+/// null = nothing built (empty or formatting failed); the caller retries
+/// next cycle.
+const BodyChunk = struct { body: []const u8, consumed: usize };
+
+fn buildBody(w: *std.Io.Writer.Allocating, pending: *Backlog, names: *NameCache) ?BodyChunk {
     w.writer.end = 0; // reset, keep capacity
-    for (entries) |*e| {
-        jsonl.writeEntry(&w.writer, e, e.message.bytes[0..e.message.len], names.lookup(e)) catch return null;
+    var consumed: usize = 0;
+    var off = pending.head;
+    while (consumed < @min(pending.len(), chunk_max)) {
+        const ent: *const ring.ShmLogEntry = @ptrCast(@alignCast(pending.buf.items.ptr + off));
+        const msg = pending.buf.items[off + @sizeOf(ring.ShmLogEntry) ..][0..ent.message_len];
+        jsonl.writeEntry(&w.writer, ent, msg, names.lookup(ent)) catch return null;
         w.writer.writeByte('\n') catch return null;
+        consumed += 1;
+        if (w.writer.end >= body_cap) break;
+        off = pending.nextOff(off);
     }
-    return w.writer.buffer[0..w.writer.end];
+    if (consumed == 0) return null;
+    return .{ .body = w.writer.buffer[0..w.writer.end], .consumed = consumed };
 }
 
-/// Ring → backlog. OOM counts the drained events as lost (ring is already drained).
+/// Ring → backlog. OOM counts the drained event as lost (the ring is already
+/// drained). Round cap: the ring refilling as fast as it drains would keep
+/// this loop running — 4096 events ≈ the old 64×64 batch — before sends,
+/// /metrics and the latch get control back.
 fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
     var drained: usize = 0;
-    var batch: [drain_batch]ring.ShmLogEntry = undefined;
-    // Round cap: drainBatch returning a full batch every time means capture
-    // is refilling the ring as fast as it drains — without the cap this loop
-    // holds the ring lock in bursts and the flush cycle (sends, /metrics,
-    // latch) never gets control back. 64 rounds ≈ 4k events per call.
-    var rounds: usize = 0;
-    while (rounds < 64) : (rounds += 1) {
-        const count = capture.drainBatch(&batch);
-        if (count == 0) return drained;
-        pending.append(alloc, batch[0..count]) catch {
-            capture.bumpExport(0, 0, 0, 0, count);
+    var head: ring.ShmLogEntry = undefined;
+    while (drained < 4096) {
+        if (!capture.drainOne(&head, drain_msg)) return drained;
+        pending.append(alloc, &head, drain_msg[0..head.message_len]) catch {
+            capture.bumpExport(0, 0, 0, 0, 1);
             return drained;
         };
-        drained += count;
+        drained += 1;
     }
     return drained; // ring non-empty: the next flush cycle drains the rest
 }
@@ -416,40 +433,54 @@ fn trimBacklog(pending: *Backlog) u64 {
     return lost;
 }
 
-/// Front-consumable RAM backlog: appended at the tail (ring drains), consumed
-/// from the head (chunk parks / sends). dropFront is O(1) — a head index, with
-/// the dead prefix compacted inside append once it dominates. The old
+/// Front-consumable RAM backlog as a byte arena of [head][message] records,
+/// 8-aligned so the head cast below is legal (c_allocator guarantees 16 for
+/// any allocation this size). dropFront advances the byte head by walking
+/// records (~80ns/step — a worst-case trim of 60k records is ~5ms); the dead
+/// prefix is compacted inside append once it dominates. The old
 /// shift-per-chunk copyForwards moved up to 27MB (8192 × 3.4KB) per 256-event
 /// chunk and capped park throughput at ~14k events/s: below storm inflow, so
 /// the trim fired continuously and lost events even with the fallback file on.
 const Backlog = struct {
-    list: std.ArrayList(ring.ShmLogEntry) = .empty,
-    head: usize = 0,
+    buf: std.ArrayList(u8) = .empty,
+    head: usize = 0, // byte offset of the first live record
+    count: usize = 0, // live records; len() must stay O(1) — loop conditions read it
 
     fn len(self: *const Backlog) usize {
-        return self.list.items.len - self.head;
+        return self.count;
     }
 
-    fn live(self: *const Backlog) []ring.ShmLogEntry {
-        return self.list.items[self.head..];
-    }
-
-    fn append(self: *Backlog, alloc: std.mem.Allocator, items: []const ring.ShmLogEntry) !void {
-        if (self.head > 0 and self.head * 2 >= self.list.items.len) {
-            const rest = self.list.items.len - self.head;
-            std.mem.copyForwards(ring.ShmLogEntry, self.list.items[0..rest], self.list.items[self.head..]);
-            self.list.items.len = rest;
+    fn append(self: *Backlog, alloc: std.mem.Allocator, e: *const ring.ShmLogEntry, msg: []const u8) !void {
+        if (self.head > 0 and self.head * 2 >= self.buf.items.len) {
+            const rest = self.buf.items.len - self.head;
+            std.mem.copyForwards(u8, self.buf.items[0..rest], self.buf.items[self.head..]);
+            self.buf.items.len = rest;
             self.head = 0;
         }
-        try self.list.appendSlice(alloc, items);
+        const total = std.mem.alignForward(usize, @sizeOf(ring.ShmLogEntry) + msg.len, 8);
+        const end = self.buf.items.len;
+        try self.buf.resize(alloc, end + total);
+        @memcpy(self.buf.items[end..][0..@sizeOf(ring.ShmLogEntry)], std.mem.asBytes(e));
+        @memcpy(self.buf.items[end + @sizeOf(ring.ShmLogEntry) ..][0..msg.len], msg);
+        self.count += 1;
     }
 
-    fn dropFront(self: *Backlog, count: usize) void {
-        self.head = @min(self.head + count, self.list.items.len);
+    /// Byte offset of the record after the one at `off`.
+    fn nextOff(self: *const Backlog, off: usize) usize {
+        const ent: *const ring.ShmLogEntry = @ptrCast(@alignCast(self.buf.items.ptr + off));
+        return off + std.mem.alignForward(usize, @sizeOf(ring.ShmLogEntry) + ent.message_len, 8);
+    }
+
+    fn dropFront(self: *Backlog, n: usize) void {
+        var dropped: usize = 0;
+        while (dropped < n and self.count > 0) : (dropped += 1) {
+            self.head = self.nextOff(self.head);
+            self.count -= 1;
+        }
     }
 
     fn deinit(self: *Backlog, alloc: std.mem.Allocator) void {
-        self.list.deinit(alloc);
+        self.buf.deinit(alloc);
     }
 };
 
@@ -770,7 +801,15 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
         elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{skip_at});
         return null;
     };
-    if (dec_state.body.writer.end > mlen * 64 + 65536) { // inflated absurdly: corrupt, skip
+    // buildBody admits the event that crosses body_cap, so a member this
+    // build writes is ≤ body_cap + one serialized event (≤ ring.max_message
+    // + overhead); the +64K on top also admits members from 0.3.x binaries
+    // (≤ ~371KB) read before an upgrade drains the queue. Compile-time max,
+    // not the live GUC: queued members can outlive a restart that lowers
+    // message_max. A byte bound, not a ratio: a wide repetitive body
+    // legitimately inflates past 64:1 and a ratio bound would flag it
+    // corrupt and lose it.
+    if (dec_state.body.writer.end > body_cap + ring.max_message + 65536) { // inflated absurdly: corrupt, skip
         const skip_at = fb_offset;
         fb_offset += 4 + mlen;
         fb_lost += 1;
