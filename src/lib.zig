@@ -27,14 +27,14 @@ export fn pg_logtap_version(fcinfo: pg.FunctionCallInfo) pg.Datum {
 export fn pg_logtap_stats(fcinfo: pg.FunctionCallInfo) pg.Datum {
     _ = fcinfo;
     // statsText prints into zbuf (leaving one zero byte as NUL terminator).
-    var zbuf: [384]u8 = [_]u8{0} ** 384;
+    var zbuf: [1024]u8 = [_]u8{0} ** 1024;
     _ = capture.statsText(zbuf[0 .. zbuf.len - 1]);
     return @intFromPtr(pg.cstring_to_text(@ptrCast(&zbuf)));
 }
 
 export fn pg_logtap_stats_json(fcinfo: pg.FunctionCallInfo) pg.Datum {
     _ = fcinfo;
-    var zbuf: [384]u8 = [_]u8{0} ** 384;
+    var zbuf: [1024]u8 = [_]u8{0} ** 1024;
     _ = capture.statsJson(zbuf[0 .. zbuf.len - 1]);
     return @intFromPtr(pg.cstring_to_text(@ptrCast(&zbuf)));
 }

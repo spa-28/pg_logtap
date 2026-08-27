@@ -270,6 +270,40 @@ term_bl=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM 
 [ "$term_bl" = 0 ] || fail "worker SIGTERM: queue_backlog=$term_bl after replay — counter drift on worker restart"
 ok "worker TERM mid-send: shutdown flush parked the backlog, 700/700 replayed, queue_backlog=0"
 
+echo "== worker double-TERM vs mute receiver: final flush is abortable =="
+# A mute receiver with a 30s timeout pins the shutdown flush's writeAll/recv
+# per syscall; the first TERM starts that flush, the second must end it. The
+# parked fallback file carries the backlog across the restart (at-least-once).
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_timeout_ms 30000
+setguc pg_logtap.export_url "http://$SILENT:9499"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+[ -n "$wpid" ] || fail "double-TERM: worker not found"
+gen dterm 300; sleep 1
+docker exec "$PG_CT" kill -TERM "$wpid"
+sleep 2 # flush entered its recv against the mute receiver
+docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null || true # worker ignores? no: exit now
+gone_s=-1; n=0
+while [ "$n" -lt 10 ]; do
+  docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT 1 FROM pg_stat_activity WHERE pid = $wpid" | grep -q 1 || { gone_s=$n; break; }
+  n=$((n + 1)); sleep 0.5
+done
+[ "$gone_s" -ge 0 ] || fail "double-TERM: worker still alive ${n}x0.5s after the second TERM — final flush ignores it (stuck for the 30s timeout)"
+setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_timeout_ms 5000; reload; sleep 2
+# 40s, not the usual 15: the postmaster-restarted worker starts with the
+# stale auto.conf URL (silent, 30s timeout) and may sit one full stuck recv
+# out before the reload reaches it
+n=0; while [ "$n" -lt 40 ] && [ "$(received dterm)" -lt 300 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(received dterm)" = 300 ] || fail "double-TERM: $(received dterm)/300 delivered after restart — parked backlog lost"
+dups=$(grep "logtap kill dterm$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+[ "$dups" = 0 ] || fail "double-TERM: $dups duplicate seqs — replay re-sent delivered members"
+ok "second TERM ended the flush in $((gone_s / 2)).$(( (gone_s % 2) * 5 ))s, 300/300 replayed after restart, dup=0"
+
 echo "== postmaster graceful stop: bounded final flush, queue survives =="
 # delivery.md: a graceful stop runs ONE final flush cycle, bounded (~1 s of
 # work plus one send timeout). An unbounded flush would hang the stop until
@@ -288,6 +322,71 @@ wait_for stop1 300
 [ "$(received stop1)" = 300 ] || fail "postmaster stop: queue lost across graceful stop (stop1=$(received stop1)/300)"
 ok "graceful stop in ${stop_s}s (bounded), queue carried 300/300 across the shutdown"
 
+echo "== dns_fail_streak gauge: unresolvable host, then recovery =="
+setguc pg_logtap.export_fallback_file '' # this scenario is about dns, not the queue
+setguc pg_logtap.export_url "http://no-such-logtap-host$SUF:8686"
+reload; sleep 1
+gen dnsfail 5; sleep 2 # traffic forces a dial: getaddrinfo NONAME → streak ≥ 1
+# (the events buffer in the RAM backlog — no fallback file in this scenario)
+streak=$(statf dns_fail_streak)
+[ "$streak" -ge 1 ] 2>/dev/null || fail "dns-fail gauge: dns_fail_streak=$streak after failed lookups — not exported?"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for dnsfail 5 # the buffered events ride the recovery
+[ "$(statf dns_fail_streak)" = 0 ] || fail "dns-fail gauge: streak did not reset after recovery ($(statf dns_fail_streak))"
+ok "dns_fail_streak $streak→0, visible in pg_logtap_stats()"
+
+echo "== fallback_broken gauge: foreign file disables the queue, gauge says so =="
+docker exec "$PG_CT" sh -c "echo 'not a pg_logtap queue' > '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2 # queue scan hits the foreign magic → fb_broken
+[ "$(statf fallback_broken)" = 1 ] || fail "fallback_broken gauge: $(statf fallback_broken) with a foreign fallback file"
+# While broken the worker won't touch that path again. The flag (and the
+# queue) recover when the GUC points at a DIFFERENT path — the path-string
+# change resets consumer state and re-checks the file — or on a restart.
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+FB_REL2=pg_logtap-fallback2.bin
+setguc pg_logtap.export_fallback_file "$FB_REL2"; reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] || fail "fallback_broken gauge: did not clear on repoint to a fresh path ($(statf fallback_broken))"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
+
+echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest lost =="
+# Sizing: this run's queue scenario shows ~15 compressed bytes per event, so
+# a 1MB cap holds ~68k events — 90k events force at least one compaction to
+# the newest 512KB. The exact split is compression-dependent; the asserts are
+# the CONTRACT: file bounded, newest tail delivered, dropped events counted
+# lost, no duplicate replay.
+docker exec "$PG_CT" sh -c "rm -f '$FB_DIR/$FB_REL2'"
+setguc pg_logtap.fallback_max_mb 1
+# The default backlog depth (65536 × ~3.4KB ≈ 220MB of worker RAM, documented
+# ceiling) is legal but heavy: this container's memory.peak is later asserted
+# under a 256MB cgroup ceiling (robust backlog-bound), and peak accumulates
+# from birth — a full-depth transient here would trip that assert on a phase
+# that was not even running. The GUC floor keeps the storm at ~28MB; the
+# contract under test (file bound, newest tail, loss counting) needs the
+# backlog only as a conveyor to the file, not at depth.
+setguc pg_logtap.export_backlog_max 8192
+setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
+gen cap1 90000; sleep 6 # storm parks >1MB of members; compaction fires
+sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
+[ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
+L=$(statf events_lost)
+[ "$L" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count lost events (lost=$L)"
+setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb 512
+setguc pg_logtap.export_backlog_max 65536; reload
+n=0; while [ "$n" -lt 30 ]; do
+  sleep 1; n=$((n + 1))
+  backlog=$(( $(statf events_queued) - $(statf events_replayed) ))
+  [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
+done
+R=$(received cap1)
+[ "$R" -ge 30000 ] || fail "fallback_max_mb: only $R of ~68k newest-tail events delivered after recovery"
+dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+[ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
+[ "$((R + L))" -ge 85000 ] || fail "fallback_max_mb: delivered($R) + lost($L) < 85000 of 90000"
+ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), dup=0"
+
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
+setguc pg_logtap.fallback_max_mb 512
 setguc pg_logtap.export_timeout_ms 5000; reload
 echo "e2e-kill: all scenarios passed"

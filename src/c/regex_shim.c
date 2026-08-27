@@ -10,10 +10,16 @@ typedef struct {
     regex_t re; // the real size, whatever the target libc says
 } lt_regex;
 
-lt_regex *lt_regex_compile(const char *pattern) {
+// errbuf (may be NULL) receives regerror's text for the failure — regerror
+// must run while r->re still holds the failed compile's state, i.e. BEFORE
+// free. A NULL calloc return has no regex state to describe: the caller's
+// fixed "out of memory" text covers it.
+lt_regex *lt_regex_compile(const char *pattern, char *errbuf, size_t errlen) {
     lt_regex *r = calloc(1, sizeof(lt_regex));
     if (r == NULL) return NULL;
-    if (regcomp(&r->re, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
+    int rc = regcomp(&r->re, pattern, REG_EXTENDED | REG_NOSUB);
+    if (rc != 0) {
+        if (errbuf != NULL && errlen > 0) regerror(rc, &r->re, errbuf, errlen);
         free(r);
         return NULL;
     }
@@ -32,10 +38,12 @@ int lt_regex_matches(const lt_regex *r, const char *s) {
 
 // Sub-expression variant for redaction: compiled without REG_NOSUB so
 // regexec reports the match span.
-lt_regex *lt_regex_compile_sub(const char *pattern) {
+lt_regex *lt_regex_compile_sub(const char *pattern, char *errbuf, size_t errlen) {
     lt_regex *r = calloc(1, sizeof(lt_regex));
     if (r == NULL) return NULL;
-    if (regcomp(&r->re, pattern, REG_EXTENDED) != 0) {
+    int rc = regcomp(&r->re, pattern, REG_EXTENDED);
+    if (rc != 0) {
+        if (errbuf != NULL && errlen > 0) regerror(rc, &r->re, errbuf, errlen);
         free(r);
         return NULL;
     }

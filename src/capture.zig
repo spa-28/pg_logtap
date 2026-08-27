@@ -78,15 +78,19 @@ fn assignPatternExclude(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) v
 fn assignRedact(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
     if (redactor) |*r| r.deinit();
+    const span_len = if (newval == null) 0 else std.mem.span(@as([*:0]const u8, @ptrCast(newval))).len;
     redactor = compileOrWarn(filter.Redactor, newval, "pg_logtap.redact_pattern");
+    // null also covers "pattern empty = layer off", which is not a failure
+    setRedactPatternFailed(redactor == null and span_len > 0);
 }
 
 fn compileOrWarn(comptime T: type, pattern: [*c]const u8, guc: [*:0]const u8) ?T {
     if (pattern == null) return null;
     const span = std.mem.span(@as([*:0]const u8, @ptrCast(pattern)));
     if (span.len == 0) return null;
-    return T.compile(span) orelse {
-        std.log.warn("invalid regex in {s}, ignoring", .{guc}); // no ereport inside GUC machinery
+    var diag = filter.CompileDiag{};
+    return T.compileDiag(span, &diag) orelse {
+        std.log.warn("regex in {s} did not compile, ignoring: {s}", .{ guc, diag.text() }); // no ereport inside GUC machinery
         return null;
     };
 }
@@ -97,7 +101,9 @@ fn rebuildFilter() void {
     filter_cache.include = compileOrWarn(filter.Regex, guc_pattern, "pg_logtap.pattern");
     filter_cache.exclude = compileOrWarn(filter.Regex, guc_pattern_exclude, "pg_logtap.pattern_exclude");
     if (redactor) |*r| r.deinit();
+    const span_len = if (guc_redact_pattern == null) 0 else std.mem.span(@as([*:0]const u8, @ptrCast(guc_redact_pattern))).len;
     redactor = compileOrWarn(filter.Redactor, guc_redact_pattern, "pg_logtap.redact_pattern");
+    setRedactPatternFailed(redactor == null and span_len > 0);
 }
 
 // --- shared memory -----------------------------------------------------------
@@ -145,8 +151,16 @@ fn unlockRing() void {
 // --- the hook ----------------------------------------------------------------
 
 fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
+    // Re-entrancy guard first and total: prev_hook may be an extension that
+    // logs from inside its hook (audit hooks do), and forwarding — or
+    // capturing — the nested line re-enters hook → elog → hook without
+    // bound. The nested line still reaches the server log (elog prints it
+    // regardless); it is only exempt from hook processing.
+    if (in_hook) return;
+    in_hook = true;
+    defer in_hook = false;
     if (prev_hook) |p| p(edata);
-    if (!ready or in_hook) return;
+    if (!ready) return;
     // The postmaster runs this hook for its own lines too — and during an
     // emergency restart it logs from inside PGSharedMemoryCreate, after the
     // old segment is already unmapped: `state` dangles there and even a read
@@ -158,9 +172,6 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (d.message == null) return;
     const msg: [*:0]const u8 = @ptrCast(d.message);
     if (!filter_cache.accepts(d.elevel, msg)) return;
-
-    in_hook = true;
-    defer in_hook = false;
 
     var entry = std.mem.zeroes(ring.ShmLogEntry);
     entry.timestamp_us = pg.GetCurrentTimestamp();
@@ -179,10 +190,11 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     if (port) |p| copyStr(&entry.client_host, &entry, .client_host, p.remote_host);
 
     // Statement-embedded text (log_statement / log_min_duration_statement
-    // lines) carries the raw SQL, passwords included; the token cut is gated
-    // on that marker so an ordinary message mentioning the word is untouched.
+    // lines, simple AND extended protocol — see filter.stmtLine) carries the
+    // raw SQL, passwords included; the token cut is gated on that marker so
+    // an ordinary message mentioning the word is untouched.
     const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
-    const stmt_line = std.mem.indexOf(u8, msg_span, "statement: ") != null;
+    const stmt_line = filter.stmtLine(msg_span);
     copyText(&entry.message, &entry, .message, d.message, stmt_line);
     copyText(&entry.detail, &entry, .detail, d.detail, false);
     copyText(&entry.hint, &entry, .hint, d.hint, false);
@@ -212,24 +224,24 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
 /// cut (pw — query field always, statement-embedded message lines) into one
 /// scratch buffer, then the redact_pattern regex over the result into the
 /// other. Layers that cannot change the text copy nothing. A layer that had
-/// to clip sets the field's truncated bit itself: setStr cannot, because the
-/// clipped result fits the slot.
+/// to clip sets the field's redacted bit itself: setStr cannot, because the
+/// clipped result fits the slot — and the cause is the clip, not the slot.
 fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool) void {
     if (src == null) return;
     var text: []const u8 = std.mem.span(@as([*:0]const u8, @ptrCast(src)));
     var clipped = false;
     if (pw) {
-        const m = filter.redactPassword(&redact_a, text);
-        text = m.text;
-        clipped = m.clipped;
+        const masked = filter.redactPassword(&redact_a, text);
+        text = masked.text;
+        clipped = masked.clipped;
     }
-    if (redactor) |*r| {
-        const m = r.apply(&redact_b, text);
-        text = m.text;
-        clipped = clipped or m.clipped;
+    if (redactor) |*red| {
+        const masked = red.apply(&redact_b, text);
+        text = masked.text;
+        clipped = clipped or masked.clipped;
     }
     ring.setStr(dst, &entry.truncated_mask, field, text);
-    if (clipped) entry.truncated_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    if (clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
 // --- worker side ---------------------------------------------------------------
@@ -275,6 +287,27 @@ pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64)
     unlockRing();
 }
 
+/// Worker-owned gauges, republished every flush cycle: the worker-local
+/// originals (dns_fail_streak, fb_broken) die with the process, so a restart
+/// must overwrite possibly-stale copies here within one cycle.
+pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8) void {
+    if (!ready) return;
+    lockRing();
+    state.dns_fail_streak = dns_fail;
+    state.fallback_broken = fb_broken;
+    unlockRing();
+}
+
+/// Redaction compile health. Set from the GUC assign hook (SIGHUP runs in
+/// whichever backend reloads) and the startup rebuild: a pattern that does
+/// not compile leaves that layer OFF (fail-open) — the gauge is the signal.
+pub fn setRedactPatternFailed(on: bool) void {
+    if (!ready) return;
+    lockRing();
+    state.redact_pattern_failed = @intFromBool(on);
+    unlockRing();
+}
+
 // --- dump --------------------------------------------------------------------
 
 const text_oid: pg.Oid = 25; // TEXTOID
@@ -305,15 +338,15 @@ pub fn dumpDatum(fcinfo: pg.FunctionCallInfo) pg.Datum {
     unlockRing();
 
     var datums: [max_dump]pg.Datum = undefined;
-    var n: u32 = 0;
-    while (n < taken) : (n += 1) {
+    var out_rows: u32 = 0;
+    while (out_rows < taken) : (out_rows += 1) {
         var line_w: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer line_w.deinit();
-        jsonl.writeEntry(&line_w.writer, &copies[n], resolveNames(&copies[n])) catch break;
+        jsonl.writeEntry(&line_w.writer, &copies[out_rows], resolveNames(&copies[out_rows])) catch break;
         const line = line_w.written();
-        datums[n] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
+        datums[out_rows] = @intFromPtr(pg.cstring_to_text_with_len(@ptrCast(line.ptr), @intCast(line.len)));
     }
-    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(n), text_oid));
+    return @intFromPtr(pg.construct_array_builtin(&datums, @intCast(out_rows), text_oid));
 }
 
 /// Catalog lookups run in the caller's memory context — palloc'd results are
@@ -333,8 +366,8 @@ pub fn statsText(buf: []u8) ?[]const u8 {
     if (!ready) return "shmem not initialized (shared_preload_libraries?)";
     const snap = snapshot();
     // Same names and order as the pg_logtap_delivery view columns.
-    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d}", .{
-        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.send_failed, snap.export_lost, snap.count, snap.capacity,
+    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} redact_pattern_failed={d}", .{
+        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
     }) catch "stats overflow";
 }
 
@@ -343,7 +376,7 @@ pub fn statsText(buf: []u8) ?[]const u8 {
 pub fn statsJson(buf: []u8) ?[]const u8 {
     if (!ready) return "{\"events_captured\":0}"; // shmem not up: zero row
     const snap = snapshot();
-    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d}}}", .{
+    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"redact_pattern_failed\":{d}}}", .{
         snap.captured,
         snap.dropped,
         snap.sent,
@@ -355,6 +388,9 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.send_failed,
         snap.count,
         snap.capacity,
+        snap.dns_fail_streak,
+        snap.fallback_broken,
+        snap.redact_pattern_failed,
     }) catch "{\"events_captured\":0}";
 }
 

@@ -17,29 +17,59 @@ const std = @import("std");
 /// Allocated by src/c/regex_shim.c; size is the target libc's own.
 pub const LtRegex = opaque {};
 
-extern fn lt_regex_compile(pattern: [*:0]const u8) ?*LtRegex;
+extern fn lt_regex_compile(pattern: [*:0]const u8, errbuf: [*c]u8, errlen: usize) ?*LtRegex;
 extern fn lt_regex_free(re: *LtRegex) void;
 extern fn lt_regex_matches(re: *const LtRegex, s: [*:0]const u8) c_int;
-extern fn lt_regex_compile_sub(pattern: [*:0]const u8) ?*LtRegex;
+extern fn lt_regex_compile_sub(pattern: [*:0]const u8, errbuf: [*c]u8, errlen: usize) ?*LtRegex;
 /// s must be NUL-terminated at its end (our sources are C strings); reports
 /// the first match as byte offsets from s.
 extern fn lt_regex_find(re: *const LtRegex, s: [*]const u8, notbol: c_int, start: *usize, end: *usize) c_int;
 
+/// regerror's text for a failed compile: the operator sees why the pattern
+/// was rejected ("Unmatched [") instead of a generic "invalid regex" that
+/// misdiagnoses e.g. REG_ESPACE as a syntax error.
+pub const CompileDiag = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const CompileDiag) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Shared compile-with-diag: on failure the shim filled buf with regerror's
+/// NUL-terminated text, which is copied into the caller's diag if it wants it.
+fn compileInto(comptime f: anytype, pattern: [:0]const u8, diag: ?*CompileDiag) ?*LtRegex {
+    var buf: [128]u8 = undefined;
+    const re = f(pattern.ptr, &buf, buf.len) orelse {
+        if (diag) |d| {
+            d.len = std.mem.findScalar(u8, &buf, 0) orelse buf.len;
+            @memcpy(d.buf[0..d.len], buf[0..d.len]);
+        }
+        return null;
+    };
+    return re;
+}
+
 pub const Regex = struct {
-    re: *LtRegex,
+    regex: *LtRegex,
 
     /// Returns null on invalid pattern (or OOM).
     pub fn compile(pattern: [:0]const u8) ?Regex {
-        return .{ .re = lt_regex_compile(pattern.ptr) orelse return null };
+        return compileDiag(pattern, null);
+    }
+
+    pub fn compileDiag(pattern: [:0]const u8, diag: ?*CompileDiag) ?Regex {
+        return .{ .regex = compileInto(lt_regex_compile, pattern, diag) orelse return null };
     }
 
     pub fn deinit(self: *Regex) void {
-        lt_regex_free(self.re);
+        lt_regex_free(self.regex);
     }
 
     /// Input must be NUL-terminated — our sources are C strings already.
     pub fn matches(self: *const Regex, s: [*:0]const u8) bool {
-        return lt_regex_matches(self.re, s) != 0;
+        return lt_regex_matches(self.regex, s) != 0;
     }
 };
 
@@ -49,16 +79,16 @@ pub const Filter = struct {
     exclude: ?Regex = null,
 
     pub fn deinit(self: *Filter) void {
-        if (self.include) |*re| re.deinit();
-        if (self.exclude) |*re| re.deinit();
+        if (self.include) |*inc| inc.deinit();
+        if (self.exclude) |*exc| exc.deinit();
         self.include = null;
         self.exclude = null;
     }
 
     pub fn accepts(self: *const Filter, elevel: i32, message: [*:0]const u8) bool {
         if (elevel < self.level_min) return false;
-        if (self.include) |*re| if (!re.matches(message)) return false;
-        if (self.exclude) |*re| if (re.matches(message)) return false;
+        if (self.include) |*inc| if (!inc.matches(message)) return false;
+        if (self.exclude) |*exc| if (exc.matches(message)) return false;
         return true;
     }
 };
@@ -88,6 +118,19 @@ test "empty pattern compiles to always-match" {
 
 test "invalid pattern rejected" {
     try std.testing.expect(Regex.compile("[unclosed") == null);
+}
+
+test "compile failure reports regerror's text" {
+    // The point is the operator-facing message: "invalid regex" hides a
+    // REG_ESPACE (memory) behind what reads like a syntax problem. Both
+    // libcs' texts for an unmatched bracket mention the bracket itself.
+    var diag = CompileDiag{};
+    try std.testing.expect(Regex.compileDiag("[unclosed", &diag) == null);
+    try std.testing.expect(diag.len > 0);
+    try std.testing.expect(std.mem.findScalar(u8, diag.text(), '[') != null);
+    var diag2 = CompileDiag{};
+    try std.testing.expect(Redactor.compileDiag("a(", &diag2) == null);
+    try std.testing.expect(diag2.len > 0);
 }
 
 // --- redaction ----------------------------------------------------------------
@@ -143,64 +186,111 @@ fn findWord(hay: []const u8, word: []const u8) ?usize {
 /// changed nothing) and whether it had to clip at the scratch size.
 pub const Masked = struct { text: []const u8, clipped: bool };
 
+/// True when the message line is statement-embedded SQL: the simple-protocol
+/// `statement: ` marker, or an extended-protocol phase line — postgres.c logs
+/// `parse <name>: <sql>`, `bind <name>...`, `execute <name>: <sql>` WITHOUT
+/// the "statement: " marker, each optionally behind a `duration: N ms  `
+/// prefix (log_min_duration_statement). The password cut is gated on this:
+/// an ordinary message merely mentioning a word stays verbatim.
+pub fn stmtLine(msg: []const u8) bool {
+    if (std.mem.find(u8, msg, "statement: ") != null) return true;
+    var rest = msg;
+    if (std.mem.startsWith(u8, rest, "duration: ")) {
+        rest = rest["duration: ".len..];
+        var i: usize = 0;
+        while (i < rest.len and (std.ascii.isDigit(rest[i]) or rest[i] == '.')) : (i += 1) {}
+        if (!std.mem.startsWith(u8, rest[i..], " ms  ")) return false;
+        rest = rest[i + " ms  ".len ..];
+    }
+    return std.mem.startsWith(u8, rest, "parse ") or
+        std.mem.startsWith(u8, rest, "bind ") or
+        std.mem.startsWith(u8, rest, "execute ");
+}
+
+test "statement-embedded SQL markers, simple and extended protocol" {
+    // simple protocol
+    try std.testing.expect(stmtLine("statement: SELECT 1"));
+    try std.testing.expect(stmtLine("duration: 3.2 ms  statement: SELECT 1"));
+    // extended protocol (JDBC/psycopg/pgbench -M extended): phase lines
+    // carry the raw SQL without the "statement: " marker
+    try std.testing.expect(stmtLine("parse stmt_1: SELECT $1"));
+    try std.testing.expect(stmtLine("bind sd_1 to stmt_1"));
+    try std.testing.expect(stmtLine("execute S_1: SELECT $1"));
+    try std.testing.expect(stmtLine("duration: 1.2 ms  execute S_1: SELECT $1"));
+    try std.testing.expect(stmtLine("duration: 0.4 ms  parse sd_1: ALTER ROLE a PASSWORD 'x'"));
+    // ordinary lines that merely contain the words: verbatim
+    try std.testing.expect(!stmtLine("executor slow today"));
+    try std.testing.expect(!stmtLine("parser recovered"));
+    try std.testing.expect(!stmtLine("duration of the outage: parse errors"));
+    try std.testing.expect(!stmtLine("parsed the config"));
+    // a message literally starting with a phase verb is treated as a
+    // statement line: the gate errs toward cutting (over-redaction), and the
+    // cut itself still needs a standalone password token to change anything
+    try std.testing.expect(stmtLine("bind variable count"));
+}
+
 /// Everything from the end of a standalone `password` token on is dropped and
 /// replaced (pgaudit semantics). Returns src untouched when no token is
 /// present — the common case costs one scan, no copy.
 pub fn redactPassword(dst: []u8, src: []const u8) Masked {
     const pos = findWord(src, "password") orelse return .{ .text = src, .clipped = false };
     var clipped = false;
-    var w = put(dst, src[0 .. pos + "password".len], &clipped);
-    w += put(dst[w..], " " ++ redacted, &clipped);
-    return .{ .text = dst[0..w], .clipped = clipped };
+    var out_len = put(dst, src[0 .. pos + "password".len], &clipped);
+    out_len += put(dst[out_len..], " " ++ redacted, &clipped);
+    return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
 /// Whole-match regex redaction: every match of the pattern becomes
 /// <REDACTED>. Same libc caveats as Regex (see the header note on
 /// backreferences).
 pub const Redactor = struct {
-    re: *LtRegex,
+    regex: *LtRegex,
 
     pub fn compile(pattern: [:0]const u8) ?Redactor {
-        return .{ .re = lt_regex_compile_sub(pattern.ptr) orelse return null };
+        return compileDiag(pattern, null);
+    }
+
+    pub fn compileDiag(pattern: [:0]const u8, diag: ?*CompileDiag) ?Redactor {
+        return .{ .regex = compileInto(lt_regex_compile_sub, pattern, diag) orelse return null };
     }
 
     pub fn deinit(self: *Redactor) void {
-        lt_regex_free(self.re);
+        lt_regex_free(self.regex);
     }
 
     /// src must be NUL-terminated at src.len.
     pub fn apply(self: *const Redactor, dst: []u8, src: []const u8) Masked {
         var clipped = false;
-        var w: usize = 0;
-        var r: usize = 0;
+        var out_len: usize = 0;
+        var read_pos: usize = 0;
         var bol = true;
-        while (r < src.len) {
-            var ms: usize = 0;
-            var me: usize = 0;
+        while (read_pos < src.len) {
+            var rel_start: usize = 0;
+            var rel_end: usize = 0;
             // notbol on resumed scans: '^' must anchor at the true string
             // start, not at the resume point (REG_NOTBOL is POSIX).
-            if (lt_regex_find(self.re, src.ptr + r, @intFromBool(!bol), &ms, &me) != 0) break;
+            if (lt_regex_find(self.regex, src.ptr + read_pos, @intFromBool(!bol), &rel_start, &rel_end) != 0) break;
             bol = false;
-            const s = r + ms;
-            const e = r + me;
-            w += put(dst[w..], src[r..s], &clipped);
-            w += put(dst[w..], redacted, &clipped);
-            if (e == s) { // zero-length match: emit one char and step past it
-                if (s >= src.len) break;
-                const cl: usize = if (src[s] >= 0xF0) 4 else if (src[s] >= 0xE0) 3 else if (src[s] >= 0xC0) 2 else 1;
-                w += put(dst[w..], src[s .. s + @min(cl, src.len - s)], &clipped);
-                r = s + @min(cl, src.len - s);
-            } else r = e;
+            const match_start = read_pos + rel_start;
+            const match_stop = read_pos + rel_end;
+            out_len += put(dst[out_len..], src[read_pos..match_start], &clipped);
+            out_len += put(dst[out_len..], redacted, &clipped);
+            if (match_stop == match_start) { // zero-length match: emit one char and step past it
+                if (match_start >= src.len) break;
+                const char_len: usize = if (src[match_start] >= 0xF0) 4 else if (src[match_start] >= 0xE0) 3 else if (src[match_start] >= 0xC0) 2 else 1;
+                out_len += put(dst[out_len..], src[match_start .. match_start + @min(char_len, src.len - match_start)], &clipped);
+                read_pos = match_start + @min(char_len, src.len - match_start);
+            } else read_pos = match_stop;
         }
-        w += put(dst[w..], src[r..], &clipped);
-        return .{ .text = dst[0..w], .clipped = clipped };
+        out_len += put(dst[out_len..], src[read_pos..], &clipped);
+        return .{ .text = dst[0..out_len], .clipped = clipped };
     }
 };
 
 test "password token cut" {
     var buf: [128]u8 = undefined;
-    const q = "CREATE ROLE app PASSWORD 'SECRET-abc123'";
-    const out = redactPassword(&buf, q);
+    const query = "CREATE ROLE app PASSWORD 'SECRET-abc123'";
+    const out = redactPassword(&buf, query);
     try std.testing.expectEqualStrings("CREATE ROLE app PASSWORD <REDACTED>", out.text);
     try std.testing.expect(!out.clipped);
     try std.testing.expectEqualStrings("create role x password <REDACTED>", redactPassword(&buf, "create role x password 's'").text);
@@ -208,39 +298,39 @@ test "password token cut" {
     // no token / word-boundary misses: returned untouched
     const clean = "select * from password_audit";
     try std.testing.expect(redactPassword(&buf, clean).text.ptr == clean.ptr);
-    const up = "user_passwords table";
-    try std.testing.expect(redactPassword(&buf, up).text.ptr == up.ptr);
+    const underscored = "user_passwords table";
+    try std.testing.expect(redactPassword(&buf, underscored).text.ptr == underscored.ptr);
     try std.testing.expectEqualStrings("select 1", redactPassword(&buf, "select 1").text);
 }
 
 test "redactor regex replace" {
-    var r = Redactor.compile("SECRET-[a-z0-9-]+") orelse return error.CompileFailed;
-    defer r.deinit();
+    var red = Redactor.compile("SECRET-[a-z0-9-]+") orelse return error.CompileFailed;
+    defer red.deinit();
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "token=<REDACTED> then=<REDACTED> end",
-        r.apply(&buf, "token=SECRET-abc123 then=SECRET-xyz end").text,
+        red.apply(&buf, "token=SECRET-abc123 then=SECRET-xyz end").text,
     );
-    const miss = r.apply(&buf, "nothing here");
+    const miss = red.apply(&buf, "nothing here");
     try std.testing.expectEqualStrings("nothing here", miss.text);
     try std.testing.expect(!miss.clipped);
 }
 
 test "redactor anchors and zero-length matches" {
-    var r = Redactor.compile("^a") orelse return error.CompileFailed;
-    defer r.deinit();
+    var red = Redactor.compile("^a") orelse return error.CompileFailed;
+    defer red.deinit();
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("<REDACTED>bc", r.apply(&buf, "abc").text);
+    try std.testing.expectEqualStrings("<REDACTED>bc", red.apply(&buf, "abc").text);
     // 'a' mid-string is not at the string start once scanning resumes
-    var r2 = Redactor.compile("^b") orelse return error.CompileFailed;
-    defer r2.deinit();
-    try std.testing.expectEqualStrings("ab", r2.apply(&buf, "ab").text);
+    var red2 = Redactor.compile("^b") orelse return error.CompileFailed;
+    defer red2.deinit();
+    try std.testing.expectEqualStrings("ab", red2.apply(&buf, "ab").text);
 
-    var r3 = Redactor.compile("x*") orelse return error.CompileFailed; // matches empty everywhere
-    defer r3.deinit();
+    var red3 = Redactor.compile("x*") orelse return error.CompileFailed; // matches empty everywhere
+    defer red3.deinit();
     // sed semantics (s/x*/R/g): empty match → marker, one char verbatim, step
     // past. The contract under test is termination.
-    try std.testing.expectEqualStrings("<REDACTED>a<REDACTED>b<REDACTED>c", r3.apply(&buf, "abc").text);
+    try std.testing.expectEqualStrings("<REDACTED>a<REDACTED>b<REDACTED>c", red3.apply(&buf, "abc").text);
 }
 
 test "clip cuts at a UTF-8 boundary and reports itself" {
@@ -248,15 +338,15 @@ test "clip cuts at a UTF-8 boundary and reports itself" {
     // characters and flag clipping (setStr cannot — the result fits the slot)
     var buf: [33]u8 = undefined;
     const src = "abc" ++ "é" ** 40; // 3 + 80 bytes
-    var r = Redactor.compile("nomatch") orelse return error.CompileFailed;
-    defer r.deinit();
-    const m = r.apply(&buf, src);
-    try std.testing.expect(m.clipped);
-    try std.testing.expect(m.text.len <= 32);
-    try std.testing.expect(m.text[0] == 'a');
-    try std.testing.expect(std.unicode.utf8ValidateSlice(m.text));
+    var red = Redactor.compile("nomatch") orelse return error.CompileFailed;
+    defer red.deinit();
+    const masked = red.apply(&buf, src);
+    try std.testing.expect(masked.clipped);
+    try std.testing.expect(masked.text.len <= 32);
+    try std.testing.expect(masked.text[0] == 'a');
+    try std.testing.expect(std.unicode.utf8ValidateSlice(masked.text));
     // the byte after the text is the NUL the regex pass relies on
-    try std.testing.expect(buf[m.text.len] == 0);
+    try std.testing.expect(buf[masked.text.len] == 0);
 }
 
 test "invalid redactor pattern rejected" {
@@ -290,23 +380,23 @@ test "fuzz: redactPassword over random valid UTF-8" {
     var src: [600]u8 = undefined;
     var dst: [65]u8 = undefined; // smaller than some inputs: exercise the clip
     for (0..512) |_| {
-        var n: usize = 0;
-        while (n + 24 < src.len) {
-            const p = pieces[rand.intRangeLessThan(usize, 0, pieces.len)];
-            if (n + p.len > src.len) break;
-            @memcpy(src[n..][0..p.len], p);
-            n += p.len;
+        var total: usize = 0;
+        while (total + 24 < src.len) {
+            const piece = pieces[rand.intRangeLessThan(usize, 0, pieces.len)];
+            if (total + piece.len > src.len) break;
+            @memcpy(src[total..][0..piece.len], piece);
+            total += piece.len;
         }
-        const input = src[0..n];
-        const m = redactPassword(&dst, input);
-        if (m.text.ptr == dst[0..].ptr) { // masked: lives in dst
-            try std.testing.expect(m.text.len < dst.len);
-            try std.testing.expect(dst[m.text.len] == 0);
-            try std.testing.expect(std.unicode.utf8ValidateSlice(m.text));
-            if (!m.clipped) try std.testing.expect(std.mem.endsWith(u8, m.text, " " ++ redacted));
+        const input = src[0..total];
+        const masked = redactPassword(&dst, input);
+        if (masked.text.ptr == dst[0..].ptr) { // masked: lives in dst
+            try std.testing.expect(masked.text.len < dst.len);
+            try std.testing.expect(dst[masked.text.len] == 0);
+            try std.testing.expect(std.unicode.utf8ValidateSlice(masked.text));
+            if (!masked.clipped) try std.testing.expect(std.mem.endsWith(u8, masked.text, " " ++ redacted));
         } else { // no token: returned untouched
-            try std.testing.expect(m.text.ptr == input.ptr);
-            try std.testing.expect(!m.clipped);
+            try std.testing.expect(masked.text.ptr == input.ptr);
+            try std.testing.expect(!masked.clipped);
         }
     }
 }
@@ -319,16 +409,16 @@ test "fuzz: Redactor.apply over random bytes" {
     var dst: [512]u8 = undefined;
     for (0..512) |_| {
         const pat = patterns[rand.intRangeLessThan(usize, 0, patterns.len)];
-        var r = Redactor.compile(pat) orelse return error.CompileFailed;
-        defer r.deinit();
-        const n = rand.intRangeLessThan(usize, 0, src.len);
-        for (src[0..n]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255); // C string: no NUL
-        src[n] = 0; // apply's contract: regexec reads to the terminator
-        const m = r.apply(&dst, src[0..n]);
+        var red = Redactor.compile(pat) orelse return error.CompileFailed;
+        defer red.deinit();
+        const body_len = rand.intRangeLessThan(usize, 0, src.len);
+        for (src[0..body_len]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255); // C string: no NUL
+        src[body_len] = 0; // apply's contract: regexec reads to the terminator
+        const masked = red.apply(&dst, src[0..body_len]);
         // apply always rewrites into dst (the tail copy); output stays inside
         // the buffer and NUL-terminated for the next pass
-        try std.testing.expect(m.text.ptr == dst[0..].ptr);
-        try std.testing.expect(m.text.len < dst.len);
-        try std.testing.expect(dst[m.text.len] == 0);
+        try std.testing.expect(masked.text.ptr == dst[0..].ptr);
+        try std.testing.expect(masked.text.len < dst.len);
+        try std.testing.expect(dst[masked.text.len] == 0);
     }
 }

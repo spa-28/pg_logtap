@@ -8,7 +8,10 @@
 #                   (pgaudit semantics, always on), a plain message merely
 #                   mentioning the word is NOT touched, and redact_pattern
 #                   matches become <REDACTED> — both at capture, so the
-#                   secret is never on the wire nor in the fallback file
+#                   secret is never on the wire nor in the fallback file.
+#                   A redaction that clips and a slot that overflows are
+#                   reported separately: "truncated" (slot) vs "redacted"
+#                   (clip), each naming its fields
 #   backend-kill  : a logging backend SIGKILLed mid-emit — the emergency
 #                   restart path a PANIC takes (postmaster tears the cluster
 #                   down and rebuilds it, logging through the hook chain).
@@ -191,9 +194,90 @@ for line in whole.splitlines():  # the role's duration line has no red marker
         role = True
 assert q and p and role, "probe events missing (q=%s p=%s role=%s)" % (q, p, role)
 EOF
+# truncated vs redacted are two different causes for a cut field (LT-1): a
+# redaction that expands past the scratch cap clips WITHOUT slot-truncating
+# (the clip result fits the slot exactly) → redacted only; a DETAIL past its
+# 256-byte slot whose redaction also clips → both arrays name it.
+setguc pg_logtap.redact_pattern 'ZZ'; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redclip$SUF 0 %', repeat('ZZ ', 316);
+  END \$do\$" >/dev/null 2>&1 || true
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redboth$SUF 0 x' USING DETAIL = repeat('ZZ ', 400);
+  END \$do\$" >/dev/null 2>&1 || true
+wait_for redclip 1 20; wait_for redboth 1 20
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+clip = both = False
+for line in open(path, encoding="utf-8"):
+    if "logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if m.startswith("logtap robust redclip" + suf):
+        # 978-byte message, every ZZ expands by 8 bytes: the redaction clips
+        # at 1024 — the slot cap — so the slot itself never truncated it
+        assert "message" in e["redacted"] and "message" not in e["truncated"], e
+        assert len(m.encode()) == 1024 and "<REDACTED>" in m, len(m.encode())
+        clip = True
+    if m.startswith("logtap robust redboth" + suf):
+        # 1200-byte DETAIL: redaction clip at the scratch cap AND the 256-byte
+        # slot cut — both causes, both arrays
+        d = e.get("detail") or ""
+        assert "detail" in e["truncated"] and "detail" in e["redacted"], e
+        assert len(d.encode()) <= 256 and "<REDACTED>" in d, len(d.encode())
+        both = True
+assert clip and both, "probes missing (clip=%s both=%s)" % (clip, both)
+EOF
+ok "redaction clip and slot overflow reported separately (redacted vs truncated)"
 docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
+
+# An invalid redact_pattern fails OPEN (the layer turns off, logs flow) — the
+# only durable signal is the redact_pattern_failed gauge, probed both ways.
+# Empty pattern after reset is "layer off", not a failure: the flag reads 0.
+setguc pg_logtap.redact_pattern '[unclosed'; reload; sleep 1
+[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid redact_pattern did not set redact_pattern_failed=1"
+setguc pg_logtap.redact_pattern ''; reload; sleep 1
+[ "$(statf redact_pattern_failed)" = 0 ] || fail "pattern reset did not clear redact_pattern_failed"
+ok "redact_pattern_failed: invalid pattern → 1, reset → 0 (fail-open is visible)"
+
+# Extended protocol (JDBC, psycopg, pgbench -M extended): duration lines for
+# parse/bind/execute carry the raw SQL WITHOUT the "statement: " marker — the
+# cut must fire on the phase words too. The probe SQL puts the tag BEFORE the
+# password token (survives the cut, marks the line) and the secret AFTER it
+# (a prepared statement's secret position). redact_pattern stays off so only
+# the token cut can mask.
+setguc log_min_duration_statement 0; reload; sleep 1
+docker exec "$PG_CT" sh -c "printf '%s\n' \"SELECT 'ext$SUF' AS tag, 'password' AS kw, 'SECRET-exec$SUF-abc123' AS val;\" > /tmp/probe-ext.sql"
+docker exec "$PG_CT" pgbench -U postgres -M extended -c 1 -t 1 -f /tmp/probe-ext.sql postgres >/dev/null 2>&1 || true
+n=0; while [ "$n" -lt 20 ]; do
+  # tail: vector-out.jsonl grows to GiB across runs, but this run's lines
+  # land at the end — grepping the tail keeps the wait cheap
+  [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "ext$SUF")" -gt 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: extended protocol password cut"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-exec" + suf not in whole, "secret reached the receiver via an extended-protocol line"
+saw = 0
+for line in whole.splitlines():
+    if "ext" + suf not in line:
+        continue
+    e = json.loads(line)
+    m = e.get("message", "")
+    if m.startswith(("parse ", "execute ", "duration: ")):
+        # the token cut fired: everything after the password token is gone
+        assert "kw" not in m and "<REDACTED>" in m, m
+        saw += 1
+assert saw > 0, "no extended-protocol phase lines reached the receiver"
+EOF
+setguc log_min_duration_statement -1; reload
+ok "extended-protocol parse/execute duration lines get the password cut"
 
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a
@@ -217,7 +301,17 @@ n=0; while [ -z "$bepid" ] && [ "$n" -lt 15 ]; do
   [ -n "$bepid" ] || { n=$((n + 1)); sleep 1; }
 done
 [ -n "$bepid" ] || fail "backend-kill: no pgbench backend appeared"
-docker exec "$PG_CT" bash -c "kill -9 $bepid" # abnormal death: postmaster takes the PANIC path
+# The pid can vanish between the lookup and the kill (seen in CI: a pgbench
+# client hitting its -T deadline, or finishing, right in the window) — "kill:
+# No such process" then aborts the whole suite under set -e. Re-find until
+# the kill lands: the scenario needs an abnormal death, not a specific pid.
+n=0; while [ "$n" -lt 10 ]; do
+  docker exec "$PG_CT" bash -c "kill -9 $bepid" 2>/dev/null && break
+  bepid=$(docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT pid FROM pg_stat_activity WHERE application_name = 'pgbench' LIMIT 1")
+  [ -n "$bepid" ] || sleep 1
+  n=$((n + 1))
+done
 sleep 2; wait_ready # emergency restart: teardown, shmem rebuild, recovery
 setguc log_min_duration_statement -1; reload
 docker logs "$PG_CT" 2>&1 | grep -q "was terminated by signal 9" \
