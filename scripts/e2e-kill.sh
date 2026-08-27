@@ -367,6 +367,8 @@ setguc pg_logtap.fallback_max_mb 1
 # backlog only as a conveyor to the file, not at depth.
 setguc pg_logtap.export_backlog_max 8192
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
+D0=$(statf events_dropped) # ring may legally overflow while the worker
+# gzip-parks the burst — those events close the universe in dropped, not lost
 gen cap1 90000; sleep 6 # storm parks >1MB of members; compaction fires
 sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
 [ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
@@ -383,8 +385,9 @@ R=$(received cap1)
 [ "$R" -ge 30000 ] || fail "fallback_max_mb: only $R of ~68k newest-tail events delivered after recovery"
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
-[ "$((R + L))" -ge 85000 ] || fail "fallback_max_mb: delivered($R) + lost($L) < 85000 of 90000"
-ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), dup=0"
+D=$(( $(statf events_dropped) - D0 ))
+[ "$((R + L + D))" -ge 85000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 85000 of 90000"
+ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), ring-dropped ($D), dup=0"
 
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.fallback_max_mb 512
