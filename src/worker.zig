@@ -136,6 +136,14 @@ pub fn workerMain() void {
     capture.setWorkerLatch(); // backends wake this worker on the first event
     syncMetricsListener();
     refreshSourceId();
+    // A crash between fbCompact's tmp creation and its rename leaves
+    // <path>.compact behind (up to cap/2 of litter — the compaction
+    // restarts from the original file). Before the first cycle could
+    // compact again and race the unlink; ENOENT is the normal case.
+    if (fallbackPath() != null) {
+        var tmp_buf: [4096]u8 = undefined;
+        if (fbCompactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    }
     fbCreditBacklog(alloc);
 
     while (!got_sigterm.isSet()) {
@@ -616,6 +624,17 @@ var fb_path_len: usize = 0;
 /// Resolve the GUC (relative → data directory, the log_directory convention;
 /// the queue belongs with the data). Repointing the GUC orphans the old queue
 /// (its events stay on disk for a manual drain) and resets consumer state.
+/// "<fallback>.compact" — fbCompact's rewrite target. A crash between its
+/// creation and the rename leaves it behind (up to cap/2 of litter nothing
+/// ever reads); workerMain unlinks it at boot.
+fn fbCompactPath(tmp_buf: *[4096]u8) ?[*:0]const u8 {
+    if (fb_path_len + 8 + 1 > tmp_buf.len) return null;
+    @memcpy(tmp_buf[0..fb_path_len], fb_path_buf[0..fb_path_len]);
+    @memcpy(tmp_buf[fb_path_len..][0..8], ".compact");
+    tmp_buf[fb_path_len + 8] = 0;
+    return @ptrCast(tmp_buf);
+}
+
 fn fallbackPath() ?[]const u8 {
     if (guc_export_fallback_file == null) return null;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_fallback_file)));
@@ -919,11 +938,8 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     // Rewrite: magic + [off, size) copied verbatim (gzip members are
     // self-contained; no recompression).
     var tmp_buf: [4096]u8 = undefined;
-    if (fb_path_len + 8 + 1 > tmp_buf.len) return;
-    @memcpy(tmp_buf[0..fb_path_len], fb_path_buf[0..fb_path_len]);
-    @memcpy(tmp_buf[fb_path_len..][0..8], ".compact");
-    tmp_buf[fb_path_len + 8] = 0;
-    const tmp_fd = c.open(@ptrCast(&tmp_buf), 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
+    const tmp_path = fbCompactPath(&tmp_buf) orelse return;
+    const tmp_fd = c.open(tmp_path, 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
     if (tmp_fd < 0) return;
     var copied_ok = writeAll(tmp_fd, fb_magic, false);
     var pos: u64 = off;
@@ -940,8 +956,8 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     }
     if (copied_ok) copied_ok = c.fdatasync(tmp_fd) == 0;
     _ = c.close(tmp_fd);
-    if (!copied_ok or c.rename(@ptrCast(&tmp_buf), @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
-        _ = c.unlink(@ptrCast(&tmp_buf));
+    if (!copied_ok or c.rename(tmp_path, @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
+        _ = c.unlink(tmp_path);
         return;
     }
     fsyncDirOf(fb_path_buf[0..fb_path_len]);

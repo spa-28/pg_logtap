@@ -230,12 +230,19 @@ echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log
 # hook calls happen while shmem is unmapped, which used to SEGV the cluster.
 setguc log_min_messages debug1; setguc pg_logtap.level_min 10; reload
+# A crash between fbCompact's tmp creation and its rename would leave
+# <fallback>.compact behind forever; the restarted worker must unlink it
+# at boot. Plant one and check it after the restart.
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 1
+docker exec "$PG_CT" sh -c "printf garbage > '$FB.compact'"
 wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
   "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
 [ -n "$wpid" ] || fail "worker crash: worker not found in pg_stat_activity"
 docker exec "$PG_CT" kill -9 "$wpid"
 sleep 5; wait_ready; sleep 2 # postmaster emergency-restarts the cluster
 setguc log_min_messages warning; setguc pg_logtap.level_min 15; reload
+docker exec "$PG_CT" sh -c "test ! -e '$FB.compact'" \
+  || fail "worker crash: stale $FB_REL.compact survived the worker restart"
 gen crash1 20; wait_for crash1 20
 [ "$(received crash1)" = 20 ] || fail "worker crash: no delivery after worker crash"
 ok "worker crash → cluster restarted itself, delivery resumed"
