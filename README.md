@@ -30,7 +30,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
-- **Capture-time redaction** — the `password` token in statement text is cut before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
+- **Capture-time redaction** — the `password` token in statement text is cut and bind-parameter values in `DETAIL` are masked before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~45k events/s sustained for 5 minutes (OLTP overhead and latency percentiles, measured before/after the extension: [docs/bench.md](docs/bench.md)), and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
@@ -227,7 +227,7 @@ tokens, personal data — and two independent paths ship it: `field_query`
 (query text inside the `message` of duration lines, regardless of
 `field_query`). PostgreSQL itself logs those statements the same way, so the
 exposure follows your existing logging posture — but an export destination
-extends the audience. Two layers mask such text **at capture** — the ring,
+extends the audience. Three layers mask such text **at capture** — the ring,
 the fallback file and the receiver all hold the masked form only:
 
 - **Password cut, always on.** When the captured `query` field, or a
@@ -248,6 +248,14 @@ the fallback file and the receiver all hold the masked form only:
   A message that merely mentions the word (a warning, an app-level line) is
   not statement text and passes verbatim. The cut covers the common
   `PASSWORD '...'` shapes, not every way a secret can be encoded in SQL.
+- **Bind-value mask, always on.** With
+  `log_parameter_max_length`/`log_parameter_max_length_on_error` above `-1`,
+  PostgreSQL appends the actual bind values to the statement line's `DETAIL`
+  (`Parameters: $1 = '...'`) — the SQL text carries only `$N` placeholders, so
+  the password cut cannot see them. On that one line every quoted value
+  becomes `<REDACTED>` (`Parameters: $1 = <REDACTED>, $2 = <REDACTED>`);
+  other `DETAIL`s pass verbatim. The values still sit in the server's own
+  log — keep the GUCs at `-1` unless the values are the point.
 - **`pg_logtap.redact_pattern`** — a POSIX ERE applied to
   `message`/`detail`/`hint`/`context`/`query`; every match becomes
   `<REDACTED>`:
@@ -268,10 +276,8 @@ On top of that, the operational knobs:
 - keep `field_query` off (the default) and be deliberate about
   `log_min_duration_statement`;
 - keep `log_parameter_max_length`/`log_parameter_max_length_on_error` at
-  `-1` (the default): when they are set, PostgreSQL puts **bind-parameter
-  values** into the event's `DETAIL` — and the password cut never fires
-  there (its statement-marker gate applies to `message`/`query`), so a
-  bound secret ships unless your `redact_pattern` catches it;
+  `-1` (the default) unless the values are the point: when set, bind values
+  reach `DETAIL` masked (see above) but still expand the event;
 - `pg_logtap.pattern_exclude` suppresses whole events at capture — e.g.
   `'PASSWORD|IDENTIFIED BY'` never leaves the server at all;
 - scrub at the collector — Vector's `redact` transform (built-in filters for

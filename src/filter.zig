@@ -240,6 +240,44 @@ pub fn redactPassword(dst: []u8, src: []const u8) Masked {
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
+/// Bind-parameter values ride in DETAIL as `Parameters: $1 = '...'` (put
+/// there by log_parameter_max_length — capital P, the exact errdetail shape
+/// in exec_bind_message/exec_execute_message) — the statement text carries
+/// only the $N placeholders, so the password token cut cannot see the secret.
+/// On that one line shape every single-quoted value ('' inside is an escaped
+/// quote, not the end) becomes <REDACTED>; pgaudit parity — it does not log
+/// parameter values at all. Any other detail returns src untouched: text we
+/// do not recognize is not ours to rewrite. The values stay in the server's
+/// own log; only the export is masked.
+pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
+    const pfx = "Parameters: ";
+    if (!std.mem.startsWith(u8, src, pfx)) return .{ .text = src, .clipped = false };
+    var clipped = false;
+    var out_len = put(dst, src[0..pfx.len], &clipped);
+    var i = pfx.len;
+    while (i < src.len) {
+        if (src[i] != '\'') { // between values: `$1 = `, `, ` — verbatim
+            var end = i;
+            while (end < src.len and src[end] != '\'') end += 1;
+            out_len += put(dst[out_len..], src[i..end], &clipped);
+            i = end;
+            continue;
+        }
+        // quoted value: a lone ' ends it, '' is an escaped quote inside it
+        var end = i + 1;
+        while (end < src.len) {
+            if (src[end] != '\'') {
+                end += 1;
+            } else if (end + 1 < src.len and src[end + 1] == '\'') {
+                end += 2;
+            } else break;
+        }
+        out_len += put(dst[out_len..], redacted, &clipped);
+        i = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
+    }
+    return .{ .text = dst[0..out_len], .clipped = clipped };
+}
+
 /// Whole-match regex redaction: every match of the pattern becomes
 /// <REDACTED>. Same libc caveats as Regex (see the header note on
 /// backreferences).
@@ -301,6 +339,34 @@ test "password token cut" {
     const underscored = "user_passwords table";
     try std.testing.expect(redactPassword(&buf, underscored).text.ptr == underscored.ptr);
     try std.testing.expectEqualStrings("select 1", redactPassword(&buf, "select 1").text);
+}
+
+test "bind-parameter values masked on the Parameters line" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Parameters: $1 = <REDACTED>, $2 = <REDACTED>",
+        redactParamValues(&buf, "Parameters: $1 = 'hunter2', $2 = '42'").text,
+    );
+    // '' inside a value is an escaped quote, not the terminator
+    try std.testing.expectEqualStrings(
+        "Parameters: $1 = <REDACTED>",
+        redactParamValues(&buf, "Parameters: $1 = 'o''brien''s'").text,
+    );
+    // empty value still masked; unterminated tail (length-capped log) too
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = ''").text);
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'trunc").text);
+    // a value containing the word password rides the same mask
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'password x'").text);
+    // the gate is the exact errdetail shape: lowercase or any other detail is
+    // not ours to rewrite
+    const foreign = "parameters: $1 = 'x' and other detail text";
+    try std.testing.expect(redactParamValues(&buf, foreign).text.ptr == foreign.ptr);
+    try std.testing.expect(!redactParamValues(&buf, foreign).clipped);
+    // a mask run longer than the scratch clips at a UTF-8 boundary and reports
+    var small: [26]u8 = undefined;
+    const clipped = redactParamValues(&small, "Parameters: $1 = 'aaaaéééééééé'");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped.text));
 }
 
 test "redactor regex replace" {

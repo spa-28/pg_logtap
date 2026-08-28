@@ -51,6 +51,10 @@ ok() { echo "  ok: $*"; }
 [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
   || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
+# the ready gate is a one-shot that stays exited/0 forever; a run that failed
+# inside backlog-bound leaves the receiver stopped and the next run would
+# fail its first scenario on a dead hostname — start is a no-op when running
+docker start "$VEC" >/dev/null 2>&1 || true
 mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
 
 setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
@@ -95,6 +99,20 @@ wait_for() { # wait_for <marker> <count> [tries]
     n=$((n + 1)); sleep 1
   done
 }
+
+# A previous run may have left the ring full of undrained backlog; markers
+# emitted into a full ring are dropped at emit (counted in events_dropped,
+# never delivered) and the first scenario would time out on them. Wait for a
+# quiet ring before testing.
+drain_ring() {
+  n=0
+  while [ "$n" -lt 60 ]; do
+    [ "$(statf ring_events)" = 0 ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "ring never drained (ring_events=$(statf ring_events))"
+}
+drain_ring
 
 # Every delivered marker line must parse as JSON — a torn slot or a botched
 # sanitization would surface here as invalid JSON or broken UTF-8.
@@ -279,6 +297,49 @@ EOF
 setguc log_min_duration_statement -1; reload
 ok "extended-protocol parse/execute duration lines get the password cut"
 
+# Bind parameters: with log_parameter_max_length the server puts the actual
+# values into DETAIL ("parameters: $1 = '...'") on statement lines — the SQL
+# carries only $N placeholders, so the token cut cannot see the secret. The
+# bind-value layer masks every quoted value on that line. psql \bind is psql
+# 16+; on older servers the unit tests carry the contract.
+setguc log_min_duration_statement 0; setguc log_parameter_max_length 100; reload; sleep 1
+vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
+if [ "$vnum" -ge 160000 ]; then
+  # -i: without it docker exec does not forward stdin, psql reads an empty
+  # buffer and silently runs nothing
+  docker exec -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF || true
+SELECT 'bindtag$SUF' AS tag, \$1::text, \$2::text \bind 'SECRET-bind$SUF-xyz789' 'pw''d'
+\g
+EOF
+  n=0; while [ "$n" -lt 20 ]; do
+    [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "bindtag$SUF")" -gt 0 ] && break
+    n=$((n + 1)); sleep 1
+  done
+  python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: bind-parameter values masked"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-bind" + suf not in whole, "bind value reached the receiver via DETAIL"
+saw = 0
+for line in whole.splitlines():
+    if "bindtag" + suf not in line:
+        continue
+    e = json.loads(line)
+    m, d = e.get("message") or "", e.get("detail") or "" # null ≠ absent in JSON
+    if "duration:" in m and "Parameters: " in d:
+        # every quoted value masked, the $N keys and structure verbatim
+        assert d.startswith("Parameters: $1 = <REDACTED>"), d
+        assert d.endswith("$2 = <REDACTED>"), d
+        assert "SECRET" not in d and "pw" not in d, d
+        saw += 1
+assert saw > 0, "no bind-parameter detail lines reached the receiver"
+EOF
+else
+  echo "  skip: bind-parameter masking (psql bind needs 16+, server is $vnum)"
+fi
+setguc log_min_duration_statement -1; setguc log_parameter_max_length -1; reload
+ok "bind-parameter values masked on the parameters line"
+
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a
 # captured event from a client backend); one of its backends is SIGKILLed
@@ -359,6 +420,13 @@ peak=$(docker exec "$PG_CT" cat /sys/fs/cgroup/memory.peak 2>/dev/null || \
   || fail "backlog-bound: cgroup memory peak ${peak}B touched the ${OOM_LIMIT_MB}MB ceiling"
 docker update --memory 0 --memory-swap 0 "$PG_CT" >/dev/null
 docker start "$VEC" >/dev/null; wait_vector
+# wait_vector only proves the listener socket is back. The worker is still
+# holding the storm backlog (its connect was parked on the dead receiver for
+# the whole outage): the ring stays full for seconds while it drains, and
+# markers emitted into a full ring are dropped at emit — by design, counted
+# in events_dropped. Delivery resuming = the drain finishing; only then can
+# fresh post-recovery events be expected to arrive.
+drain_ring
 gen oom4 20; wait_for oom4 20
 [ "$(received oom4)" = 20 ] || fail "backlog-bound: no delivery after recovery (oom4=$(received oom4)/20)"
 acc3() { # sent + lost + dropped from one stats call

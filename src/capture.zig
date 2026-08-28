@@ -68,7 +68,7 @@ pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5, 15=LOG, 19=WARNING, 21=ERROR, 23=PANIC). Filters export only — stderr/log_destination output is governed by the server's own log_min_messages.", null, &guc_level_min, 15, 10, 23, pg.PGC_SIGHUP, 0, null, assignLevel, null);
     pg.DefineCustomStringVariable("pg_logtap.pattern", "POSIX ERE; capture only matching messages (empty = all).", null, &guc_pattern, "", pg.PGC_SIGHUP, 0, null, assignPattern, null);
     pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching messages.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, null, assignPatternExclude, null);
-    pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting. Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
+    pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting, and so are bind-parameter values (the DETAIL line log_parameter_max_length adds to statement lines). Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
     pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event. SECURITY: queries can embed tokens and personal data beyond passwords (literals in INSERTs) — the standalone password token is cut always and redact_pattern masks its matches, but everything else ships as written; leave off unless the receiver is trusted. log_min_duration_statement puts query text into message regardless of this setting; pattern_exclude suppresses whole events at capture.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.message_max", "Width in bytes of each event's message field; longer messages are cut at a UTF-8 character boundary and named in truncated. Other fields stay 256 bytes. Shared memory cost is ring_capacity × (message_max + ~2.4 KB); restart required. Default keeps the slot byte-identical to 0.3.x (3.4 KB).", null, &guc_message_max, 1024, @intCast(ring.default_message), @intCast(ring.max_message), pg.PGC_POSTMASTER, 0, null, null, null);
@@ -220,12 +220,14 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
     const stmt_line = filter.stmtLine(msg_span);
     const msg_bytes = copyMsg(&entry, d.message, stmt_line);
-    copyText(&entry.detail, &entry, .detail, d.detail, false);
-    copyText(&entry.hint, &entry, .hint, d.hint, false);
-    copyText(&entry.context, &entry, .context, d.context, false);
+    // Bind values (log_parameter_max_length) ride DETAIL on statement lines —
+    // the secret sits there, not in the placeholder SQL the token cut sees.
+    copyText(&entry.detail, &entry, .detail, d.detail, false, stmt_line);
+    copyText(&entry.hint, &entry, .hint, d.hint, false, false);
+    copyText(&entry.context, &entry, .context, d.context, false, false);
     copyStr(&entry.filename, &entry, .filename, d.filename);
     copyStr(&entry.funcname, &entry, .funcname, d.funcname);
-    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, true);
+    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, true, false);
 
     lockRing();
     const was_empty = state.count == 0;
@@ -245,12 +247,15 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
 }
 
 /// Run text through the redaction layers: the `password` token cut (pw —
-/// query field always, statement-embedded message lines) into one scratch
-/// buffer, then the redact_pattern regex over the result into the other.
-/// Layers that cannot change the text copy nothing.
-fn maskThroughLayers(text: []const u8, pw: bool) filter.Masked {
+/// query field always, statement-embedded message lines) or the bind-value
+/// mask (bind_params — DETAIL on statement lines; the two never coexist on
+/// one field) into one scratch buffer, then the redact_pattern regex over
+/// the result into the other. Layers that cannot change the text copy
+/// nothing.
+fn maskThroughLayers(text: []const u8, pw: bool, bind_params: bool) filter.Masked {
     var out = filter.Masked{ .text = text, .clipped = false };
     if (pw) out = filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text);
+    if (bind_params) out = filter.redactParamValues(redact_a[0 .. messageMax() + 1], out.text);
     if (redactor) |*red| out = red.apply(redact_b[0 .. messageMax() + 1], out.text);
     return out;
 }
@@ -259,20 +264,21 @@ fn maskThroughLayers(text: []const u8, pw: bool) filter.Masked {
 /// A layer that had to clip sets the field's redacted bit itself: setStr
 /// cannot, because the clipped result fits the slot — and the cause is the
 /// clip, not the slot.
-fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool) void {
+fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool, bind_params: bool) void {
     if (src == null) return;
-    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, bind_params);
     ring.setStr(dst, &entry.truncated_mask, field, masked.text);
     if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
-/// The message variant of copyText: same layers, but the result lands in
+/// The message variant of copyText: same layers (bind values never ride the
+/// message — the Parameters line is DETAIL-only), but the result lands in
 /// msg_hold via setMsg (the slot's message region is variable-width) and the
 /// copied slice is returned for ring.push — it must
 /// survive until push, and the layers' own buffer (redact_b) does not: the
 /// next copyText overwrites it.
 fn copyMsg(entry: *ring.ShmLogEntry, src: [*c]const u8, pw: bool) []const u8 {
-    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, false);
     const held = ring.setMsg(&entry.message_len, &entry.truncated_mask, masked.text, msg_hold[0..messageMax()]);
     if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(ring.TruncField.message));
     return held;
