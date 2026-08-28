@@ -85,28 +85,55 @@ pub const Filter = struct {
         self.exclude = null;
     }
 
-    pub fn accepts(self: *const Filter, elevel: i32, message: [*:0]const u8) bool {
+    /// `extra` are the event's remaining text fields (detail, hint, context
+    /// and, when captured, the query) as nullable C strings. The exclude
+    /// pattern is matched against all of them: a secret riding any field
+    /// must suppress the whole event, not just the message copy. include
+    /// stays message-only — its GUC docs promise "matching messages".
+    pub fn accepts(self: *const Filter, elevel: i32, message: [*:0]const u8, extra: []const ?[*:0]const u8) bool {
         if (elevel < self.level_min) return false;
         if (self.include) |*inc| if (!inc.matches(message)) return false;
-        if (self.exclude) |*exc| if (exc.matches(message)) return false;
+        if (self.exclude) |*exc| {
+            if (exc.matches(message)) return false;
+            for (extra) |f| if (f) |s| if (exc.matches(s)) return false;
+        }
         return true;
     }
 };
 
 test "level threshold" {
     var flt = Filter{ .level_min = 19 }; // WARNING
-    try std.testing.expect(!flt.accepts(15, "log"));
-    try std.testing.expect(flt.accepts(19, "warning"));
-    try std.testing.expect(flt.accepts(21, "error"));
+    try std.testing.expect(!flt.accepts(15, "log", &.{}));
+    try std.testing.expect(flt.accepts(19, "warning", &.{}));
+    try std.testing.expect(flt.accepts(21, "error", &.{}));
 }
 
 test "regex include/exclude" {
     var flt = Filter{};
     flt.include = Regex.compile("duplicate key.*") orelse return error.CompileFailed;
     defer flt.deinit();
-    try std.testing.expect(flt.accepts(15, "duplicate key value violates"));
-    try std.testing.expect(!flt.accepts(15, "relation not found"));
-    try std.testing.expect(!flt.accepts(19, "other message")); // include regex misses
+    try std.testing.expect(flt.accepts(15, "duplicate key value violates", &.{}));
+    try std.testing.expect(!flt.accepts(15, "relation not found", &.{}));
+    try std.testing.expect(!flt.accepts(19, "other message", &.{})); // include regex misses
+}
+
+test "exclude matches any text field, include stays message-only" {
+    var flt = Filter{};
+    flt.include = Regex.compile("detected.*") orelse return error.CompileFailed;
+    flt.exclude = Regex.compile("TOKEN-[0-9]+") orelse return error.CompileFailed;
+    defer flt.deinit();
+    const clean = [_]?[*:0]const u8{ null, "plain detail", "hint text" };
+    try std.testing.expect(flt.accepts(15, "detected anomaly", &clean));
+    // the token in any extra field suppresses the whole event
+    const in_detail = [_]?[*:0]const u8{"detail: TOKEN-42"};
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_detail));
+    const in_hint = [_]?[*:0]const u8{ null, null, "TOKEN-7" };
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_hint));
+    const in_query = [_]?[*:0]const u8{ null, null, null, "SELECT TOKEN-9" };
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_query));
+    // include still matches the message only: a detail-only match of the
+    // include pattern does not let the event through
+    try std.testing.expect(!flt.accepts(15, "unrelated", &[_]?[*:0]const u8{"detected in detail"}));
 }
 
 test "empty pattern compiles to always-match" {

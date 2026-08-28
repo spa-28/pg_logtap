@@ -100,10 +100,8 @@ wait_for() { # wait_for <marker> <count> [tries]
   done
 }
 
-# A previous run may have left the ring full of undrained backlog; markers
-# emitted into a full ring are dropped at emit (counted in events_dropped,
-# never delivered) and the first scenario would time out on them. Wait for a
-# quiet ring before testing.
+# Wait for the worker to empty the ring: markers emitted into a full ring
+# are dropped at emit (counted in events_dropped, never delivered).
 drain_ring() {
   n=0
   while [ "$n" -lt 60 ]; do
@@ -112,7 +110,6 @@ drain_ring() {
   done
   fail "ring never drained (ring_events=$(statf ring_events))"
 }
-drain_ring
 
 # Every delivered marker line must parse as JSON — a torn slot or a botched
 # sanitization would surface here as invalid JSON or broken UTF-8.
@@ -135,6 +132,12 @@ echo "== huge fields: message and detail past their ring slots =="
 # changes what this one must observe.
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+# A previous run may have left the ring full of undrained backlog; markers
+# emitted into a full ring are dropped at emit (counted, never delivered)
+# and the first scenario would time out on them. Also fires on a freshly
+# configured stand only after export_url is set above — an empty URL parks
+# the worker's sends by design.
+drain_ring
 # 8k multibyte chars (16 KB into a 1024-byte slot) + a 2 KB detail (256-byte
 # slot): the cut points land mid-character — the copy must back off to the
 # char boundary and name both fields in "truncated".
@@ -339,6 +342,25 @@ else
 fi
 setguc log_min_duration_statement -1; setguc log_parameter_max_length -1; reload
 ok "bind-parameter values masked on the parameters line"
+
+# pattern_exclude matches the whole event text, not just the message: the
+# token rides DETAIL (where RAISE ... USING DETAIL puts it) — the event must
+# not ship at all, while a token-free neighbor emitted right after it flows.
+setguc pg_logtap.pattern_exclude "HIDEME$SUF"; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'exc-suppressed$SUF message is clean'
+  USING DETAIL = 'detail carries HIDEME$SUF';
+END \$\$" >/dev/null 2>&1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'exc-control$SUF no token anywhere';
+END \$\$" >/dev/null 2>&1
+wait_for "exc-control$SUF" 1 10
+[ "$(grep -c "exc-suppressed$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
+  || fail "pattern_exclude: event with the token in DETAIL reached the receiver"
+[ "$(grep -c "HIDEME$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
+  || fail "pattern_exclude: the DETAIL token itself reached the receiver"
+ok "pattern_exclude suppresses an event whose DETAIL carries the token"
+setguc pg_logtap.pattern_exclude ''; reload
 
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a

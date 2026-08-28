@@ -104,7 +104,7 @@ GUCs and restart again.
 |---|---|---|---|
 | `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 23=PANIC — see the level table below). |
 | `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and the scan runs over the full `message_max` — a wider slot widens the worst case; matching runs in every logging backend). |
-| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching messages. |
+| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. |
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. ⚠ sensitive — see below. |
 | `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; avoid backreferences (see `pattern`). |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
@@ -278,8 +278,10 @@ On top of that, the operational knobs:
 - keep `log_parameter_max_length`/`log_parameter_max_length_on_error` at
   `-1` (the default) unless the values are the point: when set, bind values
   reach `DETAIL` masked (see above) but still expand the event;
-- `pg_logtap.pattern_exclude` suppresses whole events at capture — e.g.
-  `'PASSWORD|IDENTIFIED BY'` never leaves the server at all;
+- `pg_logtap.pattern_exclude` suppresses whole events at capture — the
+  pattern is matched against every text field of the event (message,
+  detail, hint, context and the captured query), so e.g.
+  `'PASSWORD|IDENTIFIED BY'` never leaves the server in any field;
 - scrub at the collector — Vector's `redact` transform (built-in filters for
   emails/SSNs/custom regex) still applies to whatever else slips through.
 

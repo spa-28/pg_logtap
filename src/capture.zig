@@ -67,7 +67,7 @@ fn ringQ() ring.Ring {
 pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5, 15=LOG, 19=WARNING, 21=ERROR, 23=PANIC). Filters export only — stderr/log_destination output is governed by the server's own log_min_messages.", null, &guc_level_min, 15, 10, 23, pg.PGC_SIGHUP, 0, null, assignLevel, null);
     pg.DefineCustomStringVariable("pg_logtap.pattern", "POSIX ERE; capture only matching messages (empty = all).", null, &guc_pattern, "", pg.PGC_SIGHUP, 0, null, assignPattern, null);
-    pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching messages.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, null, assignPatternExclude, null);
+    pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching events — the pattern is matched against the event's whole text: message, detail, hint, context and the captured query (only when field_query is on). pattern_include still matches the message alone.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, null, assignPatternExclude, null);
     pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting, and so are bind-parameter values (the DETAIL line log_parameter_max_length adds to statement lines). Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
     pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event. SECURITY: queries can embed tokens and personal data beyond passwords (literals in INSERTs) — the standalone password token is cut always and redact_pattern masks its matches, but everything else ships as written; leave off unless the receiver is trusted. log_min_duration_statement puts query text into message regardless of this setting; pattern_exclude suppresses whole events at capture.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
@@ -195,7 +195,16 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     const d = edata.*;
     if (d.message == null) return;
     const msg: [*:0]const u8 = @ptrCast(d.message);
-    if (!filter_cache.accepts(d.elevel, msg)) return;
+    // pattern_exclude sees every text field the event would carry — the
+    // query only when it is actually captured (field_query), matching what
+    // ships: no excluding on text that never leaves the process.
+    const filter_extra = [_]?[*:0]const u8{
+        @as(?[*:0]const u8, @ptrCast(d.detail)),
+        @as(?[*:0]const u8, @ptrCast(d.hint)),
+        @as(?[*:0]const u8, @ptrCast(d.context)),
+        if (guc_field_query) @as(?[*:0]const u8, @ptrCast(pg.debug_query_string)) else null,
+    };
+    if (!filter_cache.accepts(d.elevel, msg, &filter_extra)) return;
 
     var entry = std.mem.zeroes(ring.ShmLogEntry);
     entry.timestamp_us = pg.GetCurrentTimestamp();
