@@ -740,7 +740,10 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     if (sync and c.fdatasync(file_fd) != 0) return false;
     // Cap enforcement after the durable append: the member is safe on disk
     // either way, and the compaction rewrite must never race a lost one.
-    fbCompact(alloc);
+    // The fd and the post-append size are already in hand — the cap check
+    // costs no syscall, and only a file past the cap pays for the rewrite.
+    // A fresh file (size 0) also gained the framing magic with this member.
+    fbCompact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + 4 + comp.len);
     return true;
 }
 
@@ -884,20 +887,18 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
 /// rewrite it keeping only the newest half of the cap — an unattended outage
 /// then turns over cap/2 bytes per compaction instead of filling the disk.
 /// Members below fb_offset were already delivered (dropping them is free);
-/// dropped undelivered members count into replayed AND lost: replayed keeps
-/// queue_backlog = queued − replayed truthful (they left the queue), lost
-/// records that they never arrived. Atomic (tmp + rename + directory fsync);
-/// any failure leaves the file as it was — the next append past the cap
-/// retries. Ceiling: a cap smaller than one member bounds the file only at
-/// member granularity, and decompressing the dropped prefix stalls this
-/// flush cycle (once per cap/2 of growth).
-fn fbCompact(alloc: std.mem.Allocator) void {
+/// dropped undelivered members count into compacted AND lost: compacted
+/// keeps queue_backlog = queued − replayed − compacted truthful (they left
+/// the queue), lost records that they never arrived. Atomic (tmp + rename +
+/// directory fsync); any failure leaves the file as it was — the next append
+/// past the cap retries. Ceiling: a cap smaller than one member bounds the
+/// file only at member granularity. Runs under the cycle's abort budget:
+/// the member-count walk and the copy loop check sendAborted() between
+/// syscalls, so a shutdown flush never waits out a cap/2 rewrite — the
+/// untouched original simply retries on the next append past the cap.
+fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     const cap_bytes: u64 = @as(u64, @intCast(@max(guc_fallback_max_mb, 0))) << 20;
-    if (cap_bytes == 0) return;
-    const file_fd = fbOpen() orelse return;
-    defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return;
-    if (size <= cap_bytes) return;
+    if (cap_bytes == 0 or size <= cap_bytes) return;
     const keep_bytes = cap_bytes / 2;
 
     // Walk whole members from the top; a member is droppable only if what
@@ -906,6 +907,7 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     var off: u64 = fb_magic_len;
     var lost_events: u64 = 0;
     while (off + 4 <= size) {
+        if (sendAborted()) return;
         var len_buf: [4]u8 = undefined;
         if (fbPread(file_fd, &len_buf, off) != 4) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
@@ -945,13 +947,15 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
     while (copied_ok and pos < size) {
+        // Abortable unlike the parked-backlog writes: the members are durable
+        // in the original, so an aborted rewrite is a wasted tmp, not a loss.
         const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
         const got = fbPread(file_fd, copy_buf[0..want], pos);
-        if (got == 0) {
+        if (got <= 0) { // 0 = EOF; -1 = read error — both abort the rewrite
             copied_ok = false;
             break;
         }
-        copied_ok = writeAll(tmp_fd, copy_buf[0..@intCast(got)], false);
+        copied_ok = writeAll(tmp_fd, copy_buf[0..@intCast(got)], true);
         pos += @intCast(got);
     }
     if (copied_ok) copied_ok = c.fdatasync(tmp_fd) == 0;
