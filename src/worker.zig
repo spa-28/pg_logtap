@@ -978,6 +978,11 @@ fn logFallback(active: bool) void {
     was_fallback = active;
     if (active) {
         elog.Log(@src(), "pg_logtap export diverting batches to fallback file (receiver failing)", .{});
+        // The transition guard above makes this once per divert, not once
+        // per append: an unattended outage with no cap parks events until
+        // the disk is full, and that deserves an operator-visible line.
+        if (guc_fallback_max_mb == 0)
+            elog.Warning(@src(), "pg_logtap fallback queue is unbounded (fallback_max_mb=0): a long outage grows it until the disk is full; set fallback_max_mb to bound it", .{});
     } else {
         elog.Log(@src(), "pg_logtap fallback closed, receiver delivery resumed", .{});
     }

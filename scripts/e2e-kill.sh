@@ -184,12 +184,18 @@ FB="$FB_DIR/$FB_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so in
+# the log — exactly one WARNING per divert, not one per append.
+sinceW=$(date -u +%Y-%m-%dT%H:%M:%S)
+setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0"
+warns=$(docker logs --since "$sinceW" "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
+[ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
+ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 # The queue is on disk: a cluster restart must not lose it — replay after boot.
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
@@ -200,6 +206,7 @@ fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 queue_dups=$(seqs_of queue1 | sort | uniq -d | wc -l)
 [ "$queue_dups" = 0 ] || fail "fallback queue: $queue_dups duplicate seqs in replay"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 during replay"
+setguc pg_logtap.fallback_max_mb 512 # back to the default for later scenarios
 ok "restart + receiver back → 2600/2600 replayed, queue truncated, 0 duplicate seqs"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
