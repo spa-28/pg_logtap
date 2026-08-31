@@ -131,8 +131,11 @@ whole flush gets ~1 s of work plus one send timeout (enforced between syscalls
 — a dribbling receiver cannot stretch a single send past the socket timeout it
 already survived), and a **second SIGTERM** to the worker closes the in-flight
 connection and exits immediately. Whatever the flush cannot deliver live is
-parked to the fallback file in full (parking is local-disk work with no
-deadline); SIGKILL skips all of it.
+parked to the fallback file in full — parking is local-disk work with no
+deadline by design: its fdatasync is the one deliberately non-abortable
+write in the flush (everything else checks the abort budget between
+syscalls), because that sync is the durability the crash contract rests on.
+SIGKILL skips all of it.
 With `export_fallback_file` set, the queue is on disk and **survives the
 crash** — the restarted worker replays it; the exposure shrinks to roughly one
 `flush_interval` of events (in RAM at the moment of the kill) plus the
@@ -204,10 +207,15 @@ apart downstream.
 
 The queue grows without bound through an outage — by default until the disk
 is full (then the RAM-backlog loss semantics take over). `pg_logtap.
-fallback_max_mb` (default 512, `0` = unlimited) bounds it instead: once an
+fallback_max_mb` (default 512, `0` = unlimited — parking into an unbounded
+queue logs one WARNING per divert) bounds it instead: once an
 append pushes the file past the cap, it is compacted to the **newest half of
-the cap** (atomic tmp+rename rewrite; the worker stalls for that one flush
-cycle). Delivered members at the head are dropped free; undelivered dropped
+the cap** (atomic tmp+rename rewrite). The rewrite runs under the cycle's
+abort budget — a shutdown flush never waits it out; an interrupted
+compaction leaves the original untouched and the next append past the cap
+retries it. Peak disk use is momentarily ≈1.5× the cap (the file plus the
+rewrite tmp on the same filesystem), so size the device's headroom for that.
+Delivered members at the head are dropped free; undelivered dropped
 members count into **both** `events_compacted` (they left the queue — keeps
 `queue_backlog = queued − replayed − compacted` truthful, and `delivered =
 sent + replayed` counts only events a receiver actually got) and
@@ -319,6 +327,7 @@ itself queued. Persisting the offset in the file header is on the roadmap.
 | `events_sent` | events | delivered to the export URL by a live send |
 | `events_queued` | events | durably appended to the fallback file |
 | `events_replayed` | events | delivered out of the fallback file after the receiver recovered |
+| `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while undelivered (also in `events_lost`; never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable queue member skipped, or a `fallback_max_mb` compaction dropping undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

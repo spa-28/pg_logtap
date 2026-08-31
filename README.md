@@ -215,6 +215,15 @@ All SIGHUP — re-tune on a running cluster:
   (`message_max + ~2.4 KB`; ~65 × 3.4 KB = 220 MB at defaults), paid only
   while parking falls behind.
 
+A production profile that removes the known capture cliffs, if you would
+rather not derive it from the formulas in [docs/delivery.md](docs/delivery.md):
+`ring_capacity = 8192` (postmaster; ~28 MB, ~8 s of absorption at 1 k ev/s)
+and `export_timeout_ms = 500` (SIGHUP) — together they keep capture
+drop-free through a receiver that accepts but stalls, the worst case for
+the ring (a dead one fails in milliseconds and parks on the fallback file).
+Add `export_fallback_file` and the loss window through any outage is the
+queue's, not RAM's.
+
 The full delivery contract — what is guaranteed, what is counted, and the
 loss boundaries per failure scenario — is
 [docs/delivery.md](docs/delivery.md).

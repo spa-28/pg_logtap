@@ -27,6 +27,14 @@ from scratch when the need becomes real.
   for it with a real audit requirement.
 - **IPv6 literal addresses** in `export_url` (bracket parsing in
   export.zig); hostnames with AAAA records already work.
+- **TLS / authentication on the export hop**: deliberately not in the
+  worker. The design is delegation — point `export_url` at a local sidecar
+  (Vector, Fluent Bit, stunnel, an nginx TLS terminator) on the same host
+  or network namespace, and terminate TLS there. That keeps the worker on
+  plain blocking sockets (its crash-safety budget), gives the full client-
+  cert/mTLS toolbox of a dedicated proxy, and matches how the rest of the
+  stack already ships logs. Revisit only if a deployment cannot run a
+  sidecar.
 - **Retry backoff**: exponential + jitter on send retries; the fixed
   `flush_interval` cadence is fine until a receiver rate-limits on connect
   storms.
