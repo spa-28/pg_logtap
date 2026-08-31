@@ -23,9 +23,13 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
      events_sent     — delivered by a live send
      events_queued   — durably appended to the fallback file
      events_replayed — delivered out of the fallback file
-     queue_backlog   — stuck in the fallback file right now (queued − replayed)
+     events_compacted — dropped by the fallback cap trim while undelivered
+                       (also counted in events_lost; never in delivered)
+     queue_backlog   — stuck in the fallback file right now
+                       (queued − replayed − compacted)
      delivered       — sent + replayed, everything handed to a receiver
-     events_lost     — permanently lost (no fallback file / unreadable member)
+     events_lost     — permanently lost (no fallback file / unreadable member /
+                       cap-trimmed while undelivered)
    send_cycles_failed counts failed send CYCLES, not events (receiver down).
    ring_events/ring_capacity are gauges for capture-ring pressure.
    0.3.0 gauges: dns_fail_streak — consecutive failed DNS lookups for the
@@ -38,6 +42,7 @@ CREATE TYPE pg_logtap_stats_t AS (
     events_sent          bigint,
     events_queued        bigint,
     events_replayed      bigint,
+    events_compacted     bigint,
     queue_backlog        bigint,
     delivered            bigint,
     events_lost          bigint,

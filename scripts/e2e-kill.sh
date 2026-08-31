@@ -359,10 +359,14 @@ ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
 
 echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest lost =="
 # Sizing: this run's queue scenario shows ~15 compressed bytes per event, so
-# a 1MB cap holds ~68k events — 90k events force at least one compaction to
-# the newest 512KB. The exact split is compression-dependent; the asserts are
-# the CONTRACT: file bounded, newest tail delivered, dropped events counted
-# lost, no duplicate replay.
+# a 1MB cap holds ~68k events. 150k events (~2.2MB) force at least one
+# compaction to the newest 512KB even when the 8192-deep RAM backlog trims
+# part of the burst on the way (a 90k storm sat exactly at the cap and
+# whether compaction fired depended on parking's race with the storm). The
+# exact split is compression-dependent; the asserts are the CONTRACT: file
+# bounded, newest tail delivered, dropped events counted lost (compacted
+# when the file was trimmed, lost when the backlog was), no duplicate
+# replay.
 docker exec "$PG_CT" sh -c "rm -f '$FB_DIR/$FB_REL2'"
 setguc pg_logtap.fallback_max_mb 1
 # The default backlog depth (65536 × ~3.4KB ≈ 220MB of worker RAM, documented
@@ -376,16 +380,23 @@ setguc pg_logtap.export_backlog_max 8192
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
 D0=$(statf events_dropped) # ring may legally overflow while the worker
 # gzip-parks the burst — those events close the universe in dropped, not lost
-gen cap1 90000; sleep 6 # storm parks >1MB of members; compaction fires
+gen cap1 150000; sleep 8 # storm parks >2MB of members; compaction must fire
 sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
 [ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
 L=$(statf events_lost)
 [ "$L" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count lost events (lost=$L)"
+C=$(statf events_compacted)
+[ "$C" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count compacted events (compacted=$C)"
+# delivered must EXCLUDE cap-dropped events: they were never handed to any
+# receiver (the pre-T5 bug counted them as replayed → delivered lied)
+DV=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT delivered - events_sent - events_replayed FROM pg_logtap_delivery")
+[ "$DV" = 0 ] 2>/dev/null || fail "fallback_max_mb: delivered ≠ sent + replayed ($DV)"
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb 512
 setguc pg_logtap.export_backlog_max 65536; reload
 n=0; while [ "$n" -lt 30 ]; do
   sleep 1; n=$((n + 1))
-  backlog=$(( $(statf events_queued) - $(statf events_replayed) ))
+  backlog=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)
@@ -393,8 +404,8 @@ R=$(received cap1)
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
 D=$(( $(statf events_dropped) - D0 ))
-[ "$((R + L + D))" -ge 85000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 85000 of 90000"
-ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), ring-dropped ($D), dup=0"
+[ "$((R + L + D))" -ge 140000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 140000 of 150000"
+ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), compacted=$C excluded from delivered, ring-dropped ($D), dup=0"
 
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.fallback_max_mb 512

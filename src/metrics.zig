@@ -45,12 +45,15 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
         \\# TYPE pg_logtap_events_sent_total counter
         \\pg_logtap_events_sent_total {d}
-        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed.
+        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed - events_compacted.
         \\# TYPE pg_logtap_events_queued_total counter
         \\pg_logtap_events_queued_total {d}
         \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.
         \\# TYPE pg_logtap_events_replayed_total counter
         \\pg_logtap_events_replayed_total {d}
+        \\# HELP pg_logtap_events_compacted_total Events dropped by the fallback-file cap trim while not yet delivered (also counted in events_lost) — the outage outlasted the queue.
+        \\# TYPE pg_logtap_events_compacted_total counter
+        \\pg_logtap_events_compacted_total {d}
         \\# HELP pg_logtap_send_cycles_failed_total Failed send attempts — one per flush cycle whose send failed, NOT events. The events are safe (fallback queue / backlog); this is the receiver-down signal.
         \\# TYPE pg_logtap_send_cycles_failed_total counter
         \\pg_logtap_send_cycles_failed_total {d}
@@ -74,10 +77,11 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\pg_logtap_redact_pattern_failed {d}
         \\
     , .{
-        snap.captured,        snap.dropped,         snap.sent,
-        snap.queued,          snap.replayed,        snap.send_failed,
-        snap.export_lost,     snap.count,           snap.capacity,
-        snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
+        snap.captured,              snap.dropped,         snap.sent,
+        snap.queued,                snap.replayed,        snap.compacted,
+        snap.send_failed,           snap.export_lost,     snap.count,
+        snap.capacity,              snap.dns_fail_streak, snap.fallback_broken,
+        snap.redact_pattern_failed,
     });
 }
 

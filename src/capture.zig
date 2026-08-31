@@ -321,9 +321,11 @@ pub fn setWorkerLatch() void {
 
 /// Lifecycle counters — one event is counted exactly once per stage it
 /// passes through: sent (live send), queued (fallback-file append),
-/// replayed (queue member delivered after recovery). Stuck in the queue
-/// right now = queued - replayed. failed counts CYCLES, not events.
-pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64) void {
+/// replayed (queue member delivered after recovery), compacted (dropped by
+/// the fallback cap trim while undelivered — also counted lost, never
+/// delivered). Stuck in the queue right now = queued - replayed -
+/// compacted. failed counts CYCLES, not events.
+pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64, compacted: u64) void {
     if (!ready) return;
     lockRing();
     state.sent += sent;
@@ -331,6 +333,7 @@ pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64)
     state.replayed += replayed;
     state.send_failed += failed;
     state.export_lost += lost;
+    state.compacted += compacted;
     unlockRing();
 }
 
@@ -424,8 +427,8 @@ pub fn statsText(buf: []u8) ?[]const u8 {
     if (!ready) return "shmem not initialized (shared_preload_libraries?)";
     const snap = snapshot();
     // Same names and order as the pg_logtap_delivery view columns.
-    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} redact_pattern_failed={d}", .{
-        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
+    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} events_compacted={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} redact_pattern_failed={d}", .{
+        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.compacted, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
     }) catch "stats overflow";
 }
 
@@ -434,13 +437,14 @@ pub fn statsText(buf: []u8) ?[]const u8 {
 pub fn statsJson(buf: []u8) ?[]const u8 {
     if (!ready) return "{\"events_captured\":0}"; // shmem not up: zero row
     const snap = snapshot();
-    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"redact_pattern_failed\":{d}}}", .{
+    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"events_compacted\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"redact_pattern_failed\":{d}}}", .{
         snap.captured,
         snap.dropped,
         snap.sent,
         snap.queued,
         snap.replayed,
-        snap.queued -| snap.replayed,
+        snap.compacted,
+        snap.queued -| snap.replayed -| snap.compacted,
         snap.sent +| snap.replayed,
         snap.export_lost,
         snap.send_failed,

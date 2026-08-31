@@ -81,6 +81,11 @@ pub const ShmState = extern struct {
     sent: u64 = 0,
     queued: u64 = 0,
     replayed: u64 = 0,
+    /// Events dropped by fallback-file compaction (the cap trim) while not
+    /// yet delivered — they also count into export_lost; this counter is
+    /// what keeps delivered = sent + replayed honest and queue_backlog
+    /// correct.
+    compacted: u64 = 0,
     send_failed: u64 = 0,
     export_lost: u64 = 0,
     /// Consecutive failed getaddrinfo lookups in the export worker; 0 after
@@ -128,6 +133,7 @@ pub const Stats = struct {
     sent: u64,
     queued: u64,
     replayed: u64,
+    compacted: u64,
     send_failed: u64,
     export_lost: u64,
     dns_fail_streak: u32,
@@ -197,6 +203,7 @@ pub fn snapshot(r: Ring) Stats {
         .sent = r.state.sent,
         .queued = r.state.queued,
         .replayed = r.state.replayed,
+        .compacted = r.state.compacted,
         .send_failed = r.state.send_failed,
         .export_lost = r.state.export_lost,
         .dns_fail_streak = r.state.dns_fail_streak,

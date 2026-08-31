@@ -356,7 +356,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         }
     }
 
-    capture.bumpExport(sent, queued, replayed, failed, lost);
+    capture.bumpExport(sent, queued, replayed, failed, lost, 0);
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
@@ -420,7 +420,7 @@ fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
     while (drained < 4096) {
         if (!capture.drainOne(&head, drain_msg)) return drained;
         pending.append(alloc, &head, drain_msg[0..head.message_len]) catch {
-            capture.bumpExport(0, 0, 0, 0, 1);
+            capture.bumpExport(0, 0, 0, 0, 1, 0);
             return drained;
         };
         drained += 1;
@@ -877,7 +877,7 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     fb_offset = saved_offset;
     fb_lost = saved_lost;
     const due = lines -| capture.snapshot().queued;
-    if (due > 0) capture.bumpExport(0, due, 0, 0, 0);
+    if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0);
 }
 
 /// Enforce fallback_max_mb (0 = unlimited): once the file outgrew the cap,
@@ -962,7 +962,7 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     }
     fsyncDirOf(fb_path_buf[0..fb_path_len]);
     fb_offset = @max(fb_magic_len, fb_offset -| dropped);
-    if (lost_events > 0) capture.bumpExport(0, 0, lost_events, 0, lost_events);
+    if (lost_events > 0) capture.bumpExport(0, 0, 0, 0, lost_events, lost_events);
     elog.Log(@src(), "pg_logtap fallback file compacted to the newest {d} of {d} bytes; {d} undelivered events counted lost (outage outlasted the queue cap)", .{ size - off, size, lost_events });
 }
 

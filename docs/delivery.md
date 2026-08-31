@@ -208,10 +208,12 @@ fallback_max_mb` (default 512, `0` = unlimited) bounds it instead: once an
 append pushes the file past the cap, it is compacted to the **newest half of
 the cap** (atomic tmp+rename rewrite; the worker stalls for that one flush
 cycle). Delivered members at the head are dropped free; undelivered dropped
-members count into **both** `events_replayed` (they left the queue — keeps
-`queue_backlog = queued − replayed` truthful) and `events_lost` (they never
-arrived — `PgLogtapEventsLost` fires, correctly reading "the outage outlasted
-the queue"). After recovery the newest ≈ cap/2 of data is delivered in order.
+members count into **both** `events_compacted` (they left the queue — keeps
+`queue_backlog = queued − replayed − compacted` truthful, and `delivered =
+sent + replayed` counts only events a receiver actually got) and
+`events_lost` (they never arrived — `PgLogtapEventsLost` fires, correctly
+reading "the outage outlasted the queue"). After recovery the newest ≈ cap/2
+of data is delivered in order.
 A cap smaller than one member (~a hundred KB compressed) bounds the file
 only at member granularity. Fill rate measured (v0.3.0, one 16-core
 host, 8-client pgbench with every statement duration-logged into a dead
