@@ -1320,7 +1320,9 @@ fn serveOne(conn_fd: c_int) void {
     var req_buf: [512]u8 = undefined;
     const got = recvSome(conn_fd, &req_buf);
     if (got == 0) return;
-    var resp_buf: [4096]u8 = undefined;
+    // metrics.body_cap + the status line/headers (metrics.writeResponse
+    // renders the body into its own body_cap buffer, then copies it here).
+    var resp_buf: [metrics.body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
     metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
     _ = writeAll(conn_fd, resp_w.buffered(), true);
