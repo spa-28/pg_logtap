@@ -634,6 +634,25 @@ var fb_offset: u64 = 0;
 /// Foreign or corrupt framing — never append to or replay such a file; the
 /// RAM backlog takes over until the GUC is repointed or the server restarts.
 var fb_broken = false;
+/// Warned-once latch for a failing fdatasync: a dying disk fails every cycle
+/// and a per-cycle WARNING would bury the server log, but one silent failure
+/// streak means queued events nobody knows are not durable. Cleared by the
+/// first success, so a flapping disk is heard each time it starts failing.
+var fb_sync_warned = false;
+
+/// fdatasync with an edge-triggered WARNING: false = the pages are written
+/// but not durable (an OS crash loses them; postmaster death still does not).
+fn fbDatasync(file_fd: c_int) bool {
+    if (c.fdatasync(file_fd) == 0) {
+        fb_sync_warned = false;
+        return true;
+    }
+    if (!fb_sync_warned) {
+        fb_sync_warned = true;
+        elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): queued events are written but not durable", .{std.c._errno().*});
+    }
+    return false;
+}
 /// Members skipped as unreadable (framing intact, gzip damaged) — folded into
 /// `lost` by the flush cycle that read them.
 var fb_lost: u64 = 0;
@@ -757,7 +776,7 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
     if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) return false;
-    if (sync and c.fdatasync(file_fd) != 0) return false;
+    if (sync and !fbDatasync(file_fd)) return false;
     // Cap enforcement after the durable append: the member is safe on disk
     // either way, and the compaction rewrite must never race a lost one.
     // The fd and the post-append size are already in hand — the cap check
@@ -772,7 +791,7 @@ fn fbFsync() void {
     if (fb_broken or fallbackPath() == null) return;
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
-    _ = c.fdatasync(file_fd);
+    _ = fbDatasync(file_fd);
 }
 
 /// One queued batch: decompressed NDJSON, the byte size at read time, and how
@@ -824,7 +843,13 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     const comp = alloc.alloc(u8, mlen) catch return null;
     if (fbPread(file_fd, comp, fb_offset + 4) != mlen) { // torn tail
         alloc.free(comp);
-        _ = c.ftruncate(file_fd, @intCast(fb_offset));
+        // The truncation is what lets the next append land on a member edge;
+        // if it fails the framing after fb_offset is lost until a human
+        // looks — replaying garbage is worse than stopping.
+        if (c.ftruncate(file_fd, @intCast(fb_offset)) != 0) {
+            fb_broken = true;
+            elog.Warning(@src(), "pg_logtap fallback torn tail at offset {d} could not be truncated (errno={d}), replay disabled: {s}", .{ fb_offset, std.c._errno().*, fallbackPath() orelse "" });
+        }
         return null;
     }
     defer alloc.free(comp);
