@@ -268,17 +268,24 @@ pub fn redactPassword(dst: []u8, src: []const u8) Masked {
 }
 
 /// Bind-parameter values ride in DETAIL as `Parameters: $1 = '...'` (put
-/// there by log_parameter_max_length — capital P, the exact errdetail shape
-/// in exec_bind_message/exec_execute_message) — the statement text carries
+/// there by log_parameter_max_length — the errdetail shape in
+/// exec_bind_message/exec_execute_message) — the statement text carries
 /// only the $N placeholders, so the password token cut cannot see the secret.
-/// On that one line shape every single-quoted value ('' inside is an escaped
-/// quote, not the end) becomes <REDACTED>; pgaudit parity — it does not log
-/// parameter values at all. Any other detail returns src untouched: text we
-/// do not recognize is not ours to rewrite. The values stay in the server's
-/// own log; only the export is masked.
+/// PG15/16 spell the prefix lower-case (`parameters:`), PG17+ capitalised
+/// it; both are ours to mask. On that one line shape every single-quoted
+/// value ('' inside is an escaped quote, not the end) becomes <REDACTED>;
+/// pgaudit parity — it does not log parameter values at all. Any other
+/// detail returns src untouched: text we do not recognize is not ours to
+/// rewrite. The values stay in the server's own log; only the export is
+/// masked.
 pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
-    const pfx = "Parameters: ";
-    if (!std.mem.startsWith(u8, src, pfx)) return .{ .text = src, .clipped = false };
+    const pfx_upper = "Parameters: ";
+    const pfx = if (std.mem.startsWith(u8, src, pfx_upper))
+        pfx_upper
+    else if (std.mem.startsWith(u8, src, "parameters: "))
+        "parameters: "[0..pfx_upper.len]
+    else
+        return .{ .text = src, .clipped = false };
     var clipped = false;
     var out_len = put(dst, src[0..pfx.len], &clipped);
     var i = pfx.len;
@@ -384,9 +391,14 @@ test "bind-parameter values masked on the Parameters line" {
     try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'trunc").text);
     // a value containing the word password rides the same mask
     try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'password x'").text);
-    // the gate is the exact errdetail shape: lowercase or any other detail is
-    // not ours to rewrite
-    const foreign = "parameters: $1 = 'x' and other detail text";
+    // PG15/16 spell the prefix lower-case — same line, same mask
+    try std.testing.expectEqualStrings(
+        "parameters: $1 = <REDACTED>",
+        redactParamValues(&buf, "parameters: $1 = 'hunter2'").text,
+    );
+    // the gate is the exact errdetail shape: any other detail is not ours
+    // to rewrite
+    const foreign = "parameters $1 was 'x' and other detail text";
     try std.testing.expect(redactParamValues(&buf, foreign).text.ptr == foreign.ptr);
     try std.testing.expect(!redactParamValues(&buf, foreign).clipped);
     // a mask run longer than the scratch clips at a UTF-8 boundary and reports

@@ -304,7 +304,10 @@ ok "extended-protocol parse/execute duration lines get the password cut"
 # values into DETAIL ("parameters: $1 = '...'") on statement lines — the SQL
 # carries only $N placeholders, so the token cut cannot see the secret. The
 # bind-value layer masks every quoted value on that line. psql \bind is psql
-# 16+; on older servers the unit tests carry the contract.
+# 16+; PG15 gets the same contract through pgbench -M extended (client
+# variables leave as real bind parameters). The DETAIL prefix is
+# lower-case on PG15/16 ("parameters:"), capitalised on PG17+ — asserts
+# accept both shapes.
 setguc log_min_duration_statement 0; setguc log_parameter_max_length 100; reload; sleep 1
 vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
 if [ "$vnum" -ge 160000 ]; then
@@ -329,16 +332,46 @@ for line in whole.splitlines():
         continue
     e = json.loads(line)
     m, d = e.get("message") or "", e.get("detail") or "" # null ≠ absent in JSON
-    if "duration:" in m and "Parameters: " in d:
+    if "duration:" in m and d.lower().startswith("parameters:"):
         # every quoted value masked, the $N keys and structure verbatim
-        assert d.startswith("Parameters: $1 = <REDACTED>"), d
+        assert d.startswith(("Parameters: $1 = <REDACTED>", "parameters: $1 = <REDACTED>")), d
         assert d.endswith("$2 = <REDACTED>"), d
         assert "SECRET" not in d and "pw" not in d, d
         saw += 1
 assert saw > 0, "no bind-parameter detail lines reached the receiver"
 EOF
 else
-  echo "  skip: bind-parameter masking (psql bind needs 16+, server is $vnum)"
+  # PG15: no psql \bind — drive extended protocol with pgbench. -f script
+  # keeps the secret OUT of the SQL text (:var leaves as a bind parameter,
+  # the DETAIL is where it surfaces; the quoted :'v' form is NOT replaced
+  # in extended mode — plain :v is); the tag literal is the marker.
+  docker exec "$PG_CT" sh -c "cat > /tmp/p15bind.sql <<EOF
+SELECT 'p15bind$SUF' AS tag, :v::text;
+EOF"
+  docker exec "$PG_CT" pgbench -U postgres -M extended -t 1 -c 1 \
+    -f /tmp/p15bind.sql -D "v=SECRET-p15bind$SUF-xyz789" postgres >/dev/null 2>&1 || true
+  docker exec "$PG_CT" rm -f /tmp/p15bind.sql
+  n=0; while [ "$n" -lt 20 ]; do
+    [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "p15bind$SUF")" -gt 0 ] && break
+    n=$((n + 1)); sleep 1
+  done
+  python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: bind-parameter values masked (pgbench path)"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-p15bind" + suf not in whole, "bind value reached the receiver via DETAIL"
+saw = 0
+for line in whole.splitlines():
+    if "p15bind" + suf not in line:
+        continue
+    e = json.loads(line)
+    m, d = e.get("message") or "", e.get("detail") or ""
+    if "duration:" in m and d.lower().startswith("parameters:"):
+        assert d.startswith(("Parameters: $1 = <REDACTED>", "parameters: $1 = <REDACTED>")), d
+        assert "SECRET" not in d, d
+        saw += 1
+assert saw > 0, "no bind-parameter detail lines reached the receiver"
+EOF
 fi
 setguc log_min_duration_statement -1; setguc log_parameter_max_length -1; reload
 ok "bind-parameter values masked on the parameters line"
