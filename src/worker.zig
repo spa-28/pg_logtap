@@ -108,7 +108,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, checkFallbackFile, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -660,6 +660,31 @@ var fb_lost: u64 = 0;
 var fb_path_buf: [4096]u8 = undefined;
 var fb_path_len: usize = 0;
 
+/// The queue's path buffers are 4096 bytes and compaction rewrites through
+/// "<path>.compact": a value that fits the queue but leaves no room for the
+/// suffix parks events fine, yet the cap can never fire — fbCompact cannot
+/// even name its temp. Reject the value at SET (the call path guc.c uses for
+/// both SET and ALTER SYSTEM; boot runs the default '' through here too, and
+/// empty is always accepted). Relative paths measure against the data
+/// directory, exactly as fallbackPath resolves them.
+fn checkFallbackFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (raw.len == 0) return true;
+    var resolved: []const u8 = raw;
+    var tmp: [4096]u8 = undefined;
+    if (raw[0] != '/') {
+        const dd_c = pg.DataDir orelse return true;
+        const dd = std.mem.span(@as([*:0]const u8, @ptrCast(dd_c)));
+        resolved = std.fmt.bufPrint(&tmp, "{s}/{s}", .{ dd, raw }) catch return false;
+    }
+    // +8 ".compact" +1 NUL must fit the same 4096-byte path buffers
+    return resolved.len + 9 <= 4096;
+}
+
 /// Resolve the GUC (relative → data directory, the log_directory convention;
 /// the queue belongs with the data). Repointing the GUC orphans the old queue
 /// (its events stay on disk for a manual drain) and resets consumer state.
@@ -1060,7 +1085,11 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
         if (send_conn_fd == conn_fd) send_conn_fd = -1;
         _ = c.close(conn_fd);
     }
-    var head_buf: [512]u8 = undefined;
+    // Fixed headers (method line, Host, content type/encoding/length) run
+    // ~110 bytes; 2048 leaves room for any realistic path and host, and one
+    // that still does not fit fails the send with the reason — not a torn
+    // header on the wire.
+    var head_buf: [2048]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
