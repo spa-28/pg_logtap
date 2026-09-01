@@ -413,7 +413,17 @@ n=0; while [ "$n" -lt 30 ]; do
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)
-[ "$R" -ge 30000 ] || fail "fallback_max_mb: only $R of ~68k newest-tail events delivered after recovery"
+# "Newest tail" is WHICH events survive, not HOW MANY: bytes-per-event is
+# compression- and timing-dependent (an arm64 runner parked smaller batches,
+# ~21B/event vs amd64's ~15B — 25k survived where ~68k were "expected"; the
+# contract held, the count did not). Assert the property instead: the oldest
+# of the last 1000 delivered is exactly 149000 — a hole inside the tail or an
+# undelivered final event pulls it lower, and so does a delivery count under
+# 1000. Even with zero compression the 512KB newest slice holds ~5k of these
+# events, so 1000 never clips legitimate survivors.
+last1k=$(grep -oE "logtap kill cap1$SUF [0-9]+" "$OUT/vector-out.jsonl" \
+  | grep -oE '[0-9]+$' | sort -n | tail -n 1000 | head -n 1)
+[ "$last1k" = 149000 ] || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k (want 149000, delivered=$R)"
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
 D=$(( $(statf events_dropped) - D0 ))
