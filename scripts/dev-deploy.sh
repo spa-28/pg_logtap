@@ -14,7 +14,9 @@ else
     EXTDIR=/usr/share/postgresql/18/extension
 fi
 
-scripts/build.sh 18
+# ReleaseSafe: a Debug build's gzip/JSON is several times slower and the
+# e2e timing asserts (parking keeping up with a storm, dns gauges) flap on it.
+scripts/build.sh 18 -Doptimize=ReleaseSafe
 docker cp zig-out/lib/pg_logtap.so "$C:$LIBDIR/"
 docker cp pg_logtap.control "$C:$EXTDIR/"
 for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done

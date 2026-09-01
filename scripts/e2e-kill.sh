@@ -187,15 +187,18 @@ docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 # R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so in
-# the log — exactly one WARNING per divert, not one per append.
-sinceW=$(date -u +%Y-%m-%dT%H:%M:%S)
+# the log — exactly one WARNING per divert, not one per append. docker logs
+# --since does not reliably bound the window on a long-lived container (its
+# filter misses older entries), so count the DELTA over the whole log: what
+# the scenario added is what the divert produced.
+warns0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
 setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-warns=$(docker logs --since "$sinceW" "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
+warns=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true) - warns0 ))
 [ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
 ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
@@ -216,8 +219,9 @@ echo "== torn queue tail: crash mid-append =="
 # The exact shape a crash mid-append leaves: magic, a member header claiming
 # 1000 bytes, then only 100. The worker's next read (its boot-time queue
 # walk) must cut the file back to the member boundary and append there —
-# not disable replay, not misparse the framing.
-since0=$(date -u +%Y-%m-%dT%H:%M:%S)
+# not disable replay, not misparse the framing. (docker logs --since does
+# not bound the window on a long-lived container — count the delta.)
+corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
 # Write the template while the fallback is still off (export_fallback_file=''
 # since the previous scenario) — the worker does not open the file at all.
 # Writing it after the reload instead raced the worker's own appends: parking
@@ -235,9 +239,8 @@ sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for torn1 20
 [ "$(received torn1)" = 20 ] || fail "torn queue tail: replay broken (torn1=$(received torn1)/20)"
-docker logs --since "$since0" "$PG_CT" 2>&1 \
-  | grep -qE "replay disabled|framing corrupt|not a pg_logtap queue" \
-  && fail "torn queue tail: misparsed as corrupt instead of cut"
+corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
+[ "$corr" = 0 ] || fail "torn queue tail: misparsed as corrupt instead of cut"
 ok "torn tail cut at the member boundary, appends resumed, 20/20 replayed"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
