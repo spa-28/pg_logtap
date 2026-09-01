@@ -40,7 +40,14 @@ const chunk_max = 256; // events per request / queue member. 1024 measured
 // glibc's mmap threshold and every flush cycle munmaps ~1MB — TLB shootdown
 // IPIs tax every core, postgres backends included. 256 keeps allocations on
 // the malloc heap and 4x more fdatasyncs cost less than that.
-const drain_batch = 64; // popped per lock round; stack-sized
+const body_cap = 4 << 20; // byte ceiling per request body / queue member: at
+// message_max=1MB a full 256-event chunk would be ~67MB — past proxy body
+// limits and the flush cycle's time budget. buildBody stops at whichever
+// bound, events or bytes, comes first.
+
+/// Message staging for ring drains (capture.messageMax() bytes, allocated
+/// once at worker start, outside every lock).
+var drain_msg: []u8 = &.{};
 
 var guc_export_url: [*c]u8 = null;
 var guc_cluster_name: [*c]u8 = null;
@@ -120,12 +127,23 @@ pub fn workerMain() void {
     pg.BackgroundWorkerUnblockSignals();
 
     const alloc = std.heap.c_allocator;
+    // Drain-side message staging, sized to the slot's runtime width; without
+    // it there is nowhere to pop a message into.
+    drain_msg = alloc.alloc(u8, capture.messageMax()) catch pg.proc_exit(1);
     var pending: Backlog = .{};
     defer pending.deinit(alloc);
     var names = NameCache{};
     capture.setWorkerLatch(); // backends wake this worker on the first event
     syncMetricsListener();
     refreshSourceId();
+    // A crash between fbCompact's tmp creation and its rename leaves
+    // <path>.compact behind (up to cap/2 of litter — the compaction
+    // restarts from the original file). Before the first cycle could
+    // compact again and race the unlink; ENOENT is the normal case.
+    if (fallbackPath() != null) {
+        var tmp_buf: [4096]u8 = undefined;
+        if (fbCompactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    }
     fbCreditBacklog(alloc);
 
     while (!got_sigterm.isSet()) {
@@ -144,7 +162,7 @@ pub fn workerMain() void {
         // Return a storm-swollen backlog buffer: parking keeps the ArrayList
         // capacity, so a one-off million-event storm would otherwise pin GiB
         // of RSS for the worker's whole life (measured: 6.6GiB retained).
-        if (pending.len() == 0 and pending.list.capacity > 4096) {
+        if (pending.len() == 0 and pending.buf.capacity >= 2 * body_cap) {
             pending.deinit(alloc);
             pending = .{};
         }
@@ -239,14 +257,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 if (!final and pg.GetCurrentTimestamp() > cycle_deadline) break;
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
-                const count = @min(pending.len(), chunk_max);
-                const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-                if (!fbAppend(alloc, body, false)) { // disk full → RAM-backlog semantics for the rest
+                const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+                if (!fbAppend(alloc, chunk.body, false)) { // disk full → RAM-backlog semantics for the rest
                     failed += 1;
                     break;
                 }
-                pending.dropFront(count);
-                queued += count;
+                pending.dropFront(chunk.consumed);
+                queued += chunk.consumed;
                 appended = true;
             }
             if (appended) fbFsync();
@@ -288,9 +305,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         }
 
         if (pending.len() == 0) break;
-        const count = @min(pending.len(), chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, body, true)) {
+        const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, chunk.body, true)) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
@@ -300,16 +316,16 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // probe that clears receiver_slow — parking into nowhere while
             // the flag is set livelocks delivery forever.
             logFallback(true);
-            pending.dropFront(count);
-            queued += count;
+            pending.dropFront(chunk.consumed);
+            queued += chunk.consumed;
             continue;
         }
-        const gzipped = gzipPayload(alloc, dest, body, &gzip_buf);
+        const gzipped = gzipPayload(alloc, dest, chunk.body, &gzip_buf);
         const sent_at = pg.GetCurrentTimestamp();
         if (send(dest, url, gzipped.payload, gzipped.enabled)) {
             logFallback(false);
-            pending.dropFront(count);
-            sent += count;
+            pending.dropFront(chunk.consumed);
+            sent += chunk.consumed;
             // Liveness probe, both ways: an answer this slow cannot keep up
             // with capture; a fast one clears the park — the live path must
             // clear it too, or a slow answer with no fallback file set parks
@@ -323,10 +339,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             failed += 1;
             parkAll(alloc, pending, names, &queued, &lost);
             break;
-        } else if (fbAppend(alloc, body, true)) {
+        } else if (fbAppend(alloc, chunk.body, true)) {
             logFallback(true);
-            pending.dropFront(count);
-            queued += count; // durably parked: counted replayed on delivery
+            pending.dropFront(chunk.consumed);
+            queued += chunk.consumed; // durably parked: counted replayed on delivery
             failed += 1; // the send DID fail — without this a diverting storm
             // reports send_cycles_failed=0 (the receiver-down signal) while
             // actively losing events
@@ -340,7 +356,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         }
     }
 
-    capture.bumpExport(sent, queued, replayed, failed, lost);
+    capture.bumpExport(sent, queued, replayed, failed, lost, 0);
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
@@ -356,11 +372,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
 fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queued: *u64, lost: *u64) void {
     var appended = false;
     while (pending.len() > 0) {
-        const count = @min(pending.len(), chunk_max);
-        const body = buildBody(bodyWriter(alloc), pending.live()[0..count], names) orelse break;
-        if (!fbAppend(alloc, body, false)) break;
-        pending.dropFront(count);
-        queued.* += count;
+        const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
+        if (!fbAppend(alloc, chunk.body, false)) break;
+        pending.dropFront(chunk.consumed);
+        queued.* += chunk.consumed;
         appended = true;
     }
     if (appended) fbFsync();
@@ -368,37 +383,47 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
     pending.dropFront(pending.len());
 }
 
-/// pending slice → NDJSON body (one JSON line per event), built in a REUSED
+/// pending → NDJSON body (one JSON line per event), built in a REUSED
 /// buffer: a fresh ~100KB chunk body sits above glibc's mmap threshold, and
 /// the per-chunk mmap/munmap + TLB shootdowns stall every core — measured as
 /// ring drops under a 16-client storm. The slice is valid until the next call.
-/// null = formatting failed (OOM); the caller retries the chunk next cycle.
-fn buildBody(w: *std.Io.Writer.Allocating, entries: []const ring.ShmLogEntry, names: *NameCache) ?[]const u8 {
+/// Stops at chunk_max events or body_cap bytes, whichever comes first, and
+/// reports how many events it consumed — the caller drops exactly those.
+/// null = nothing built (empty or formatting failed); the caller retries
+/// next cycle.
+const BodyChunk = struct { body: []const u8, consumed: usize };
+
+fn buildBody(w: *std.Io.Writer.Allocating, pending: *Backlog, names: *NameCache) ?BodyChunk {
     w.writer.end = 0; // reset, keep capacity
-    for (entries) |*e| {
-        jsonl.writeEntry(&w.writer, e, names.lookup(e)) catch return null;
+    var consumed: usize = 0;
+    var off = pending.head;
+    while (consumed < @min(pending.len(), chunk_max)) {
+        const ent: *const ring.ShmLogEntry = @ptrCast(@alignCast(pending.buf.items.ptr + off));
+        const msg = pending.buf.items[off + @sizeOf(ring.ShmLogEntry) ..][0..ent.message_len];
+        jsonl.writeEntry(&w.writer, ent, msg, names.lookup(ent)) catch return null;
         w.writer.writeByte('\n') catch return null;
+        consumed += 1;
+        if (w.writer.end >= body_cap) break;
+        off = pending.nextOff(off);
     }
-    return w.writer.buffer[0..w.writer.end];
+    if (consumed == 0) return null;
+    return .{ .body = w.writer.buffer[0..w.writer.end], .consumed = consumed };
 }
 
-/// Ring → backlog. OOM counts the drained events as lost (ring is already drained).
+/// Ring → backlog. OOM counts the drained event as lost (the ring is already
+/// drained). Round cap: the ring refilling as fast as it drains would keep
+/// this loop running — 4096 events ≈ the old 64×64 batch — before sends,
+/// /metrics and the latch get control back.
 fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
     var drained: usize = 0;
-    var batch: [drain_batch]ring.ShmLogEntry = undefined;
-    // Round cap: drainBatch returning a full batch every time means capture
-    // is refilling the ring as fast as it drains — without the cap this loop
-    // holds the ring lock in bursts and the flush cycle (sends, /metrics,
-    // latch) never gets control back. 64 rounds ≈ 4k events per call.
-    var rounds: usize = 0;
-    while (rounds < 64) : (rounds += 1) {
-        const count = capture.drainBatch(&batch);
-        if (count == 0) return drained;
-        pending.append(alloc, batch[0..count]) catch {
-            capture.bumpExport(0, 0, 0, 0, count);
+    var head: ring.ShmLogEntry = undefined;
+    while (drained < 4096) {
+        if (!capture.drainOne(&head, drain_msg)) return drained;
+        pending.append(alloc, &head, drain_msg[0..head.message_len]) catch {
+            capture.bumpExport(0, 0, 0, 0, 1, 0);
             return drained;
         };
-        drained += count;
+        drained += 1;
     }
     return drained; // ring non-empty: the next flush cycle drains the rest
 }
@@ -416,40 +441,54 @@ fn trimBacklog(pending: *Backlog) u64 {
     return lost;
 }
 
-/// Front-consumable RAM backlog: appended at the tail (ring drains), consumed
-/// from the head (chunk parks / sends). dropFront is O(1) — a head index, with
-/// the dead prefix compacted inside append once it dominates. The old
+/// Front-consumable RAM backlog as a byte arena of [head][message] records,
+/// 8-aligned so the head cast below is legal (c_allocator guarantees 16 for
+/// any allocation this size). dropFront advances the byte head by walking
+/// records (~80ns/step — a worst-case trim of 60k records is ~5ms); the dead
+/// prefix is compacted inside append once it dominates. The old
 /// shift-per-chunk copyForwards moved up to 27MB (8192 × 3.4KB) per 256-event
 /// chunk and capped park throughput at ~14k events/s: below storm inflow, so
 /// the trim fired continuously and lost events even with the fallback file on.
 const Backlog = struct {
-    list: std.ArrayList(ring.ShmLogEntry) = .empty,
-    head: usize = 0,
+    buf: std.ArrayList(u8) = .empty,
+    head: usize = 0, // byte offset of the first live record
+    count: usize = 0, // live records; len() must stay O(1) — loop conditions read it
 
     fn len(self: *const Backlog) usize {
-        return self.list.items.len - self.head;
+        return self.count;
     }
 
-    fn live(self: *const Backlog) []ring.ShmLogEntry {
-        return self.list.items[self.head..];
-    }
-
-    fn append(self: *Backlog, alloc: std.mem.Allocator, items: []const ring.ShmLogEntry) !void {
-        if (self.head > 0 and self.head * 2 >= self.list.items.len) {
-            const rest = self.list.items.len - self.head;
-            std.mem.copyForwards(ring.ShmLogEntry, self.list.items[0..rest], self.list.items[self.head..]);
-            self.list.items.len = rest;
+    fn append(self: *Backlog, alloc: std.mem.Allocator, e: *const ring.ShmLogEntry, msg: []const u8) !void {
+        if (self.head > 0 and self.head * 2 >= self.buf.items.len) {
+            const rest = self.buf.items.len - self.head;
+            std.mem.copyForwards(u8, self.buf.items[0..rest], self.buf.items[self.head..]);
+            self.buf.items.len = rest;
             self.head = 0;
         }
-        try self.list.appendSlice(alloc, items);
+        const total = std.mem.alignForward(usize, @sizeOf(ring.ShmLogEntry) + msg.len, 8);
+        const end = self.buf.items.len;
+        try self.buf.resize(alloc, end + total);
+        @memcpy(self.buf.items[end..][0..@sizeOf(ring.ShmLogEntry)], std.mem.asBytes(e));
+        @memcpy(self.buf.items[end + @sizeOf(ring.ShmLogEntry) ..][0..msg.len], msg);
+        self.count += 1;
     }
 
-    fn dropFront(self: *Backlog, count: usize) void {
-        self.head = @min(self.head + count, self.list.items.len);
+    /// Byte offset of the record after the one at `off`.
+    fn nextOff(self: *const Backlog, off: usize) usize {
+        const ent: *const ring.ShmLogEntry = @ptrCast(@alignCast(self.buf.items.ptr + off));
+        return off + std.mem.alignForward(usize, @sizeOf(ring.ShmLogEntry) + ent.message_len, 8);
+    }
+
+    fn dropFront(self: *Backlog, n: usize) void {
+        var dropped: usize = 0;
+        while (dropped < n and self.count > 0) : (dropped += 1) {
+            self.head = self.nextOff(self.head);
+            self.count -= 1;
+        }
     }
 
     fn deinit(self: *Backlog, alloc: std.mem.Allocator) void {
-        self.list.deinit(alloc);
+        self.buf.deinit(alloc);
     }
 };
 
@@ -585,6 +624,17 @@ var fb_path_len: usize = 0;
 /// Resolve the GUC (relative → data directory, the log_directory convention;
 /// the queue belongs with the data). Repointing the GUC orphans the old queue
 /// (its events stay on disk for a manual drain) and resets consumer state.
+/// "<fallback>.compact" — fbCompact's rewrite target. A crash between its
+/// creation and the rename leaves it behind (up to cap/2 of litter nothing
+/// ever reads); workerMain unlinks it at boot.
+fn fbCompactPath(tmp_buf: *[4096]u8) ?[*:0]const u8 {
+    if (fb_path_len + 8 + 1 > tmp_buf.len) return null;
+    @memcpy(tmp_buf[0..fb_path_len], fb_path_buf[0..fb_path_len]);
+    @memcpy(tmp_buf[fb_path_len..][0..8], ".compact");
+    tmp_buf[fb_path_len + 8] = 0;
+    return @ptrCast(tmp_buf);
+}
+
 fn fallbackPath() ?[]const u8 {
     if (guc_export_fallback_file == null) return null;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_fallback_file)));
@@ -690,7 +740,10 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     if (sync and c.fdatasync(file_fd) != 0) return false;
     // Cap enforcement after the durable append: the member is safe on disk
     // either way, and the compaction rewrite must never race a lost one.
-    fbCompact(alloc);
+    // The fd and the post-append size are already in hand — the cap check
+    // costs no syscall, and only a file past the cap pays for the rewrite.
+    // A fresh file (size 0) also gained the framing magic with this member.
+    fbCompact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + 4 + comp.len);
     return true;
 }
 
@@ -770,7 +823,15 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
         elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{skip_at});
         return null;
     };
-    if (dec_state.body.writer.end > mlen * 64 + 65536) { // inflated absurdly: corrupt, skip
+    // buildBody admits the event that crosses body_cap, so a member this
+    // build writes is ≤ body_cap + one serialized event (≤ ring.max_message
+    // + overhead); the +64K on top also admits members from 0.3.x binaries
+    // (≤ ~371KB) read before an upgrade drains the queue. Compile-time max,
+    // not the live GUC: queued members can outlive a restart that lowers
+    // message_max. A byte bound, not a ratio: a wide repetitive body
+    // legitimately inflates past 64:1 and a ratio bound would flag it
+    // corrupt and lose it.
+    if (dec_state.body.writer.end > body_cap + ring.max_message + 65536) { // inflated absurdly: corrupt, skip
         const skip_at = fb_offset;
         fb_offset += 4 + mlen;
         fb_lost += 1;
@@ -819,27 +880,25 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
     fb_offset = saved_offset;
     fb_lost = saved_lost;
     const due = lines -| capture.snapshot().queued;
-    if (due > 0) capture.bumpExport(0, due, 0, 0, 0);
+    if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0);
 }
 
 /// Enforce fallback_max_mb (0 = unlimited): once the file outgrew the cap,
 /// rewrite it keeping only the newest half of the cap — an unattended outage
 /// then turns over cap/2 bytes per compaction instead of filling the disk.
 /// Members below fb_offset were already delivered (dropping them is free);
-/// dropped undelivered members count into replayed AND lost: replayed keeps
-/// queue_backlog = queued − replayed truthful (they left the queue), lost
-/// records that they never arrived. Atomic (tmp + rename + directory fsync);
-/// any failure leaves the file as it was — the next append past the cap
-/// retries. Ceiling: a cap smaller than one member bounds the file only at
-/// member granularity, and decompressing the dropped prefix stalls this
-/// flush cycle (once per cap/2 of growth).
-fn fbCompact(alloc: std.mem.Allocator) void {
+/// dropped undelivered members count into compacted AND lost: compacted
+/// keeps queue_backlog = queued − replayed − compacted truthful (they left
+/// the queue), lost records that they never arrived. Atomic (tmp + rename +
+/// directory fsync); any failure leaves the file as it was — the next append
+/// past the cap retries. Ceiling: a cap smaller than one member bounds the
+/// file only at member granularity. Runs under the cycle's abort budget:
+/// the member-count walk and the copy loop check sendAborted() between
+/// syscalls, so a shutdown flush never waits out a cap/2 rewrite — the
+/// untouched original simply retries on the next append past the cap.
+fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     const cap_bytes: u64 = @as(u64, @intCast(@max(guc_fallback_max_mb, 0))) << 20;
-    if (cap_bytes == 0) return;
-    const file_fd = fbOpen() orelse return;
-    defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return;
-    if (size <= cap_bytes) return;
+    if (cap_bytes == 0 or size <= cap_bytes) return;
     const keep_bytes = cap_bytes / 2;
 
     // Walk whole members from the top; a member is droppable only if what
@@ -848,6 +907,7 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     var off: u64 = fb_magic_len;
     var lost_events: u64 = 0;
     while (off + 4 <= size) {
+        if (sendAborted()) return;
         var len_buf: [4]u8 = undefined;
         if (fbPread(file_fd, &len_buf, off) != 4) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
@@ -880,34 +940,33 @@ fn fbCompact(alloc: std.mem.Allocator) void {
     // Rewrite: magic + [off, size) copied verbatim (gzip members are
     // self-contained; no recompression).
     var tmp_buf: [4096]u8 = undefined;
-    if (fb_path_len + 8 + 1 > tmp_buf.len) return;
-    @memcpy(tmp_buf[0..fb_path_len], fb_path_buf[0..fb_path_len]);
-    @memcpy(tmp_buf[fb_path_len..][0..8], ".compact");
-    tmp_buf[fb_path_len + 8] = 0;
-    const tmp_fd = c.open(@ptrCast(&tmp_buf), 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
+    const tmp_path = fbCompactPath(&tmp_buf) orelse return;
+    const tmp_fd = c.open(tmp_path, 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
     if (tmp_fd < 0) return;
     var copied_ok = writeAll(tmp_fd, fb_magic, false);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
     while (copied_ok and pos < size) {
+        // Abortable unlike the parked-backlog writes: the members are durable
+        // in the original, so an aborted rewrite is a wasted tmp, not a loss.
         const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
         const got = fbPread(file_fd, copy_buf[0..want], pos);
-        if (got == 0) {
+        if (got <= 0) { // 0 = EOF; -1 = read error — both abort the rewrite
             copied_ok = false;
             break;
         }
-        copied_ok = writeAll(tmp_fd, copy_buf[0..@intCast(got)], false);
+        copied_ok = writeAll(tmp_fd, copy_buf[0..@intCast(got)], true);
         pos += @intCast(got);
     }
     if (copied_ok) copied_ok = c.fdatasync(tmp_fd) == 0;
     _ = c.close(tmp_fd);
-    if (!copied_ok or c.rename(@ptrCast(&tmp_buf), @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
-        _ = c.unlink(@ptrCast(&tmp_buf));
+    if (!copied_ok or c.rename(tmp_path, @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
+        _ = c.unlink(tmp_path);
         return;
     }
     fsyncDirOf(fb_path_buf[0..fb_path_len]);
     fb_offset = @max(fb_magic_len, fb_offset -| dropped);
-    if (lost_events > 0) capture.bumpExport(0, 0, lost_events, 0, lost_events);
+    if (lost_events > 0) capture.bumpExport(0, 0, 0, 0, lost_events, lost_events);
     elog.Log(@src(), "pg_logtap fallback file compacted to the newest {d} of {d} bytes; {d} undelivered events counted lost (outage outlasted the queue cap)", .{ size - off, size, lost_events });
 }
 
@@ -919,6 +978,11 @@ fn logFallback(active: bool) void {
     was_fallback = active;
     if (active) {
         elog.Log(@src(), "pg_logtap export diverting batches to fallback file (receiver failing)", .{});
+        // The transition guard above makes this once per divert, not once
+        // per append: an unattended outage with no cap parks events until
+        // the disk is full, and that deserves an operator-visible line.
+        if (guc_fallback_max_mb == 0)
+            elog.Warning(@src(), "pg_logtap fallback queue is unbounded (fallback_max_mb=0): a long outage grows it until the disk is full; set fallback_max_mb to bound it", .{});
     } else {
         elog.Log(@src(), "pg_logtap fallback closed, receiver delivery resumed", .{});
     }
@@ -1261,7 +1325,9 @@ fn serveOne(conn_fd: c_int) void {
     var req_buf: [512]u8 = undefined;
     const got = recvSome(conn_fd, &req_buf);
     if (got == 0) return;
-    var resp_buf: [4096]u8 = undefined;
+    // metrics.body_cap + the status line/headers (metrics.writeResponse
+    // renders the body into its own body_cap buffer, then copies it here).
+    var resp_buf: [metrics.body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
     metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
     _ = writeAll(conn_fd, resp_w.buffered(), true);

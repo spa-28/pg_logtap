@@ -184,12 +184,18 @@ FB="$FB_DIR/$FB_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so in
+# the log — exactly one WARNING per divert, not one per append.
+sinceW=$(date -u +%Y-%m-%dT%H:%M:%S)
+setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0"
+warns=$(docker logs --since "$sinceW" "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
+[ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
+ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 # The queue is on disk: a cluster restart must not lose it — replay after boot.
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
@@ -200,6 +206,7 @@ fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 queue_dups=$(seqs_of queue1 | sort | uniq -d | wc -l)
 [ "$queue_dups" = 0 ] || fail "fallback queue: $queue_dups duplicate seqs in replay"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 during replay"
+setguc pg_logtap.fallback_max_mb 512 # back to the default for later scenarios
 ok "restart + receiver back → 2600/2600 replayed, queue truncated, 0 duplicate seqs"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
@@ -209,9 +216,15 @@ echo "== torn queue tail: crash mid-append =="
 # walk) must cut the file back to the member boundary and append there —
 # not disable replay, not misparse the framing.
 since0=$(date -u +%Y-%m-%dT%H:%M:%S)
+# Write the template while the fallback is still off (export_fallback_file=''
+# since the previous scenario) — the worker does not open the file at all.
+# Writing it after the reload instead raced the worker's own appends: parking
+# had already started (receiver pointed at a dead port), and the interleaved
+# writes left garbage at offset 8, which the boot walk then rightfully reported
+# as framing corrupt instead of cutting the torn member (seen on pg16).
+docker exec "$PG_CT" sh -c "printf 'PGLTFB01' > '$FB'; printf '\350\003\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload
-docker exec "$PG_CT" sh -c "printf 'PGLTFB01' > '$FB'; printf '\350\003\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 sleep 2 # boot queue walk reads the file and truncates the torn tail
 gen torn1 20; sleep 3 # parks at the member boundary the walk left
@@ -230,12 +243,19 @@ echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log
 # hook calls happen while shmem is unmapped, which used to SEGV the cluster.
 setguc log_min_messages debug1; setguc pg_logtap.level_min 10; reload
+# A crash between fbCompact's tmp creation and its rename would leave
+# <fallback>.compact behind forever; the restarted worker must unlink it
+# at boot. Plant one and check it after the restart.
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 1
+docker exec "$PG_CT" sh -c "printf garbage > '$FB.compact'"
 wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
   "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
 [ -n "$wpid" ] || fail "worker crash: worker not found in pg_stat_activity"
 docker exec "$PG_CT" kill -9 "$wpid"
 sleep 5; wait_ready; sleep 2 # postmaster emergency-restarts the cluster
 setguc log_min_messages warning; setguc pg_logtap.level_min 15; reload
+docker exec "$PG_CT" sh -c "test ! -e '$FB.compact'" \
+  || fail "worker crash: stale $FB_REL.compact survived the worker restart"
 gen crash1 20; wait_for crash1 20
 [ "$(received crash1)" = 20 ] || fail "worker crash: no delivery after worker crash"
 ok "worker crash → cluster restarted itself, delivery resumed"
@@ -352,10 +372,14 @@ ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
 
 echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest lost =="
 # Sizing: this run's queue scenario shows ~15 compressed bytes per event, so
-# a 1MB cap holds ~68k events — 90k events force at least one compaction to
-# the newest 512KB. The exact split is compression-dependent; the asserts are
-# the CONTRACT: file bounded, newest tail delivered, dropped events counted
-# lost, no duplicate replay.
+# a 1MB cap holds ~68k events. 150k events (~2.2MB) force at least one
+# compaction to the newest 512KB even when the 8192-deep RAM backlog trims
+# part of the burst on the way (a 90k storm sat exactly at the cap and
+# whether compaction fired depended on parking's race with the storm). The
+# exact split is compression-dependent; the asserts are the CONTRACT: file
+# bounded, newest tail delivered, dropped events counted lost (compacted
+# when the file was trimmed, lost when the backlog was), no duplicate
+# replay.
 docker exec "$PG_CT" sh -c "rm -f '$FB_DIR/$FB_REL2'"
 setguc pg_logtap.fallback_max_mb 1
 # The default backlog depth (65536 × ~3.4KB ≈ 220MB of worker RAM, documented
@@ -367,24 +391,44 @@ setguc pg_logtap.fallback_max_mb 1
 # backlog only as a conveyor to the file, not at depth.
 setguc pg_logtap.export_backlog_max 8192
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
-gen cap1 90000; sleep 6 # storm parks >1MB of members; compaction fires
+D0=$(statf events_dropped) # ring may legally overflow while the worker
+# gzip-parks the burst — those events close the universe in dropped, not lost
+gen cap1 150000; sleep 8 # storm parks >2MB of members; compaction must fire
 sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
 [ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
 L=$(statf events_lost)
 [ "$L" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count lost events (lost=$L)"
+C=$(statf events_compacted)
+[ "$C" -ge 1 ] 2>/dev/null || fail "fallback_max_mb: compaction did not count compacted events (compacted=$C)"
+# delivered must EXCLUDE cap-dropped events: they were never handed to any
+# receiver (the pre-T5 bug counted them as replayed → delivered lied)
+DV=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT delivered - events_sent - events_replayed FROM pg_logtap_delivery")
+[ "$DV" = 0 ] 2>/dev/null || fail "fallback_max_mb: delivered ≠ sent + replayed ($DV)"
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb 512
 setguc pg_logtap.export_backlog_max 65536; reload
 n=0; while [ "$n" -lt 30 ]; do
   sleep 1; n=$((n + 1))
-  backlog=$(( $(statf events_queued) - $(statf events_replayed) ))
+  backlog=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)
-[ "$R" -ge 30000 ] || fail "fallback_max_mb: only $R of ~68k newest-tail events delivered after recovery"
+# "Newest tail" is WHICH events survive, not HOW MANY: bytes-per-event is
+# compression- and timing-dependent (an arm64 runner parked smaller batches,
+# ~21B/event vs amd64's ~15B — 25k survived where ~68k were "expected"; the
+# contract held, the count did not). Assert the property instead: the oldest
+# of the last 1000 delivered is exactly 149000 — a hole inside the tail or an
+# undelivered final event pulls it lower, and so does a delivery count under
+# 1000. Even with zero compression the 512KB newest slice holds ~5k of these
+# events, so 1000 never clips legitimate survivors.
+last1k=$(grep -oE "logtap kill cap1$SUF [0-9]+" "$OUT/vector-out.jsonl" \
+  | grep -oE '[0-9]+$' | sort -n | tail -n 1000 | head -n 1)
+[ "$last1k" = 149000 ] || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k (want 149000, delivered=$R)"
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
-[ "$((R + L))" -ge 85000 ] || fail "fallback_max_mb: delivered($R) + lost($L) < 85000 of 90000"
-ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), dup=0"
+D=$(( $(statf events_dropped) - D0 ))
+[ "$((R + L + D))" -ge 140000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 140000 of 150000"
+ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), compacted=$C excluded from delivered, ring-dropped ($D), dup=0"
 
 setguc pg_logtap.export_url ''; setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.fallback_max_mb 512

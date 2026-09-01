@@ -4,13 +4,19 @@ const std = @import("std");
 
 const ring = @import("ring.zig");
 
+/// Response body ceiling: sized with every counter rendered at its u64
+/// widest (20 digits) — the "metrics body fits" test below pins that, and a
+/// new metric that breaks it must raise this. Callers serving the response
+/// need body_cap + 512 for the status line and headers on top.
+pub const body_cap = 4096;
+
 /// Full HTTP/1.1 response for one scraped request line ("GET /metrics HTTP/1.1").
 pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Stats) !void {
     var parts = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = parts.next() orelse "";
     const path = parts.next() orelse "";
 
-    var body_buf: [4096]u8 = undefined;
+    var body_buf: [body_cap]u8 = undefined;
     var body_w = std.Io.Writer.fixed(&body_buf);
     var is_ok = true;
     if (!std.mem.eql(u8, method, "GET")) {
@@ -45,12 +51,15 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
         \\# TYPE pg_logtap_events_sent_total counter
         \\pg_logtap_events_sent_total {d}
-        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed.
+        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed - events_compacted.
         \\# TYPE pg_logtap_events_queued_total counter
         \\pg_logtap_events_queued_total {d}
         \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.
         \\# TYPE pg_logtap_events_replayed_total counter
         \\pg_logtap_events_replayed_total {d}
+        \\# HELP pg_logtap_events_compacted_total Events dropped by the fallback-file cap trim while not yet delivered (also counted in events_lost) — the outage outlasted the queue.
+        \\# TYPE pg_logtap_events_compacted_total counter
+        \\pg_logtap_events_compacted_total {d}
         \\# HELP pg_logtap_send_cycles_failed_total Failed send attempts — one per flush cycle whose send failed, NOT events. The events are safe (fallback queue / backlog); this is the receiver-down signal.
         \\# TYPE pg_logtap_send_cycles_failed_total counter
         \\pg_logtap_send_cycles_failed_total {d}
@@ -74,10 +83,11 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\pg_logtap_redact_pattern_failed {d}
         \\
     , .{
-        snap.captured,        snap.dropped,         snap.sent,
-        snap.queued,          snap.replayed,        snap.send_failed,
-        snap.export_lost,     snap.count,           snap.capacity,
-        snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
+        snap.captured,              snap.dropped,         snap.sent,
+        snap.queued,                snap.replayed,        snap.compacted,
+        snap.send_failed,           snap.export_lost,     snap.count,
+        snap.capacity,              snap.dns_fail_streak, snap.fallback_broken,
+        snap.redact_pattern_failed,
     });
 }
 
@@ -99,6 +109,41 @@ test "metrics response" {
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_dns_fail_streak 12\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
+    // Content-Length must match the body that actually follows it.
+    const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
+    const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;
+    const len_end = std.mem.findScalarPos(u8, got, cl_idx, '\r').?;
+    try std.testing.expectEqual(hdr_end + try std.fmt.parseInt(usize, got[cl_idx..len_end], 10), got.len);
+}
+
+test "metrics body fits with every counter at u64 width" {
+    // The structural T11 case: counters can legitimately be 20 digits after
+    // a long uptime at high rates. Every field at its type's widest must
+    // still render whole into body_cap — and the full response (status line
+    // + headers + body) into the worker's body_cap + 512 serve buffer.
+    var snap = std.mem.zeroes(ring.Stats);
+    snap.captured = 12345678901234567890;
+    snap.dropped = 12345678901234567890;
+    snap.sent = 12345678901234567890;
+    snap.queued = 12345678901234567890;
+    snap.replayed = 12345678901234567890;
+    snap.compacted = 12345678901234567890;
+    snap.send_failed = 12345678901234567890;
+    snap.export_lost = 12345678901234567890;
+    snap.dns_fail_streak = 4294967295;
+    snap.fallback_broken = 255;
+    snap.redact_pattern_failed = 255;
+    snap.count = 4294967295;
+    snap.capacity = 4294967295;
+    var wbuf: [body_cap + 512]u8 = undefined;
+    var resp_w = std.Io.Writer.fixed(&wbuf);
+    try writeResponse(&resp_w, "GET /metrics HTTP/1.1", snap);
+    const got = resp_w.buffered();
+    // No metric line may be missing (a body overflow would truncate the tail
+    // — and today fails the write outright): first, middle and last.
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_captured_total 12345678901234567890\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_compacted_total 12345678901234567890\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 255\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;

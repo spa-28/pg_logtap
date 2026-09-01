@@ -20,12 +20,16 @@ pub var source_host: []const u8 = "";
 pub var source_cluster: []const u8 = "";
 pub var source_pgdata: []const u8 = "";
 
-pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, names: Names) !void {
+/// `msg` is the event's message bytes, passed separately from the fixed
+/// fields: it is the one variable-width part of an event (pg_logtap.
+/// message_max), so every owner of it — the ring slot, the RAM backlog
+/// record, the capture hold buffer — hands it in as a plain slice.
+pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, msg: []const u8, names: Names) !void {
     try w.print("{{\"seq\":{d},\"timestamp\":\"", .{e.seq});
     try writeTimestamp(w, e.timestamp_us);
     try w.writeAll("\"");
     try w.print(",\"level\":\"{s}\",\"message\":", .{levelName(e.elevel)});
-    try jsonStr(w, fixed(&e.message));
+    try jsonStr(w, msg);
     try w.print(",\"detail\":", .{});
     try optJsonStr(w, fixed(&e.detail));
     try w.print(",\"hint\":", .{});
@@ -197,11 +201,12 @@ test "invalid utf-8 bytes sanitize to U+FFFD, line stays valid JSON" {
     // 0x80 (stray continuation), \xC3\x28 (broken 2-byte), 'a\xED\xA0\x80z'
     // (surrogate pair), trailing \xC3 (2-byte sequence cut at buffer end) —
     // all invalid; valid ASCII and a valid 2-byte 'é' must pass untouched.
-    ring.setStr(&entry.message, &entry.truncated_mask, .message, "a\x80b\xC3\x28 \xC3\xA9 \xED\xA0\x80 \xC3");
+    var msg_buf: [128]u8 = undefined;
+    const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, "a\x80b\xC3\x28 \xC3\xA9 \xED\xA0\x80 \xC3", msg_buf[0..]);
 
     var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer line_w.deinit();
-    try writeEntry(&line_w.writer, &entry, .{});
+    try writeEntry(&line_w.writer, &entry, msg, .{});
     const line = line_w.written();
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
@@ -216,11 +221,12 @@ test "control characters in message escape correctly" {
     var entry = std.mem.zeroes(ring.ShmLogEntry);
     entry.seq = 2;
     entry.elevel = 19;
-    ring.setStr(&entry.message, &entry.truncated_mask, .message, "tab\tquote\"nl\n\x00");
+    var msg_buf: [128]u8 = undefined;
+    const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, "tab\tquote\"nl\n\x00", msg_buf[0..]);
 
     var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer line_w.deinit();
-    try writeEntry(&line_w.writer, &entry, .{});
+    try writeEntry(&line_w.writer, &entry, msg, .{});
     const line = line_w.written();
 
     // still one line: no raw \n or \0 anywhere, quotes escaped
@@ -271,7 +277,15 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
         entry.pid = rand.int(i32);
         rand.bytes(std.mem.asBytes(&entry.truncated_mask));
         rand.bytes(std.mem.asBytes(&entry.redacted_mask));
-        fill(&entry, .message, rand);
+        // message: variable-width, staged in its own buffer like capture does
+        // (setMsg sets message_len + the truncation bit; ~1/3 of runs exceed
+        // the staged cap)
+        var msg_src: [ring.default_message + 64]u8 = undefined;
+        const msg_fill = rand.intRangeLessThan(usize, 0, msg_src.len);
+        for (msg_src[0..msg_fill]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255);
+        var msg_dst: [ring.default_message]u8 = undefined;
+        const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, msg_src[0..msg_fill], &msg_dst);
+
         fill(&entry, .detail, rand);
         fill(&entry, .hint, rand);
         fill(&entry, .context, rand);
@@ -282,7 +296,7 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
         fill(&entry, .app, rand);
         fill(&entry, .client_host, rand);
 
-        var scratch: [ring.msg_len + 16]u8 = undefined;
+        var scratch: [96]u8 = undefined;
         rand.bytes(&scratch);
         const names: Names = .{
             .database = scratch[0..rand.intRangeLessThan(usize, 0, 32)],
@@ -291,7 +305,7 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
 
         var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer line_w.deinit();
-        try writeEntry(&line_w.writer, &entry, names);
+        try writeEntry(&line_w.writer, &entry, msg, names);
         const line = line_w.written();
 
         if (!try std.json.validate(std.testing.allocator, line)) {
@@ -304,12 +318,14 @@ test "fuzz: random bytes in every field stay one valid JSON line" {
 }
 
 /// Fill a fixed field with random non-NUL bytes; ~1/3 of runs exceed the
-/// slot cap so the setStr truncation path is exercised alongside.
+/// slot cap so the setStr truncation path is exercised alongside. The message
+/// has no fixed field — the fuzz loop stages it via setMsg separately.
 fn fill(entry: *ring.ShmLogEntry, comptime field: ring.TruncField, rand: std.Random) void {
-    var buf: [ring.msg_len + 64]u8 = undefined;
+    var buf: [ring.default_message + 64]u8 = undefined;
     const fill_len = rand.intRangeLessThan(usize, 0, buf.len);
     for (buf[0..fill_len]) |*b| b.* = rand.intRangeAtMost(u8, 1, 255);
     switch (field) {
+        .message => {},
         inline else => |f| ring.setStr(&@field(entry, @tagName(f)), &entry.truncated_mask, field, buf[0..fill_len]),
     }
 }
@@ -331,16 +347,38 @@ test "truncated and redacted are independent arrays" {
         var entry = std.mem.zeroes(ring.ShmLogEntry);
         entry.seq = 1;
         entry.elevel = 19;
-        ring.setStr(&entry.message, &entry.truncated_mask, .message, "text");
+        ring.setStr(&entry.detail, &entry.truncated_mask, .detail, "text");
         entry.truncated_mask = c.truncated;
         entry.redacted_mask = c.redacted;
         var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer line_w.deinit();
-        try writeEntry(&line_w.writer, &entry, .{});
+        try writeEntry(&line_w.writer, &entry, "text", .{});
         const line = line_w.written();
         try std.testing.expect(std.mem.find(u8, line, c.want) != null);
         try std.testing.expect(try std.json.validate(std.testing.allocator, line));
     }
+}
+
+test "message wider than the default slot" {
+    // The message lives outside the fixed head now: a >1024-byte message is
+    // just a longer slice — no truncation bit, no clipping.
+    var entry = std.mem.zeroes(ring.ShmLogEntry);
+    entry.seq = 7;
+    entry.elevel = 19;
+    var msg_src: [4096]u8 = undefined;
+    @memset(&msg_src, 'x');
+    var msg_buf: [4096]u8 = undefined;
+    const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, &msg_src, &msg_buf);
+
+    var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line_w.deinit();
+    try writeEntry(&line_w.writer, &entry, msg, .{});
+    const line = line_w.written();
+
+    try std.testing.expectEqual(@as(u32, 4096), entry.message_len);
+    try std.testing.expectEqual(@as(u16, 0), entry.truncated_mask);
+    try std.testing.expect(std.mem.find(u8, line, "\"truncated\":[]") != null);
+    try std.testing.expect(try std.json.validate(std.testing.allocator, line));
 }
 
 test "full entry json" {
@@ -353,7 +391,8 @@ test "full entry json" {
     entry.pid = 12345;
     entry.db_oid = 16384;
     entry.role_oid = 10;
-    ring.setStr(&entry.message, &entry.truncated_mask, .message, "duplicate key \"x\"");
+    var msg_buf: [128]u8 = undefined;
+    const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, "duplicate key \"x\"", msg_buf[0..]);
     ring.setStr(&entry.filename, &entry.truncated_mask, .filename, "nbtinsert.c");
     ring.setStr(&entry.funcname, &entry.truncated_mask, .funcname, "_bt_check_unique");
     ring.setStr(&entry.backend_type, &entry.truncated_mask, .backend_type, "client backend");
@@ -368,7 +407,7 @@ test "full entry json" {
         source_host = "";
         source_cluster = "";
     }
-    try writeEntry(&line_w.writer, &entry, .{ .database = "mydb", .user = "app" });
+    try writeEntry(&line_w.writer, &entry, msg, .{ .database = "mydb", .user = "app" });
     const got = line_w.written();
 
     try std.testing.expect(std.mem.find(u8, got, "\"host\":\"pg1.example\"") != null);

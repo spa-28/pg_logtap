@@ -85,28 +85,55 @@ pub const Filter = struct {
         self.exclude = null;
     }
 
-    pub fn accepts(self: *const Filter, elevel: i32, message: [*:0]const u8) bool {
+    /// `extra` are the event's remaining text fields (detail, hint, context
+    /// and, when captured, the query) as nullable C strings. The exclude
+    /// pattern is matched against all of them: a secret riding any field
+    /// must suppress the whole event, not just the message copy. include
+    /// stays message-only — its GUC docs promise "matching messages".
+    pub fn accepts(self: *const Filter, elevel: i32, message: [*:0]const u8, extra: []const ?[*:0]const u8) bool {
         if (elevel < self.level_min) return false;
         if (self.include) |*inc| if (!inc.matches(message)) return false;
-        if (self.exclude) |*exc| if (exc.matches(message)) return false;
+        if (self.exclude) |*exc| {
+            if (exc.matches(message)) return false;
+            for (extra) |f| if (f) |s| if (exc.matches(s)) return false;
+        }
         return true;
     }
 };
 
 test "level threshold" {
     var flt = Filter{ .level_min = 19 }; // WARNING
-    try std.testing.expect(!flt.accepts(15, "log"));
-    try std.testing.expect(flt.accepts(19, "warning"));
-    try std.testing.expect(flt.accepts(21, "error"));
+    try std.testing.expect(!flt.accepts(15, "log", &.{}));
+    try std.testing.expect(flt.accepts(19, "warning", &.{}));
+    try std.testing.expect(flt.accepts(21, "error", &.{}));
 }
 
 test "regex include/exclude" {
     var flt = Filter{};
     flt.include = Regex.compile("duplicate key.*") orelse return error.CompileFailed;
     defer flt.deinit();
-    try std.testing.expect(flt.accepts(15, "duplicate key value violates"));
-    try std.testing.expect(!flt.accepts(15, "relation not found"));
-    try std.testing.expect(!flt.accepts(19, "other message")); // include regex misses
+    try std.testing.expect(flt.accepts(15, "duplicate key value violates", &.{}));
+    try std.testing.expect(!flt.accepts(15, "relation not found", &.{}));
+    try std.testing.expect(!flt.accepts(19, "other message", &.{})); // include regex misses
+}
+
+test "exclude matches any text field, include stays message-only" {
+    var flt = Filter{};
+    flt.include = Regex.compile("detected.*") orelse return error.CompileFailed;
+    flt.exclude = Regex.compile("TOKEN-[0-9]+") orelse return error.CompileFailed;
+    defer flt.deinit();
+    const clean = [_]?[*:0]const u8{ null, "plain detail", "hint text" };
+    try std.testing.expect(flt.accepts(15, "detected anomaly", &clean));
+    // the token in any extra field suppresses the whole event
+    const in_detail = [_]?[*:0]const u8{"detail: TOKEN-42"};
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_detail));
+    const in_hint = [_]?[*:0]const u8{ null, null, "TOKEN-7" };
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_hint));
+    const in_query = [_]?[*:0]const u8{ null, null, null, "SELECT TOKEN-9" };
+    try std.testing.expect(!flt.accepts(15, "detected anomaly", &in_query));
+    // include still matches the message only: a detail-only match of the
+    // include pattern does not let the event through
+    try std.testing.expect(!flt.accepts(15, "unrelated", &[_]?[*:0]const u8{"detected in detail"}));
 }
 
 test "empty pattern compiles to always-match" {
@@ -240,6 +267,51 @@ pub fn redactPassword(dst: []u8, src: []const u8) Masked {
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
+/// Bind-parameter values ride in DETAIL as `Parameters: $1 = '...'` (put
+/// there by log_parameter_max_length — the errdetail shape in
+/// exec_bind_message/exec_execute_message) — the statement text carries
+/// only the $N placeholders, so the password token cut cannot see the secret.
+/// PG15/16 spell the prefix lower-case (`parameters:`), PG17+ capitalised
+/// it; both are ours to mask. On that one line shape every single-quoted
+/// value ('' inside is an escaped quote, not the end) becomes <REDACTED>;
+/// pgaudit parity — it does not log parameter values at all. Any other
+/// detail returns src untouched: text we do not recognize is not ours to
+/// rewrite. The values stay in the server's own log; only the export is
+/// masked.
+pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
+    const pfx_upper = "Parameters: ";
+    const pfx = if (std.mem.startsWith(u8, src, pfx_upper))
+        pfx_upper
+    else if (std.mem.startsWith(u8, src, "parameters: "))
+        "parameters: "[0..pfx_upper.len]
+    else
+        return .{ .text = src, .clipped = false };
+    var clipped = false;
+    var out_len = put(dst, src[0..pfx.len], &clipped);
+    var i = pfx.len;
+    while (i < src.len) {
+        if (src[i] != '\'') { // between values: `$1 = `, `, ` — verbatim
+            var end = i;
+            while (end < src.len and src[end] != '\'') end += 1;
+            out_len += put(dst[out_len..], src[i..end], &clipped);
+            i = end;
+            continue;
+        }
+        // quoted value: a lone ' ends it, '' is an escaped quote inside it
+        var end = i + 1;
+        while (end < src.len) {
+            if (src[end] != '\'') {
+                end += 1;
+            } else if (end + 1 < src.len and src[end + 1] == '\'') {
+                end += 2;
+            } else break;
+        }
+        out_len += put(dst[out_len..], redacted, &clipped);
+        i = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
+    }
+    return .{ .text = dst[0..out_len], .clipped = clipped };
+}
+
 /// Whole-match regex redaction: every match of the pattern becomes
 /// <REDACTED>. Same libc caveats as Regex (see the header note on
 /// backreferences).
@@ -301,6 +373,39 @@ test "password token cut" {
     const underscored = "user_passwords table";
     try std.testing.expect(redactPassword(&buf, underscored).text.ptr == underscored.ptr);
     try std.testing.expectEqualStrings("select 1", redactPassword(&buf, "select 1").text);
+}
+
+test "bind-parameter values masked on the Parameters line" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Parameters: $1 = <REDACTED>, $2 = <REDACTED>",
+        redactParamValues(&buf, "Parameters: $1 = 'hunter2', $2 = '42'").text,
+    );
+    // '' inside a value is an escaped quote, not the terminator
+    try std.testing.expectEqualStrings(
+        "Parameters: $1 = <REDACTED>",
+        redactParamValues(&buf, "Parameters: $1 = 'o''brien''s'").text,
+    );
+    // empty value still masked; unterminated tail (length-capped log) too
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = ''").text);
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'trunc").text);
+    // a value containing the word password rides the same mask
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'password x'").text);
+    // PG15/16 spell the prefix lower-case — same line, same mask
+    try std.testing.expectEqualStrings(
+        "parameters: $1 = <REDACTED>",
+        redactParamValues(&buf, "parameters: $1 = 'hunter2'").text,
+    );
+    // the gate is the exact errdetail shape: any other detail is not ours
+    // to rewrite
+    const foreign = "parameters $1 was 'x' and other detail text";
+    try std.testing.expect(redactParamValues(&buf, foreign).text.ptr == foreign.ptr);
+    try std.testing.expect(!redactParamValues(&buf, foreign).clipped);
+    // a mask run longer than the scratch clips at a UTF-8 boundary and reports
+    var small: [26]u8 = undefined;
+    const clipped = redactParamValues(&small, "Parameters: $1 = 'aaaaéééééééé'");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped.text));
 }
 
 test "redactor regex replace" {

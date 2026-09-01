@@ -30,7 +30,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
-- **Capture-time redaction** — the `password` token in statement text is cut before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
+- **Capture-time redaction** — the `password` token in statement text is cut and bind-parameter values in `DETAIL` are masked before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~45k events/s sustained for 5 minutes (OLTP overhead and latency percentiles, measured before/after the extension: [docs/bench.md](docs/bench.md)), and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
@@ -103,11 +103,12 @@ GUCs and restart again.
 | Option | Default | Context | Description |
 |---|---|---|---|
 | `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 23=PANIC — see the level table below). |
-| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at the 1024-byte message cap; matching runs in every logging backend). |
-| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching messages. |
+| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and the scan runs over the full `message_max` — a wider slot widens the worst case; matching runs in every logging backend). |
+| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. |
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. ⚠ sensitive — see below. |
 | `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; avoid backreferences (see `pattern`). |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
+| `pg_logtap.message_max` | `1024` (1024–1048576) | postmaster | Slot width for each event's `message` in bytes; longer messages are cut at a UTF-8 character boundary and named in `truncated`. Other fields stay 256 bytes. Shared memory cost is `ring_capacity × (message_max + ~2.4 KB)` — the default keeps the slot byte-identical to 0.3.x (≈3.4 KB); the max width with the max ring is ≈8.6 GB. Capture cost grows with the message's actual length, not the setting (~1.8 µs/KB — a 1 MB message adds ~1.9 ms in the logging backend; short messages pay microseconds as before). Check the receiver's line limit before raising it (see Receivers). |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
 | `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
 | `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
@@ -115,7 +116,7 @@ GUCs and restart again.
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
 | `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
-| `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot (~3.4 KB), touched only when parking falls behind. Clamped up to `ring_capacity`. |
+| `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
 | `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
@@ -189,8 +190,11 @@ in `events_dropped` — a live receiver should never get there.
 
 Leave it alone unless `/metrics` shows `events_dropped` growing while the
 receiver is up (spiky capture, e.g. `level_min = 10` debug storms or
-connection bursts on `log_connections`). Memory cost is `capacity × slot
-(≈3.4 KB)`: `8192` (the max) ≈ 28 MB of shared memory, paid at boot. A slow
+connection bursts on `log_connections`). Memory cost is `capacity ×
+(message_max + ~2.4 KB)` — ≈3.4 KB per slot at the default width
+(`8192` slots ≈ 28 MB, byte-identical to 0.3.x), ≈10.5 KB at
+`message_max = 8192` (≈86 MB), ≈1 MB at the maximum width (8192 slots
+≈ 8.6 GB — the extreme corner, paid at boot). A slow
 or dead receiver is *not* a ring problem — that is what `export_backlog_max`
 and the fallback file absorb (next section).
 
@@ -207,8 +211,18 @@ All SIGHUP — re-tune on a running cluster:
   park on the `export_fallback_file` instead of piling up in RAM while the
   receiver limps; `0` disables the parking.
 - `export_backlog_max` — RAM backlog depth before the oldest events are
-  trimmed (`events_lost`). Ceiling cost ≈ depth × 3.4 KB, paid only while
-  parking falls behind.
+  trimmed (`events_lost`). Ceiling cost ≈ depth × slot
+  (`message_max + ~2.4 KB`; ~65 × 3.4 KB = 220 MB at defaults), paid only
+  while parking falls behind.
+
+A production profile that removes the known capture cliffs, if you would
+rather not derive it from the formulas in [docs/delivery.md](docs/delivery.md):
+`ring_capacity = 8192` (postmaster; ~28 MB, ~8 s of absorption at 1 k ev/s)
+and `export_timeout_ms = 500` (SIGHUP) — together they keep capture
+drop-free through a receiver that accepts but stalls, the worst case for
+the ring (a dead one fails in milliseconds and parks on the fallback file).
+Add `export_fallback_file` and the loss window through any outage is the
+queue's, not RAM's.
 
 The full delivery contract — what is guaranteed, what is counted, and the
 loss boundaries per failure scenario — is
@@ -222,7 +236,7 @@ tokens, personal data — and two independent paths ship it: `field_query`
 (query text inside the `message` of duration lines, regardless of
 `field_query`). PostgreSQL itself logs those statements the same way, so the
 exposure follows your existing logging posture — but an export destination
-extends the audience. Two layers mask such text **at capture** — the ring,
+extends the audience. Three layers mask such text **at capture** — the ring,
 the fallback file and the receiver all hold the masked form only:
 
 - **Password cut, always on.** When the captured `query` field, or a
@@ -243,6 +257,14 @@ the fallback file and the receiver all hold the masked form only:
   A message that merely mentions the word (a warning, an app-level line) is
   not statement text and passes verbatim. The cut covers the common
   `PASSWORD '...'` shapes, not every way a secret can be encoded in SQL.
+- **Bind-value mask, always on.** With
+  `log_parameter_max_length`/`log_parameter_max_length_on_error` above `-1`,
+  PostgreSQL appends the actual bind values to the statement line's `DETAIL`
+  (`Parameters: $1 = '...'`) — the SQL text carries only `$N` placeholders, so
+  the password cut cannot see them. On that one line every quoted value
+  becomes `<REDACTED>` (`Parameters: $1 = <REDACTED>, $2 = <REDACTED>`);
+  other `DETAIL`s pass verbatim. The values still sit in the server's own
+  log — keep the GUCs at `-1` unless the values are the point.
 - **`pg_logtap.redact_pattern`** — a POSIX ERE applied to
   `message`/`detail`/`hint`/`context`/`query`; every match becomes
   `<REDACTED>`:
@@ -263,12 +285,12 @@ On top of that, the operational knobs:
 - keep `field_query` off (the default) and be deliberate about
   `log_min_duration_statement`;
 - keep `log_parameter_max_length`/`log_parameter_max_length_on_error` at
-  `-1` (the default): when they are set, PostgreSQL puts **bind-parameter
-  values** into the event's `DETAIL` — and the password cut never fires
-  there (its statement-marker gate applies to `message`/`query`), so a
-  bound secret ships unless your `redact_pattern` catches it;
-- `pg_logtap.pattern_exclude` suppresses whole events at capture — e.g.
-  `'PASSWORD|IDENTIFIED BY'` never leaves the server at all;
+  `-1` (the default) unless the values are the point: when set, bind values
+  reach `DETAIL` masked (see above) but still expand the event;
+- `pg_logtap.pattern_exclude` suppresses whole events at capture — the
+  pattern is matched against every text field of the event (message,
+  detail, hint, context and the captured query), so e.g.
+  `'PASSWORD|IDENTIFIED BY'` never leaves the server in any field;
 - scrub at the collector — Vector's `redact` transform (built-in filters for
   emails/SSNs/custom regex) still applies to whatever else slips through.
 
@@ -306,6 +328,13 @@ Not direct (put a collector in between): **Kafka** (binary protocol);
 doesn't do by design. Principle: pg_logtap is a dumb reliable transporter of a
 trivial format; transformation, TLS, auth and fan-out are the collector's job.
 
+Size limits to check before raising `message_max`: **VictoriaLogs** skips
+any ingest line longer than `-insert.maxLineSizeBytes` (default 256 KB)
+*without failing the request* — the insert answers 200 and the loss is
+visible only in the VL log; run it with the flag raised above
+`message_max + ~2 KB`. **nginx** in front of a receiver needs
+`client_max_body_size` above 4 MB (pg_logtap bodies chunk at 4 MB).
+
 ## Event Format
 
 One JSON object per line:
@@ -341,7 +370,8 @@ One JSON object per line:
 Notes: `sqlerrcode` is the canonical 5-char SQLSTATE string. `app` /
 `client_host` come from the session (`[local]` for unix sockets). `host` /
 `cluster` / `pgdata` identify the sending server. Fields are copied into
-fixed-size slots — `message` up to 1024 bytes, other fields up to 256; invalid
+fixed-size slots — `message` up to `pg_logtap.message_max` bytes (1024 by
+default), other fields up to 256; invalid
 bytes become U+FFFD. One event per log record, never split. A field can be cut
 for two different reasons, reported as separate arrays:
 `truncated` names fields that did not fit their slot (the tail is gone —

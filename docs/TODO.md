@@ -3,13 +3,6 @@
 Known ceilings and deferred designs — kept here so they are not re-derived
 from scratch when the need becomes real.
 
-- **Larger message slots** (`pg_logtap.message_max`, postmaster GUC): fields
-  are cut at 1024 (`message`) / 256 (others) bytes — measured fine for what
-  PostgreSQL itself emits (p99 ≈ 136 bytes in a debug-level storm), the
-  exception being `duration:` lines that embed full SQL text and chatty
-  applications. A GUC computed into the shmem slot layout at boot is the
-  cheap fix; the memory cost is visible up front
-  (`ring_capacity × (message_max + ~2.8 KB)`).
 - **Chained slots for oversized messages**: capture splits a long message
   across continuation ring slots under one LWLock hold, the worker joins
   them back into one event at export — no fixed per-slot tax, the ring pays
@@ -34,6 +27,14 @@ from scratch when the need becomes real.
   for it with a real audit requirement.
 - **IPv6 literal addresses** in `export_url` (bracket parsing in
   export.zig); hostnames with AAAA records already work.
+- **TLS / authentication on the export hop**: deliberately not in the
+  worker. The design is delegation — point `export_url` at a local sidecar
+  (Vector, Fluent Bit, stunnel, an nginx TLS terminator) on the same host
+  or network namespace, and terminate TLS there. That keeps the worker on
+  plain blocking sockets (its crash-safety budget), gives the full client-
+  cert/mTLS toolbox of a dedicated proxy, and matches how the rest of the
+  stack already ships logs. Revisit only if a deployment cannot run a
+  sidecar.
 - **Retry backoff**: exponential + jitter on send retries; the fixed
   `flush_interval` cadence is fine until a receiver rate-limits on connect
   storms.

@@ -68,7 +68,12 @@ scale 8, c=8 j=2, 300 s per job:
   (off-mute vs off-loud). Capturing every statement through pg_logtap is
   cheaper than what PostgreSQL itself spends writing those lines to stderr.
 - Worker RSS at that rate: 41 MB. Ring shmem is fixed by
-  `pg_logtap.ring_capacity` (~3.4 KB per slot).
+  `pg_logtap.ring_capacity` × (`message_max` + ~2.4 KB) — ≈3.4 KB per slot at
+  the default width, byte-identical to 0.3.x.
+- Wide messages (0.4.0): the hook's added cost scales with the message's
+  actual length at ~1.8 µs/KB (measured on pg18: a 1 MB WARNING costs ~1.9 ms
+  in the backend vs ~4 µs for a 1 KB one; a raised `message_max` alone costs
+  short messages nothing — the slot is touched only for `message_len` bytes).
 - Capture→receiver latency (on-loud, n=13.7M): p50 = 0.8 ms, p95 = 1.5 ms,
   p99 = 1.9 ms. The 643 s max is an artifact of the one-shot benchmark
   receiver printing 13.7M lines through the docker logs pipe — the batch sat

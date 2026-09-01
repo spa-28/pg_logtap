@@ -51,6 +51,10 @@ ok() { echo "  ok: $*"; }
 [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
   || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
+# the ready gate is a one-shot that stays exited/0 forever; a run that failed
+# inside backlog-bound leaves the receiver stopped and the next run would
+# fail its first scenario on a dead hostname — start is a no-op when running
+docker start "$VEC" >/dev/null 2>&1 || true
 mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
 
 setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
@@ -96,6 +100,17 @@ wait_for() { # wait_for <marker> <count> [tries]
   done
 }
 
+# Wait for the worker to empty the ring: markers emitted into a full ring
+# are dropped at emit (counted in events_dropped, never delivered).
+drain_ring() {
+  n=0
+  while [ "$n" -lt 60 ]; do
+    [ "$(statf ring_events)" = 0 ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "ring never drained (ring_events=$(statf ring_events))"
+}
+
 # Every delivered marker line must parse as JSON — a torn slot or a botched
 # sanitization would surface here as invalid JSON or broken UTF-8.
 json_check() { # json_check <marker>: prints "json_ok <n>"
@@ -117,6 +132,12 @@ echo "== huge fields: message and detail past their ring slots =="
 # changes what this one must observe.
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+# A previous run may have left the ring full of undrained backlog; markers
+# emitted into a full ring are dropped at emit (counted, never delivered)
+# and the first scenario would time out on them. Also fires on a freshly
+# configured stand only after export_url is set above — an empty URL parks
+# the worker's sends by design.
+drain_ring
 # 8k multibyte chars (16 KB into a 1024-byte slot) + a 2 KB detail (256-byte
 # slot): the cut points land mid-character — the copy must back off to the
 # char boundary and name both fields in "truncated".
@@ -279,6 +300,101 @@ EOF
 setguc log_min_duration_statement -1; reload
 ok "extended-protocol parse/execute duration lines get the password cut"
 
+# Bind parameters: with log_parameter_max_length the server puts the actual
+# values into DETAIL ("parameters: $1 = '...'") on statement lines — the SQL
+# carries only $N placeholders, so the token cut cannot see the secret. The
+# bind-value layer masks every quoted value on that line. psql \bind is psql
+# 16+; PG15 gets the same contract through pgbench -M extended (client
+# variables leave as real bind parameters). The DETAIL prefix is
+# lower-case on PG15/16 ("parameters:"), capitalised on PG17+ — asserts
+# accept both shapes.
+setguc log_min_duration_statement 0; setguc log_parameter_max_length 100; reload; sleep 1
+vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
+if [ "$vnum" -ge 160000 ]; then
+  # -i: without it docker exec does not forward stdin, psql reads an empty
+  # buffer and silently runs nothing
+  docker exec -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF || true
+SELECT 'bindtag$SUF' AS tag, \$1::text, \$2::text \bind 'SECRET-bind$SUF-xyz789' 'pw''d'
+\g
+EOF
+  n=0; while [ "$n" -lt 20 ]; do
+    [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "bindtag$SUF")" -gt 0 ] && break
+    n=$((n + 1)); sleep 1
+  done
+  python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: bind-parameter values masked"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-bind" + suf not in whole, "bind value reached the receiver via DETAIL"
+saw = 0
+for line in whole.splitlines():
+    if "bindtag" + suf not in line:
+        continue
+    e = json.loads(line)
+    m, d = e.get("message") or "", e.get("detail") or "" # null ≠ absent in JSON
+    if "duration:" in m and d.lower().startswith("parameters:"):
+        # every quoted value masked, the $N keys and structure verbatim
+        assert d.startswith(("Parameters: $1 = <REDACTED>", "parameters: $1 = <REDACTED>")), d
+        assert d.endswith("$2 = <REDACTED>"), d
+        assert "SECRET" not in d and "pw" not in d, d
+        saw += 1
+assert saw > 0, "no bind-parameter detail lines reached the receiver"
+EOF
+else
+  # PG15: no psql \bind — drive extended protocol with pgbench. -f script
+  # keeps the secret OUT of the SQL text (:var leaves as a bind parameter,
+  # the DETAIL is where it surfaces; the quoted :'v' form is NOT replaced
+  # in extended mode — plain :v is); the tag literal is the marker.
+  docker exec "$PG_CT" sh -c "cat > /tmp/p15bind.sql <<EOF
+SELECT 'p15bind$SUF' AS tag, :v::text;
+EOF"
+  docker exec "$PG_CT" pgbench -U postgres -M extended -t 1 -c 1 \
+    -f /tmp/p15bind.sql -D "v=SECRET-p15bind$SUF-xyz789" postgres >/dev/null 2>&1 || true
+  docker exec "$PG_CT" rm -f /tmp/p15bind.sql
+  n=0; while [ "$n" -lt 20 ]; do
+    [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "p15bind$SUF")" -gt 0 ] && break
+    n=$((n + 1)); sleep 1
+  done
+  python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: bind-parameter values masked (pgbench path)"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+assert "SECRET-p15bind" + suf not in whole, "bind value reached the receiver via DETAIL"
+saw = 0
+for line in whole.splitlines():
+    if "p15bind" + suf not in line:
+        continue
+    e = json.loads(line)
+    m, d = e.get("message") or "", e.get("detail") or ""
+    if "duration:" in m and d.lower().startswith("parameters:"):
+        assert d.startswith(("Parameters: $1 = <REDACTED>", "parameters: $1 = <REDACTED>")), d
+        assert "SECRET" not in d, d
+        saw += 1
+assert saw > 0, "no bind-parameter detail lines reached the receiver"
+EOF
+fi
+setguc log_min_duration_statement -1; setguc log_parameter_max_length -1; reload
+ok "bind-parameter values masked on the parameters line"
+
+# pattern_exclude matches the whole event text, not just the message: the
+# token rides DETAIL (where RAISE ... USING DETAIL puts it) — the event must
+# not ship at all, while a token-free neighbor emitted right after it flows.
+setguc pg_logtap.pattern_exclude "HIDEME$SUF"; reload; sleep 1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'exc-suppressed$SUF message is clean'
+  USING DETAIL = 'detail carries HIDEME$SUF';
+END \$\$" >/dev/null 2>&1
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'exc-control$SUF no token anywhere';
+END \$\$" >/dev/null 2>&1
+wait_for "exc-control$SUF" 1 10
+[ "$(grep -c "exc-suppressed$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
+  || fail "pattern_exclude: event with the token in DETAIL reached the receiver"
+[ "$(grep -c "HIDEME$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
+  || fail "pattern_exclude: the DETAIL token itself reached the receiver"
+ok "pattern_exclude suppresses an event whose DETAIL carries the token"
+setguc pg_logtap.pattern_exclude ''; reload
+
 echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # pgbench drives sustained statement logging (every duration line is a
 # captured event from a client backend); one of its backends is SIGKILLed
@@ -359,6 +475,13 @@ peak=$(docker exec "$PG_CT" cat /sys/fs/cgroup/memory.peak 2>/dev/null || \
   || fail "backlog-bound: cgroup memory peak ${peak}B touched the ${OOM_LIMIT_MB}MB ceiling"
 docker update --memory 0 --memory-swap 0 "$PG_CT" >/dev/null
 docker start "$VEC" >/dev/null; wait_vector
+# wait_vector only proves the listener socket is back. The worker is still
+# holding the storm backlog (its connect was parked on the dead receiver for
+# the whole outage): the ring stays full for seconds while it drains, and
+# markers emitted into a full ring are dropped at emit — by design, counted
+# in events_dropped. Delivery resuming = the drain finishing; only then can
+# fresh post-recovery events be expected to arrive.
+drain_ring
 gen oom4 20; wait_for oom4 20
 [ "$(received oom4)" = 20 ] || fail "backlog-bound: no delivery after recovery (oom4=$(received oom4)/20)"
 acc3() { # sent + lost + dropped from one stats call
@@ -385,6 +508,31 @@ drpd=$(( $(statf events_dropped) - bdrp )); lostd=$(( $(statf events_lost) - blo
 [ $((drpd + lostd)) -ge 40000 ] \
   || fail "backlog-bound: the bound was never exercised (dropped=$drpd lost=$lostd of 60000)"
 ok "worker RSS ${rss0}→${rss1}kB (bounded), cgroup ceiling ${OOM_LIMIT_MB}MB never touched (peak ${peak:-?}B), accounted: emitted=$((capd + drpd)) = captured=$capd + dropped=$drpd, captured = sent=$sentd + lost=$lostd, delivery resumed"
+
+echo "== redact gauge assign under live lock traffic =="
+# The redact_pattern assign hook also runs in the postmaster on its own SIGHUP
+# reload, and the gauge update takes the ring LWLock — contended there, it
+# would PANIC ("cannot wait without a PGPROC structure") and take the whole
+# cluster down. The capture-side MyProc gate must keep the postmaster off the
+# lock; the window needs live lock traffic to matter, so flip an invalid
+# pattern through several reloads while backends push logged statements. Runs
+# AFTER the memory-peak assert on purpose: statement-rate logging at the
+# default backlog depth is what that assert exists to forbid.
+# Backlog is still clamped to 8192 by the scenario above, so the burst's RAM
+# cost is the documented ~28MB, not a GUC-default surprise.
+setguc log_min_duration_statement 0; reload
+docker exec "$PG_CT" sh -c "printf '%s\n' 'SELECT 1;' > /tmp/probe-load$SUF.sql"
+docker exec -d "$PG_CT" pgbench -U postgres -c 4 -T 12 -f "/tmp/probe-load$SUF.sql" postgres
+flip=0
+while [ "$flip" -lt 8 ]; do
+  setguc pg_logtap.redact_pattern "[reload-under-load-$flip"
+  reload; sleep 1
+  flip=$((flip + 1))
+done
+docker exec "$PG_CT" psql -U postgres -qc "SELECT 1" >/dev/null 2>&1 || fail "redact_pattern reload under load crashed the server"
+[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid pattern under load did not set redact_pattern_failed=1"
+setguc pg_logtap.redact_pattern ''; setguc log_min_duration_statement -1; reload; sleep 1
+ok "redact_pattern reloaded 8x under pgbench statement load: postmaster survived, gauge set"
 
 dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "$dups duplicate seqs across the suite"
