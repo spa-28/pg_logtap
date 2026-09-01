@@ -216,9 +216,15 @@ echo "== torn queue tail: crash mid-append =="
 # walk) must cut the file back to the member boundary and append there —
 # not disable replay, not misparse the framing.
 since0=$(date -u +%Y-%m-%dT%H:%M:%S)
+# Write the template while the fallback is still off (export_fallback_file=''
+# since the previous scenario) — the worker does not open the file at all.
+# Writing it after the reload instead raced the worker's own appends: parking
+# had already started (receiver pointed at a dead port), and the interleaved
+# writes left garbage at offset 8, which the boot walk then rightfully reported
+# as framing corrupt instead of cutting the torn member (seen on pg16).
+docker exec "$PG_CT" sh -c "printf 'PGLTFB01' > '$FB'; printf '\350\003\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload
-docker exec "$PG_CT" sh -c "printf 'PGLTFB01' > '$FB'; printf '\350\003\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 sleep 2 # boot queue walk reads the file and truncates the torn tail
 gen torn1 20; sleep 3 # parks at the member boundary the walk left
