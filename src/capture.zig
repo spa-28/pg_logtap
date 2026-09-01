@@ -228,15 +228,18 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     // an ordinary message mentioning the word is untouched.
     const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
     const stmt_line = filter.stmtLine(msg_span);
-    const msg_bytes = copyMsg(&entry, d.message, stmt_line);
+    const msg_bytes = copyMsg(&entry, d.message, if (stmt_line) .tail else .none);
     // Bind values (log_parameter_max_length) ride DETAIL on statement lines —
     // the secret sits there, not in the placeholder SQL the token cut sees.
-    copyText(&entry.detail, &entry, .detail, d.detail, false, stmt_line);
-    copyText(&entry.hint, &entry, .hint, d.hint, false, false);
-    copyText(&entry.context, &entry, .context, d.context, false, false);
+    // Off statement lines detail/hint/context get the value cut: secrets echo
+    // next to a password token (RAISE ... USING DETAIL, error text) are
+    // masked, PG's own diagnostics text survives.
+    copyText(&entry.detail, &entry, .detail, d.detail, .value, stmt_line);
+    copyText(&entry.hint, &entry, .hint, d.hint, .value, false);
+    copyText(&entry.context, &entry, .context, d.context, .value, false);
     copyStr(&entry.filename, &entry, .filename, d.filename);
     copyStr(&entry.funcname, &entry, .funcname, d.funcname);
-    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, true, false);
+    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, .tail, false);
 
     lockRing();
     const was_empty = state.count == 0;
@@ -255,15 +258,23 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
     ring.setStr(dst, &entry.truncated_mask, field, std.mem.span(@as([*:0]const u8, @ptrCast(src))));
 }
 
-/// Run text through the redaction layers: the `password` token cut (pw —
-/// query field always, statement-embedded message lines) or the bind-value
-/// mask (bind_params — DETAIL on statement lines; the two never coexist on
-/// one field) into one scratch buffer, then the redact_pattern regex over
-/// the result into the other. Layers that cannot change the text copy
-/// nothing.
-fn maskThroughLayers(text: []const u8, pw: bool, bind_params: bool) filter.Masked {
+/// Which password cut a field gets: none; the tail cut (query and
+/// statement-embedded message lines — everything after a standalone
+/// `password` token goes, pgaudit semantics); or the value cut
+/// (detail/hint/context — only a quoted value assigned to the token is
+/// masked, so PG's own `password authentication failed for user "x"`
+/// diagnostics survive verbatim).
+const PwCut = enum { none, tail, value };
+
+/// Run text through the redaction layers: the password cut (pw — see PwCut)
+/// or the bind-value mask (bind_params — DETAIL on statement lines; the two
+/// never coexist on one field) into one scratch buffer, then the
+/// redact_pattern regex over the result into the other. Layers that cannot
+/// change the text copy nothing.
+fn maskThroughLayers(text: []const u8, pw: PwCut, bind_params: bool) filter.Masked {
     var out = filter.Masked{ .text = text, .clipped = false };
-    if (pw) out = filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text);
+    if (pw == .tail) out = filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text);
+    if (pw == .value) out = filter.redactPasswordValue(redact_a[0 .. messageMax() + 1], out.text);
     if (bind_params) out = filter.redactParamValues(redact_a[0 .. messageMax() + 1], out.text);
     if (redactor) |*red| out = red.apply(redact_b[0 .. messageMax() + 1], out.text);
     return out;
@@ -273,7 +284,7 @@ fn maskThroughLayers(text: []const u8, pw: bool, bind_params: bool) filter.Maske
 /// A layer that had to clip sets the field's redacted bit itself: setStr
 /// cannot, because the clipped result fits the slot — and the cause is the
 /// clip, not the slot.
-fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: bool, bind_params: bool) void {
+fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: PwCut, bind_params: bool) void {
     if (src == null) return;
     const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, bind_params);
     ring.setStr(dst, &entry.truncated_mask, field, masked.text);
@@ -286,7 +297,7 @@ fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src:
 /// copied slice is returned for ring.push — it must
 /// survive until push, and the layers' own buffer (redact_b) does not: the
 /// next copyText overwrites it.
-fn copyMsg(entry: *ring.ShmLogEntry, src: [*c]const u8, pw: bool) []const u8 {
+fn copyMsg(entry: *ring.ShmLogEntry, src: [*c]const u8, pw: PwCut) []const u8 {
     const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, false);
     const held = ring.setMsg(&entry.message_len, &entry.truncated_mask, masked.text, msg_hold[0..messageMax()]);
     if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(ring.TruncField.message));

@@ -178,19 +178,27 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redq$SUF 0 benign password note'; END \$do\$; -- password 'SECRET-do$SUF-abc123'" \
   >/dev/null 2>&1 || true
 setguc pg_logtap.redact_pattern 'SECRET-[a-z0-9-]+'; reload; sleep 1
+# Before the pattern switches on — the DETAIL probes below must be masked by
+# the password VALUE cut alone: a secret assigned to the token is masked,
+# PG's own "password authentication failed" phrasing survives verbatim.
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redd$SUF 0' USING DETAIL = 'password = ''SECRET-det$SUF-xyz789'' and user alice';
+  RAISE WARNING 'logtap robust redd$SUF 1' USING DETAIL = 'password authentication failed for user \"alice\"';
+  END \$do\$" >/dev/null 2>&1 || true
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redp$SUF 0 token=SECRET-msg$SUF-abc123'; END \$do\$" \
   >/dev/null 2>&1 || true
-wait_for redq 1 20; wait_for redp 1 20
+wait_for redq 1 20; wait_for redp 1 20; wait_for redd 2 20
 # vector-out.jsonl accumulates across runs BY DESIGN: the secrets carry this
 # run's suffix so stale lines from earlier runs cannot fail this one.
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: contract"
 import json, sys
 path, suf = sys.argv[1], sys.argv[2]
 whole = open(path, encoding="utf-8").read()
-for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123"):
+for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123",
+               "SECRET-det" + suf + "-xyz789"):
     assert secret not in whole, secret + " reached the receiver unmasked"
-q = p = role = False
+q = p = role = det = False
 for line in whole.splitlines():
     if "logtap robust red" not in line:
         continue
@@ -205,6 +213,13 @@ for line in whole.splitlines():
     if m.startswith("logtap robust redp" + suf):
         assert "<REDACTED>" in m, m  # redact_pattern fired at capture
         p = True
+    if m.startswith("logtap robust redd" + suf):
+        d = e.get("detail") or ""
+        if m.endswith(" 0"):  # assigned value masked, surrounding text intact
+            assert d == "password = <REDACTED> and user alice", repr(d)
+        else:  # PG's standard failure phrasing: not ours to rewrite
+            assert d == 'password authentication failed for user "alice"', repr(d)
+        det = True
 for line in whole.splitlines():  # the role's duration line has no red marker
     if "tmp_red" + suf not in line:
         continue
@@ -213,7 +228,7 @@ for line in whole.splitlines():  # the role's duration line has no red marker
     if "CREATE ROLE" in m:
         assert "<REDACTED>" in m, m
         role = True
-assert q and p and role, "probe events missing (q=%s p=%s role=%s)" % (q, p, role)
+assert q and p and role and det, "probe events missing (q=%s p=%s role=%s det=%s)" % (q, p, role, det)
 EOF
 # truncated vs redacted are two different causes for a cut field (LT-1): a
 # redaction that expands past the scratch cap clips WITHOUT slot-truncating
