@@ -71,6 +71,15 @@ phase_stand() { # <v>: build, compose stand, deploy + install the extension
   # -v: the anon data volume follows the compose project, not the major —
   # without it a full local run hands pg16 a data dir initdb'd by pg15
   # ("database files are incompatible with server") and the stand never boots.
+  # The project's pg service may currently live under ANOTHER major's name
+  # (the run just finished pg16, pg17 starts): compose tracks containers by
+  # project+service labels and would recreate THAT one into this major's
+  # name, carrying its anon data volume over (observed: pg17 booting a
+  # pg16 data dir). Remove the service container by label, not just by
+  # this major's name — then `up` always creates fresh, with a fresh volume.
+  docker ps -aq --filter "label=com.docker.compose.project=pglogtap-e2e" \
+    --filter "label=com.docker.compose.service=pg" \
+    | xargs -r docker rm -f -v >/dev/null 2>&1 || true
   docker rm -f -v "$C" >/dev/null 2>&1 || true # stale same-name container
   if ! PG_MAJOR=$v PG_CT=$C $COMPOSE up -d --no-deps pg >/dev/null; then
     echo "pg$v: compose could not start pg" >&2
