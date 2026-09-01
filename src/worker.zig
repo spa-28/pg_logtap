@@ -84,9 +84,24 @@ var send_conn_fd: c_int = -1;
 /// timeout alone cannot bound (a dribbling receiver makes ONE send unbounded).
 var send_deadline_us: i64 = 0;
 
+/// The compaction's own bound. A normal flush cycle has a 1s budget
+/// (cycle_deadline) that sendAborted() cannot see — send_deadline_us is set
+/// only during shutdown — so without this a cap/2 rewrite could hold the
+/// worker past the whole cycle, starving drainInto, /metrics and SIGHUP.
+/// Set per flushAll; 0 = only the shutdown deadline applies (the final park
+/// runs under sendAborted, as before).
+var compact_deadline_us: i64 = 0;
+
 fn sendAborted() bool {
     if (got_sigterm.read() >= 2) return true;
     return send_deadline_us != 0 and pg.GetCurrentTimestamp() > send_deadline_us;
+}
+
+/// The compaction aborts on either deadline: the cycle budget in a normal
+/// flush, the shutdown budget during the final one.
+fn compactAborted() bool {
+    if (compact_deadline_us != 0 and pg.GetCurrentTimestamp() > compact_deadline_us) return true;
+    return sendAborted();
 }
 
 pub fn init() void {
@@ -202,6 +217,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         return;
     };
     defer send_deadline_us = 0; // zero for normal cycles regardless
+    defer compact_deadline_us = 0;
     if (final) send_deadline_us = pg.GetCurrentTimestamp() + 1_000_000 + @as(i64, guc_export_timeout_ms) * 1000;
 
     var sent: u64 = 0; // delivered by a live send
@@ -222,6 +238,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // up in a local and flushed minutes late. The next cycle resumes 100ms
     // later; a fast receiver still drains a full backlog in one call.
     const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
+    // The compaction shares the cycle's budget: a cap/2 rewrite mid-cycle
+    // that ignores it holds the worker past drainInto/metrics/SIGHUP until
+    // the rewrite finishes (sendAborted() cannot bound it — no shutdown).
+    if (!final) compact_deadline_us = cycle_deadline;
     var drained_total: usize = 0; // live inflow this flushAll call
     while (final or !got_sigterm.isSet()) {
         if (pg.GetCurrentTimestamp() > cycle_deadline) {
@@ -893,9 +913,10 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
 /// directory fsync); any failure leaves the file as it was — the next append
 /// past the cap retries. Ceiling: a cap smaller than one member bounds the
 /// file only at member granularity. Runs under the cycle's abort budget:
-/// the member-count walk and the copy loop check sendAborted() between
-/// syscalls, so a shutdown flush never waits out a cap/2 rewrite — the
-/// untouched original simply retries on the next append past the cap.
+/// the member-count walk and the copy loop check compactAborted() between
+/// syscalls — the flush cycle's own budget mid-cycle, send_deadline during
+/// shutdown — so neither ever waits out a cap/2 rewrite: the untouched
+/// original simply retries on the next append past the cap.
 fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     const cap_bytes: u64 = @as(u64, @intCast(@max(guc_fallback_max_mb, 0))) << 20;
     if (cap_bytes == 0 or size <= cap_bytes) return;
@@ -907,7 +928,7 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     var off: u64 = fb_magic_len;
     var lost_events: u64 = 0;
     while (off + 4 <= size) {
-        if (sendAborted()) return;
+        if (compactAborted()) return;
         var len_buf: [4]u8 = undefined;
         if (fbPread(file_fd, &len_buf, off) != 4) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
@@ -961,6 +982,10 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     while (copied_ok and pos < size) {
         // Abortable unlike the parked-backlog writes: the members are durable
         // in the original, so an aborted rewrite is a wasted tmp, not a loss.
+        if (compactAborted()) { // mid-cycle: hand the worker back, retry later
+            copied_ok = false;
+            break;
+        }
         const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
         const got = fbPread(file_fd, copy_buf[0..want], pos);
         if (got <= 0) { // 0 = EOF; -1 = read error — both abort the rewrite
