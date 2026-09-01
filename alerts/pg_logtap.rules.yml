@@ -10,9 +10,13 @@ groups:
         annotations:
           summary: "pg_logtap lost events on {{ $labels.instance }}"
           description: >-
-            Backlog overflow: the receiver was down or too slow for longer
-            than ring_capacity / events_per_s, and oldest events were dropped.
-            Loss is bounded by the backlog; see docs/delivery.md.
+            Events are permanently gone. Causes, in order of likelihood:
+            backlog overflow (receiver down or too slow with no fallback
+            file — loss bounded by export_backlog_max); the fallback file's
+            fallback_max_mb cap trimming undelivered members during a long
+            outage (cross-check pg_logtap_events_compacted_total — the
+            outage outlasted the queue); or an unreadable queue member
+            skipped at replay. See docs/delivery.md.
       - alert: PgLogtapRingDropped
         expr: increase(pg_logtap_events_dropped_total[5m]) > 0
         labels:

@@ -21,10 +21,6 @@ from scratch when the need becomes real.
   counter-glossary note in delivery.md). Requires a framing format bump
   (`PGLTFB01` → `02`); pick up when a queue large enough for the startup
   scan to matter is seen in the wild (642 MB scanned in ~1 s today).
-- **Multi-field pattern matching**: `redact_pattern`/password-cut match the
-  message only; DETAIL carries bind parameters (see README, redaction
-  contract). Extend to message+detail+hint+context+query when someone asks
-  for it with a real audit requirement.
 - **IPv6 literal addresses** in `export_url` (bracket parsing in
   export.zig); hostnames with AAAA records already work.
 - **TLS / authentication on the export hop**: deliberately not in the

@@ -59,8 +59,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.3.0/pg_logtap-0.3.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.3.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.0/pg_logtap-0.4.0-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.4.0-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -397,7 +397,7 @@ monitoring user needs it. The counters (`pg_logtap_stats()`,
 Event counters — same names in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition (each event counted
 once per lifecycle stage it passes; stuck in the fallback queue right now =
-`events_queued - events_replayed`):
+`events_queued - events_replayed - events_compacted`):
 
 | counter | unit | grows when |
 |---|---|---|
@@ -406,16 +406,19 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `events_sent` | events | delivered to the export URL by a live send |
 | `events_queued` | events | durably appended to the fallback file |
 | `events_replayed` | events | delivered out of the fallback file after recovery |
-| `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — or an unreadable queue member |
+| `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while still undelivered (also counted in `events_lost`, never in `delivered`) |
+| `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable queue member, or the `fallback_max_mb` cap trimming undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
 The view adds two derived columns: `queue_backlog` (`events_queued −
-events_replayed`, stuck in the file right now) and `delivered`
-(`events_sent + events_replayed`, everything handed to a receiver).
+events_replayed − events_compacted`, stuck in the file right now) and
+`delivered` (`events_sent + events_replayed`, everything handed to a
+receiver).
 
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
-events_sent,events_queued,events_replayed,send_cycles_failed,events_lost}_total`
+events_sent,events_queued,events_replayed,events_compacted,
+send_cycles_failed,events_lost}_total`
 (counters) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
