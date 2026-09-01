@@ -1276,7 +1276,7 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
         .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
     };
     if (net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
-        or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
+    or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
         // A socket the timeouts did not land on would block the single
         // worker loop forever — the exact hang they exist to prevent. Cancel
         // the attempt (the batch retries like any dead receiver) instead of
