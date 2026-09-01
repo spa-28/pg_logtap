@@ -17,6 +17,9 @@ SINK=pglogtap-slow
 
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
+
 # socat forks per connection; the background (sleep N; printf) answers with a
 # bare 200 after N seconds while `cat` drains the request body. N=1: every
 # send succeeds (failure path never fires) yet every send is "slow".

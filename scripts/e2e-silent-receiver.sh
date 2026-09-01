@@ -17,6 +17,8 @@ SINK=pglogtap-silent
   echo "e2e-silent: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
   exit 1
 }
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
 # 1s timeout, fallback file on: failed sends must divert, not lose.

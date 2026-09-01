@@ -19,4 +19,9 @@ docker cp zig-out/lib/pg_logtap.so "$C:$LIBDIR/"
 docker cp pg_logtap.control "$C:$EXTDIR/"
 for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done
 
-echo "deployed to $C ($LIBDIR)"
+# The postmaster keeps the .so it was started with — a copied-over library
+# changes nothing until restart. Restart (or start) and prove the load.
+docker restart "$C" >/dev/null
+"$(dirname "$0")/e2e-require-ext.sh" "$C"
+
+echo "deployed to $C ($LIBDIR), server restarted on the new .so"

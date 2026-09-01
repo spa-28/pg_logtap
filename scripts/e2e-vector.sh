@@ -14,6 +14,8 @@ NET=pglogtap-e2e_default
   echo "e2e-vector: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
   exit 1
 }
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
 # Point pg_logtap at Vector (URL is re-read every flush cycle, no restart

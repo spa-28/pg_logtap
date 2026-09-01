@@ -77,6 +77,8 @@ wait_vector() { # until the receiver actually accepts TCP again after the
 # receiver port answering at boot (tests/e2e/compose.yaml, `ready`).
 [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
   || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
 
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN:
