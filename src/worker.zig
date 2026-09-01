@@ -941,8 +941,20 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     // self-contained; no recompression).
     var tmp_buf: [4096]u8 = undefined;
     const tmp_path = fbCompactPath(&tmp_buf) orelse return;
-    const tmp_fd = c.open(tmp_path, 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
-    if (tmp_fd < 0) return;
+    // The temp must be exclusively ours: a predictable name opened with
+    // O_TRUNC follows a symlink planted in a writable directory (truncating
+    // its target, and the rename would then put that symlink in the queue's
+    // place). O_EXCL|O_NOFOLLOW refuse both; the EEXIST case is our own
+    // litter from a crashed compaction — unlink it (never a symlink's
+    // target) and retry once. Anything still in the way aborts quietly:
+    // the original queue stands, the cap retries on the next append.
+    const tmp_flags = 2 | 64 | 128 | 131072; // O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
+    var tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
+    if (tmp_fd < 0) {
+        if (c.unlink(tmp_path) != 0) return;
+        tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
+        if (tmp_fd < 0) return;
+    }
     var copied_ok = writeAll(tmp_fd, fb_magic, false);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
