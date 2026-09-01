@@ -78,6 +78,15 @@ var got_sighup = interrupts.Signal.new(0);
 /// the slot before their own close, so a recycled fd number is never hit.
 var send_conn_fd: c_int = -1;
 
+/// The one sanctioned way an in-flight send socket goes away. The
+/// double-SIGTERM handler closes it to punch blocking I/O; the sender's
+/// defer must not then close the same number again after a recycle. Both
+/// routes go through here so the slot and the fd always move together.
+fn closeSendFd(fd: c_int) void {
+    if (send_conn_fd == fd) send_conn_fd = -1;
+    _ = c.close(fd);
+}
+
 /// Final-flush abort state: 0 outside a graceful-shutdown flush. The deadline
 /// bounds the whole flush to ~1s of work plus one send timeout; sendAborted()
 /// is checked between partial-write syscalls, which a per-syscall socket
@@ -1081,10 +1090,7 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // failed.
     const conn_fd = dialTcp(h.host, h.port) orelse return false;
     send_conn_fd = conn_fd;
-    defer {
-        if (send_conn_fd == conn_fd) send_conn_fd = -1;
-        _ = c.close(conn_fd);
-    }
+    defer closeSendFd(conn_fd);
     // Fixed headers (method line, Host, content type/encoding/length) run
     // ~110 bytes; 2048 leaves room for any realistic path and host, and one
     // that still does not fit fails the send with the reason — not a torn
@@ -1110,10 +1116,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
     // As sendHttp: the dial path already recorded why it failed.
     const conn_fd = fd_opt orelse return false;
     send_conn_fd = conn_fd;
-    defer {
-        if (send_conn_fd == conn_fd) send_conn_fd = -1;
-        _ = c.close(conn_fd);
-    }
+    defer closeSendFd(conn_fd);
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     return true;
 }
@@ -1272,8 +1275,17 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
         .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
         .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
     };
-    _ = net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
-    _ = net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
+    if (net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
+        or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
+        // A socket the timeouts did not land on would block the single
+        // worker loop forever — the exact hang they exist to prevent. Cancel
+        // the attempt (the batch retries like any dead receiver) instead of
+        // proceeding without the guarantee.
+        const err = std.c._errno().*;
+        _ = c.close(conn_fd);
+        _ = failSend("setsockopt", err);
+        return null;
+    }
     if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
     const err = std.c._errno().*;
     _ = c.close(conn_fd);
@@ -1432,10 +1444,7 @@ fn handleTerm(sig: c_int) callconv(.c) void {
     // demands immediate exit (see send_conn_fd).
     const n = got_sigterm.read() + 1;
     got_sigterm.set(n);
-    if (n >= 2 and send_conn_fd >= 0) {
-        _ = c.close(send_conn_fd);
-        send_conn_fd = -1;
-    }
+    if (n >= 2 and send_conn_fd >= 0) closeSendFd(send_conn_fd);
     if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
 }
 
