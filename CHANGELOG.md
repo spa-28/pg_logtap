@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (in PR #12, unreleased)
+## 0.4.0 (2026-09-01)
 
 ### Added
 
