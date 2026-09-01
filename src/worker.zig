@@ -1241,8 +1241,8 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     dns_fail_streak = 0;
     defer if (res) |r| net.freeaddrinfo(r);
 
-    var it = res;
-    while (it) |ai| : (it = ai.next) {
+    var addr_iter = res;
+    while (addr_iter) |ai| : (addr_iter = ai.next) {
         if (dialAddr(ai.addr.?, ai.addrlen, ai.family)) |conn_fd| {
             if (host.len <= dns_good_host.len and ai.addrlen <= dns_good_addr.len) {
                 @memcpy(dns_good_host[0..host.len], host);

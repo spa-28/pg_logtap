@@ -55,7 +55,14 @@ pub fn build(b: *std.Build) void {
     lint_step.dependOn(step: {
         var builder = zlinter.builder(b, .{});
         builder.addRule(.{ .builtin = .field_naming }, .{});
-        builder.addRule(.{ .builtin = .declaration_naming }, .{});
+        // zlinter's defaults whitelist one-letter names (x/y/z/i/b/it/...) as
+        // warnings the build survives; here a name under three chars is an
+        // error. The only exemption is `c` — worker.zig's C-declaration
+        // module alias, same standing as `std`.
+        builder.addRule(.{ .builtin = .declaration_naming }, .{
+            .decl_name_min_len = .{ .len = 3, .severity = .@"error" },
+            .decl_name_exclude_len = &.{"c"},
+        });
         builder.addRule(.{ .builtin = .function_naming }, .{});
         builder.addRule(.{ .builtin = .file_naming }, .{});
         builder.addRule(.{ .builtin = .switch_case_ordering }, .{});

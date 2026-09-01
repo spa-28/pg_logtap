@@ -196,13 +196,13 @@ fn isIdentChar(b: u8) bool {
 /// non-identifier bytes). Returns its offset.
 fn findWord(hay: []const u8, word: []const u8) ?usize {
     if (word.len == 0 or hay.len < word.len) return null;
-    var i: usize = 0;
-    while (i + word.len <= hay.len) : (i += 1) {
-        if (i > 0 and isIdentChar(hay[i - 1])) continue;
+    var pos: usize = 0;
+    while (pos + word.len <= hay.len) : (pos += 1) {
+        if (pos > 0 and isIdentChar(hay[pos - 1])) continue;
         for (word, 0..) |w, j| {
-            if (std.ascii.toLower(hay[i + j]) != w) break;
+            if (std.ascii.toLower(hay[pos + j]) != w) break;
             if (j + 1 == word.len) {
-                if (i + word.len == hay.len or !isIdentChar(hay[i + word.len])) return i;
+                if (pos + word.len == hay.len or !isIdentChar(hay[pos + word.len])) return pos;
             }
         }
     }
@@ -224,10 +224,10 @@ pub fn stmtLine(msg: []const u8) bool {
     var rest = msg;
     if (std.mem.startsWith(u8, rest, "duration: ")) {
         rest = rest["duration: ".len..];
-        var i: usize = 0;
-        while (i < rest.len and (std.ascii.isDigit(rest[i]) or rest[i] == '.')) : (i += 1) {}
-        if (!std.mem.startsWith(u8, rest[i..], " ms  ")) return false;
-        rest = rest[i + " ms  ".len ..];
+        var num_len: usize = 0;
+        while (num_len < rest.len and (std.ascii.isDigit(rest[num_len]) or rest[num_len] == '.')) : (num_len += 1) {}
+        if (!std.mem.startsWith(u8, rest[num_len..], " ms  ")) return false;
+        rest = rest[num_len + " ms  ".len ..];
     }
     return std.mem.startsWith(u8, rest, "parse ") or
         std.mem.startsWith(u8, rest, "bind ") or
@@ -332,17 +332,17 @@ pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
         return .{ .text = src, .clipped = false };
     var clipped = false;
     var out_len = put(dst, src[0..pfx.len], &clipped);
-    var i = pfx.len;
-    while (i < src.len) {
-        if (src[i] != '\'') { // between values: `$1 = `, `, ` — verbatim
-            var end = i;
+    var pos = pfx.len;
+    while (pos < src.len) {
+        if (src[pos] != '\'') { // between values: `$1 = `, `, ` — verbatim
+            var end = pos;
             while (end < src.len and src[end] != '\'') end += 1;
-            out_len += put(dst[out_len..], src[i..end], &clipped);
-            i = end;
+            out_len += put(dst[out_len..], src[pos..end], &clipped);
+            pos = end;
             continue;
         }
         // quoted value: a lone ' ends it, '' is an escaped quote inside it
-        var end = i + 1;
+        var end = pos + 1;
         while (end < src.len) {
             if (src[end] != '\'') {
                 end += 1;
@@ -351,7 +351,7 @@ pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
             } else break;
         }
         out_len += put(dst[out_len..], redacted, &clipped);
-        i = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
+        pos = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
     }
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }

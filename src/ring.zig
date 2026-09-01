@@ -158,10 +158,10 @@ pub fn push(r: Ring, e: ShmLogEntry, msg: []const u8) bool {
     var entry = e;
     entry.seq = r.state.seq_next;
     r.state.seq_next += 1;
-    const c = clipUtf8(msg, r.state.message_max);
-    entry.message_len = @intCast(c.len);
+    const clipped = clipUtf8(msg, r.state.message_max);
+    entry.message_len = @intCast(clipped.len);
     r.slotHead(r.state.write_pos).* = entry;
-    if (c.len > 0) @memcpy(r.slotMsg(r.state.write_pos)[0..c.len], msg[0..c.len]);
+    if (clipped.len > 0) @memcpy(r.slotMsg(r.state.write_pos)[0..clipped.len], msg[0..clipped.len]);
     r.state.write_pos = (r.state.write_pos + 1) % r.state.capacity;
     r.state.count += 1;
     r.state.captured += 1;
@@ -229,21 +229,21 @@ pub fn clipUtf8(src: []const u8, cap: usize) struct { len: usize, truncated: boo
 /// Copy `src` into a FixedStr field, setting the field's truncation bit when
 /// clipped.
 pub fn setStr(dst: anytype, mask: *u16, field: TruncField, src: []const u8) void {
-    const c = clipUtf8(src, dst.bytes.len);
-    @memcpy(dst.bytes[0..c.len], src[0..c.len]);
-    dst.len = @intCast(c.len);
-    if (c.truncated) mask.* |= @as(u16, 1) << @intCast(@intFromEnum(field));
+    const clipped = clipUtf8(src, dst.bytes.len);
+    @memcpy(dst.bytes[0..clipped.len], src[0..clipped.len]);
+    dst.len = @intCast(clipped.len);
+    if (clipped.truncated) mask.* |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
 /// The message counterpart of setStr for the variable-width field: clip into
 /// `dst` (the capture-side hold buffer, or a test buffer), set message_len
 /// and the truncated bit, and return the copied slice.
 pub fn setMsg(len_out: *u32, mask: *u16, src: []const u8, dst: []u8) []const u8 {
-    const c = clipUtf8(src, dst.len);
-    @memcpy(dst[0..c.len], src[0..c.len]);
-    len_out.* = @intCast(c.len);
-    if (c.truncated) mask.* |= @as(u16, 1) << @intCast(@intFromEnum(TruncField.message));
-    return dst[0..c.len];
+    const clipped = clipUtf8(src, dst.len);
+    @memcpy(dst[0..clipped.len], src[0..clipped.len]);
+    len_out.* = @intCast(clipped.len);
+    if (clipped.truncated) mask.* |= @as(u16, 1) << @intCast(@intFromEnum(TruncField.message));
+    return dst[0..clipped.len];
 }
 
 test "head layout: default config keeps the 0.3.x shmem request" {

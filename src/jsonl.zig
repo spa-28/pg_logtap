@@ -101,15 +101,15 @@ fn jsonChars(w: *std.Io.Writer, s: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(s))
         return std.json.Stringify.encodeJsonStringChars(s, .{}, w);
     var run: usize = 0; // start of the current valid run
-    var i: usize = 0;
-    while (i < s.len) {
-        if (validSeqAt(s, i)) |len| {
-            i += len;
+    var pos: usize = 0;
+    while (pos < s.len) {
+        if (validSeqAt(s, pos)) |len| {
+            pos += len;
         } else {
-            try std.json.Stringify.encodeJsonStringChars(s[run..i], .{}, w);
+            try std.json.Stringify.encodeJsonStringChars(s[run..pos], .{}, w);
             try w.writeAll("\u{FFFD}");
-            i += 1;
-            run = i;
+            pos += 1;
+            run = pos;
         }
     }
     return std.json.Stringify.encodeJsonStringChars(s[run..], .{}, w);
@@ -150,9 +150,9 @@ pub fn writeTimestamp(w: *std.Io.Writer, ts_us: i64) !void {
 
 /// Howard Hinnant's civil_from_days; valid for the whole TimestampTz range.
 fn civilFromDays(z_in: i64) struct { year: i64, month: u32, day: u32 } {
-    const z = z_in + 719_468;
-    const era = @divFloor(z, 146_097);
-    const doe = z - era * 146_097; // [0, 146096]
+    const days = z_in + 719_468;
+    const era = @divFloor(days, 146_097);
+    const doe = days - era * 146_097; // [0, 146096]
     const yoe = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36_524) - @divTrunc(doe, 146_096), 365);
     const year_full = yoe + era * 400;
     const doy = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
