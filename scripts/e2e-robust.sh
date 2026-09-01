@@ -196,7 +196,7 @@ import json, sys
 path, suf = sys.argv[1], sys.argv[2]
 whole = open(path, encoding="utf-8").read()
 for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123",
-               "SECRET-det" + suf + "-xyz789"):
+               "SECRET-det" + suf + "-xyz789", "SECRET-or" + suf + "-xyz789"):
     assert secret not in whole, secret + " reached the receiver unmasked"
 q = p = role = det = False
 for line in whole.splitlines():
@@ -241,13 +241,21 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redboth$SUF 0 x' USING DETAIL = repeat('ZZ ', 400);
   END \$do\$" >/dev/null 2>&1 || true
-wait_for redclip 1 20; wait_for redboth 1 20
+# The password value cut clips on this 1800-byte DETAIL (past the 1025-byte
+# scratch); redact_pattern 'ZZ' does not match the filler, so the regex layer
+# does not clip — the clip of the FIRST layer must still reach redacted_mask.
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redor$SUF 0' USING DETAIL =
+    'password = ''SECRET-or$SUF-xyz789'' tail ' || repeat('ab ', 600);
+  END \$do\$" >/dev/null 2>&1 || true
+wait_for redclip 1 20; wait_for redboth 1 20; wait_for redor 1 20
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
 import json, sys
 path, suf = sys.argv[1], sys.argv[2]
-clip = both = False
+clip = both = orflag = False
 for line in open(path, encoding="utf-8"):
-    if "logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line:
+    if ("logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line
+            and "logtap robust redor" + suf not in line):
         continue
     e = json.loads(line)
     m = e.get("message", "")
@@ -264,7 +272,14 @@ for line in open(path, encoding="utf-8"):
         assert "detail" in e["truncated"] and "detail" in e["redacted"], e
         assert len(d.encode()) <= 256 and "<REDACTED>" in d, len(d.encode())
         both = True
-assert clip and both, "probes missing (clip=%s both=%s)" % (clip, both)
+    if m.startswith("logtap robust redor" + suf):
+        # the value cut clipped in layer one, the regex layer did not: the
+        # clip flag must survive the layer that came after it
+        d = e.get("detail") or ""
+        assert "detail" in e["redacted"], e
+        assert d.startswith("password = <REDACTED>"), repr(d)
+        orflag = True
+assert clip and both and orflag, "probes missing (clip=%s both=%s or=%s)" % (clip, both, orflag)
 EOF
 ok "redaction clip and slot overflow reported separately (redacted vs truncated)"
 docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true

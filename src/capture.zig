@@ -271,12 +271,20 @@ const PwCut = enum { none, tail, value };
 /// never coexist on one field) into one scratch buffer, then the
 /// redact_pattern regex over the result into the other. Layers that cannot
 /// change the text copy nothing.
+/// Each layer rewrites the text but must not erase the previous layer's
+/// clip: a password value that clipped in the first layer and a regex that
+/// did not clip in the second still left the field shortened by the first —
+/// the event must say so.
+fn applyLayer(out: filter.Masked, layer: filter.Masked) filter.Masked {
+    return .{ .text = layer.text, .clipped = out.clipped or layer.clipped };
+}
+
 fn maskThroughLayers(text: []const u8, pw: PwCut, bind_params: bool) filter.Masked {
     var out = filter.Masked{ .text = text, .clipped = false };
-    if (pw == .tail) out = filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text);
-    if (pw == .value) out = filter.redactPasswordValue(redact_a[0 .. messageMax() + 1], out.text);
-    if (bind_params) out = filter.redactParamValues(redact_a[0 .. messageMax() + 1], out.text);
-    if (redactor) |*red| out = red.apply(redact_b[0 .. messageMax() + 1], out.text);
+    if (pw == .tail) out = applyLayer(out, filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text));
+    if (pw == .value) out = applyLayer(out, filter.redactPasswordValue(redact_a[0 .. messageMax() + 1], out.text));
+    if (bind_params) out = applyLayer(out, filter.redactParamValues(redact_a[0 .. messageMax() + 1], out.text));
+    if (redactor) |*red| out = applyLayer(out, red.apply(redact_b[0 .. messageMax() + 1], out.text));
     return out;
 }
 
