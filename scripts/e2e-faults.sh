@@ -72,9 +72,13 @@ EXTDIR=$(docker exec "$CT" pg_config --sharedir)/extension
 docker cp "$SO" "$CT:$LIBDIR/"
 docker cp pg_logtap.control "$CT:$EXTDIR/"
 for f in sql/*.sql; do docker cp "$f" "$CT:$EXTDIR/"; done
-docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'" \
-  -qc "ALTER SYSTEM SET pg_logtap.flush_interval = 100" >/dev/null
+# Core GUC first, restart, THEN the pg_logtap.* ones: PG<=16 rejects ALTER
+# SYSTEM on unregistered custom GUCs, so the library must load first (same
+# two-step the matrix's stand phase does).
+docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'" >/dev/null
 docker restart "$CT" >/dev/null; wait_ready
+docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.flush_interval = 100" \
+  -qc "SELECT pg_reload_conf()" >/dev/null
 docker exec "$CT" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 "$(dirname "$0")/e2e-require-ext.sh" "$CT"
 
@@ -84,7 +88,7 @@ stats() { docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
 statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
 # Markers in a file:// sink: count distinct events and duplicate seqs there.
 sink_lines() { docker exec "$CT" sh -c "grep -oE 'logtap fault $1 [0-9]+' /tmp/$2.log 2>/dev/null" | sort -u | wc -l; }
-sink_dups() { docker exec "$CT" sh -c "grep 'logtap fault' /tmp/$2.log 2>/dev/null" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l; }
+sink_dups() { docker exec "$CT" sh -c "grep 'logtap fault' /tmp/$1.log 2>/dev/null" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l; }
 gen() { docker exec "$CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
   WHILE i < $2 LOOP
     RAISE WARNING 'logtap fault $1 %', i;
