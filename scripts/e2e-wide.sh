@@ -25,6 +25,8 @@ ok() { echo "  ok: $*"; }
 # Stand gate: the compose one-shot must have passed.
 [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
   || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
 

@@ -63,7 +63,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_send_cycles_failed_total Failed send attempts — one per flush cycle whose send failed, NOT events. The events are safe (fallback queue / backlog); this is the receiver-down signal.
         \\# TYPE pg_logtap_send_cycles_failed_total counter
         \\pg_logtap_send_cycles_failed_total {d}
-        \\# HELP pg_logtap_events_lost_total Events permanently lost: RAM backlog overflow with no fallback file, or an unreadable fallback member skipped.
+        \\# HELP pg_logtap_events_lost_total Events permanently lost: RAM backlog overflow with no fallback file, the fallback_max_mb cap trimming undelivered members (also in events_compacted), or an unreadable fallback member skipped.
         \\# TYPE pg_logtap_events_lost_total counter
         \\pg_logtap_events_lost_total {d}
         \\# HELP pg_logtap_ring_events Events currently waiting in the ring.

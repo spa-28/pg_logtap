@@ -78,22 +78,46 @@ var got_sighup = interrupts.Signal.new(0);
 /// the slot before their own close, so a recycled fd number is never hit.
 var send_conn_fd: c_int = -1;
 
+/// The one sanctioned way an in-flight send socket goes away. The
+/// double-SIGTERM handler closes it to punch blocking I/O; the sender's
+/// defer must not then close the same number again after a recycle. Both
+/// routes go through here so the slot and the fd always move together.
+fn closeSendFd(fd: c_int) void {
+    if (send_conn_fd == fd) send_conn_fd = -1;
+    _ = c.close(fd);
+}
+
 /// Final-flush abort state: 0 outside a graceful-shutdown flush. The deadline
 /// bounds the whole flush to ~1s of work plus one send timeout; sendAborted()
 /// is checked between partial-write syscalls, which a per-syscall socket
 /// timeout alone cannot bound (a dribbling receiver makes ONE send unbounded).
 var send_deadline_us: i64 = 0;
 
+/// The compaction's own bound. A normal flush cycle has a 1s budget
+/// (cycle_deadline) that sendAborted() cannot see — send_deadline_us is set
+/// only during shutdown — so without this a cap/2 rewrite could hold the
+/// worker past the whole cycle, starving drainInto, /metrics and SIGHUP.
+/// Set per flushAll; 0 = only the shutdown deadline applies (the final park
+/// runs under sendAborted, as before).
+var compact_deadline_us: i64 = 0;
+
 fn sendAborted() bool {
     if (got_sigterm.read() >= 2) return true;
     return send_deadline_us != 0 and pg.GetCurrentTimestamp() > send_deadline_us;
+}
+
+/// The compaction aborts on either deadline: the cycle budget in a normal
+/// flush, the shutdown budget during the final one.
+fn compactAborted() bool {
+    if (compact_deadline_us != 0 and pg.GetCurrentTimestamp() > compact_deadline_us) return true;
+    return sendAborted();
 }
 
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, checkFallbackFile, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -202,6 +226,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         return;
     };
     defer send_deadline_us = 0; // zero for normal cycles regardless
+    defer compact_deadline_us = 0;
     if (final) send_deadline_us = pg.GetCurrentTimestamp() + 1_000_000 + @as(i64, guc_export_timeout_ms) * 1000;
 
     var sent: u64 = 0; // delivered by a live send
@@ -222,6 +247,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // up in a local and flushed minutes late. The next cycle resumes 100ms
     // later; a fast receiver still drains a full backlog in one call.
     const cycle_deadline = pg.GetCurrentTimestamp() + 1_000_000; // µs
+    // The compaction shares the cycle's budget: a cap/2 rewrite mid-cycle
+    // that ignores it holds the worker past drainInto/metrics/SIGHUP until
+    // the rewrite finishes (sendAborted() cannot bound it — no shutdown).
+    if (!final) compact_deadline_us = cycle_deadline;
     var drained_total: usize = 0; // live inflow this flushAll call
     while (final or !got_sigterm.isSet()) {
         if (pg.GetCurrentTimestamp() > cycle_deadline) {
@@ -614,12 +643,56 @@ var fb_offset: u64 = 0;
 /// Foreign or corrupt framing — never append to or replay such a file; the
 /// RAM backlog takes over until the GUC is repointed or the server restarts.
 var fb_broken = false;
+/// Warned-once latch for a failing fdatasync: a dying disk fails every cycle
+/// and a per-cycle WARNING would bury the server log, but one silent failure
+/// streak means queued events nobody knows are not durable. Cleared by the
+/// first success, so a flapping disk is heard each time it starts failing.
+var fb_sync_warned = false;
+
+/// fdatasync with an edge-triggered WARNING: false = the pages are written
+/// but not durable (an OS crash loses them; postmaster death still does not).
+fn fbDatasync(file_fd: c_int) bool {
+    if (c.fdatasync(file_fd) == 0) {
+        fb_sync_warned = false;
+        return true;
+    }
+    if (!fb_sync_warned) {
+        fb_sync_warned = true;
+        elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): queued events are written but not durable", .{std.c._errno().*});
+    }
+    return false;
+}
 /// Members skipped as unreadable (framing intact, gzip damaged) — folded into
 /// `lost` by the flush cycle that read them.
 var fb_lost: u64 = 0;
 
 var fb_path_buf: [4096]u8 = undefined;
 var fb_path_len: usize = 0;
+
+/// The queue's path buffers are 4096 bytes and compaction rewrites through
+/// "<path>.compact": a value that fits the queue but leaves no room for the
+/// suffix parks events fine, yet the cap can never fire — fbCompact cannot
+/// even name its temp. Reject the value at SET (the call path guc.c uses for
+/// both SET and ALTER SYSTEM; boot runs the default '' through here too, and
+/// empty is always accepted). Relative paths measure against the data
+/// directory, exactly as fallbackPath resolves them.
+fn checkFallbackFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (raw.len == 0) return true;
+    var resolved: []const u8 = raw;
+    var tmp: [4096]u8 = undefined;
+    if (raw[0] != '/') {
+        const dd_c = pg.DataDir orelse return true;
+        const dd = std.mem.span(@as([*:0]const u8, @ptrCast(dd_c)));
+        resolved = std.fmt.bufPrint(&tmp, "{s}/{s}", .{ dd, raw }) catch return false;
+    }
+    // +8 ".compact" +1 NUL must fit the same 4096-byte path buffers
+    return resolved.len + 9 <= 4096;
+}
 
 /// Resolve the GUC (relative → data directory, the log_directory convention;
 /// the queue belongs with the data). Repointing the GUC orphans the old queue
@@ -737,7 +810,7 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
     if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) return false;
-    if (sync and c.fdatasync(file_fd) != 0) return false;
+    if (sync and !fbDatasync(file_fd)) return false;
     // Cap enforcement after the durable append: the member is safe on disk
     // either way, and the compaction rewrite must never race a lost one.
     // The fd and the post-append size are already in hand — the cap check
@@ -752,7 +825,7 @@ fn fbFsync() void {
     if (fb_broken or fallbackPath() == null) return;
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
-    _ = c.fdatasync(file_fd);
+    _ = fbDatasync(file_fd);
 }
 
 /// One queued batch: decompressed NDJSON, the byte size at read time, and how
@@ -804,7 +877,13 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     const comp = alloc.alloc(u8, mlen) catch return null;
     if (fbPread(file_fd, comp, fb_offset + 4) != mlen) { // torn tail
         alloc.free(comp);
-        _ = c.ftruncate(file_fd, @intCast(fb_offset));
+        // The truncation is what lets the next append land on a member edge;
+        // if it fails the framing after fb_offset is lost until a human
+        // looks — replaying garbage is worse than stopping.
+        if (c.ftruncate(file_fd, @intCast(fb_offset)) != 0) {
+            fb_broken = true;
+            elog.Warning(@src(), "pg_logtap fallback torn tail at offset {d} could not be truncated (errno={d}), replay disabled: {s}", .{ fb_offset, std.c._errno().*, fallbackPath() orelse "" });
+        }
         return null;
     }
     defer alloc.free(comp);
@@ -893,9 +972,10 @@ fn fbCreditBacklog(alloc: std.mem.Allocator) void {
 /// directory fsync); any failure leaves the file as it was — the next append
 /// past the cap retries. Ceiling: a cap smaller than one member bounds the
 /// file only at member granularity. Runs under the cycle's abort budget:
-/// the member-count walk and the copy loop check sendAborted() between
-/// syscalls, so a shutdown flush never waits out a cap/2 rewrite — the
-/// untouched original simply retries on the next append past the cap.
+/// the member-count walk and the copy loop check compactAborted() between
+/// syscalls — the flush cycle's own budget mid-cycle, send_deadline during
+/// shutdown — so neither ever waits out a cap/2 rewrite: the untouched
+/// original simply retries on the next append past the cap.
 fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     const cap_bytes: u64 = @as(u64, @intCast(@max(guc_fallback_max_mb, 0))) << 20;
     if (cap_bytes == 0 or size <= cap_bytes) return;
@@ -907,7 +987,7 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     var off: u64 = fb_magic_len;
     var lost_events: u64 = 0;
     while (off + 4 <= size) {
-        if (sendAborted()) return;
+        if (compactAborted()) return;
         var len_buf: [4]u8 = undefined;
         if (fbPread(file_fd, &len_buf, off) != 4) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
@@ -941,14 +1021,30 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     // self-contained; no recompression).
     var tmp_buf: [4096]u8 = undefined;
     const tmp_path = fbCompactPath(&tmp_buf) orelse return;
-    const tmp_fd = c.open(tmp_path, 2 | 64 | 512, @as(c_uint, 0o600)); // O_RDWR|O_CREAT|O_TRUNC
-    if (tmp_fd < 0) return;
+    // The temp must be exclusively ours: a predictable name opened with
+    // O_TRUNC follows a symlink planted in a writable directory (truncating
+    // its target, and the rename would then put that symlink in the queue's
+    // place). O_EXCL|O_NOFOLLOW refuse both; the EEXIST case is our own
+    // litter from a crashed compaction — unlink it (never a symlink's
+    // target) and retry once. Anything still in the way aborts quietly:
+    // the original queue stands, the cap retries on the next append.
+    const tmp_flags = 2 | 64 | 128 | 131072; // O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
+    var tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
+    if (tmp_fd < 0) {
+        if (c.unlink(tmp_path) != 0) return;
+        tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
+        if (tmp_fd < 0) return;
+    }
     var copied_ok = writeAll(tmp_fd, fb_magic, false);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
     while (copied_ok and pos < size) {
         // Abortable unlike the parked-backlog writes: the members are durable
         // in the original, so an aborted rewrite is a wasted tmp, not a loss.
+        if (compactAborted()) { // mid-cycle: hand the worker back, retry later
+            copied_ok = false;
+            break;
+        }
         const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
         const got = fbPread(file_fd, copy_buf[0..want], pos);
         if (got <= 0) { // 0 = EOF; -1 = read error — both abort the rewrite
@@ -994,11 +1090,12 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // failed.
     const conn_fd = dialTcp(h.host, h.port) orelse return false;
     send_conn_fd = conn_fd;
-    defer {
-        if (send_conn_fd == conn_fd) send_conn_fd = -1;
-        _ = c.close(conn_fd);
-    }
-    var head_buf: [512]u8 = undefined;
+    defer closeSendFd(conn_fd);
+    // Fixed headers (method line, Host, content type/encoding/length) run
+    // ~110 bytes; 2048 leaves room for any realistic path and host, and one
+    // that still does not fit fails the send with the reason — not a torn
+    // header on the wire.
+    var head_buf: [2048]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
@@ -1019,10 +1116,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
     // As sendHttp: the dial path already recorded why it failed.
     const conn_fd = fd_opt orelse return false;
     send_conn_fd = conn_fd;
-    defer {
-        if (send_conn_fd == conn_fd) send_conn_fd = -1;
-        _ = c.close(conn_fd);
-    }
+    defer closeSendFd(conn_fd);
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     return true;
 }
@@ -1147,8 +1241,8 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     dns_fail_streak = 0;
     defer if (res) |r| net.freeaddrinfo(r);
 
-    var it = res;
-    while (it) |ai| : (it = ai.next) {
+    var addr_iter = res;
+    while (addr_iter) |ai| : (addr_iter = ai.next) {
         if (dialAddr(ai.addr.?, ai.addrlen, ai.family)) |conn_fd| {
             if (host.len <= dns_good_host.len and ai.addrlen <= dns_good_addr.len) {
                 @memcpy(dns_good_host[0..host.len], host);
@@ -1181,8 +1275,17 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
         .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
         .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
     };
-    _ = net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_RCVTIMEO
-    _ = net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)); // SOL_SOCKET, SO_SNDTIMEO
+    if (net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
+    or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
+        // A socket the timeouts did not land on would block the single
+        // worker loop forever — the exact hang they exist to prevent. Cancel
+        // the attempt (the batch retries like any dead receiver) instead of
+        // proceeding without the guarantee.
+        const err = std.c._errno().*;
+        _ = c.close(conn_fd);
+        _ = failSend("setsockopt", err);
+        return null;
+    }
     if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
     const err = std.c._errno().*;
     _ = c.close(conn_fd);
@@ -1341,10 +1444,7 @@ fn handleTerm(sig: c_int) callconv(.c) void {
     // demands immediate exit (see send_conn_fd).
     const n = got_sigterm.read() + 1;
     got_sigterm.set(n);
-    if (n >= 2 and send_conn_fd >= 0) {
-        _ = c.close(send_conn_fd);
-        send_conn_fd = -1;
-    }
+    if (n >= 2 and send_conn_fd >= 0) closeSendFd(send_conn_fd);
     if (pg.MyLatch != null) pg.SetLatch(pg.MyLatch);
 }
 

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.1 (2026-09-01)
+
+Hardening round from the 0.4.0 external review. No schema or shmem
+changes; upgrade is a binary replace + restart as usual.
+
+### Fixed
+
+- The cap compaction's temp file is created exclusively and never
+  through a symlink: the predictable `<queue>.compact.tmp` path was a
+  symlink-attack and cross-process race window on a shared data
+  directory.
+- A cap/2 rewrite in a *normal* flush cycle ran under a deadline that
+  only a shutdown flush sets — mid-cycle it could hold the worker for
+  the whole walk + inflate + copy, starving drain, `/metrics` and
+  SIGHUP. The rewrite now has its own deadline in every cycle.
+- Password-assigned values (`password = '…'` in a DETAIL/HINT/CONTEXT
+  line) are masked, not just the password token in statement text.
+- An event's `redacted` marker survives when a redaction layer clips at
+  the scratch size and a later layer matches nothing — previously the
+  marker was overwritten and a clipped event shipped as untouched.
+- Fallback durability failures are audible: a dying `fdatasync` warns
+  once (per failure streak) instead of being indistinguishable from
+  success, and a torn tail that cannot be truncated back to its member
+  boundary disables replay with a WARNING instead of misparsing.
+- A socket whose `SO_RCVTIMEO`/`SO_SNDTIMEO` options failed to land is
+  abandoned before `connect` — proceeding meant the unbounded block the
+  timeouts exist to prevent. The send socket's two close routes (sender
+  defer, double-SIGTERM punch) go through one helper, closing the
+  fd-slot double-close window.
+
+### Changed
+
+- `pg_logtap.export_fallback_file` is validated at SET time: a value
+  whose resolved path leaves no room for the `.compact` rewrite suffix
+  under the 4096-byte path limit is rejected instead of failing only
+  when a compaction first needs the name. Relative paths still resolve
+  against the data directory; the empty default still passes.
+
+### Internal
+
+- Declaration names under three characters fail the lint build (`c` —
+  worker.zig's C-alias — excepted).
+- The e2e suite refuses to run against a stale extension load (every
+  script checks `pg_logtap_version()` against the tree), and log-window
+  asserts count before/after deltas instead of trusting
+  `docker logs --since`.
+- Counters glossary, alerts and the metrics HELP lines name
+  `events_compacted` and all three `events_lost` causes; SECURITY.md
+  states the redaction stance (best-effort, erring toward masking too
+  much).
+
 ## 0.4.0 (2026-09-01)
 
 ### Added

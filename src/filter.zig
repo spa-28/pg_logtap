@@ -196,13 +196,13 @@ fn isIdentChar(b: u8) bool {
 /// non-identifier bytes). Returns its offset.
 fn findWord(hay: []const u8, word: []const u8) ?usize {
     if (word.len == 0 or hay.len < word.len) return null;
-    var i: usize = 0;
-    while (i + word.len <= hay.len) : (i += 1) {
-        if (i > 0 and isIdentChar(hay[i - 1])) continue;
+    var pos: usize = 0;
+    while (pos + word.len <= hay.len) : (pos += 1) {
+        if (pos > 0 and isIdentChar(hay[pos - 1])) continue;
         for (word, 0..) |w, j| {
-            if (std.ascii.toLower(hay[i + j]) != w) break;
+            if (std.ascii.toLower(hay[pos + j]) != w) break;
             if (j + 1 == word.len) {
-                if (i + word.len == hay.len or !isIdentChar(hay[i + word.len])) return i;
+                if (pos + word.len == hay.len or !isIdentChar(hay[pos + word.len])) return pos;
             }
         }
     }
@@ -224,10 +224,10 @@ pub fn stmtLine(msg: []const u8) bool {
     var rest = msg;
     if (std.mem.startsWith(u8, rest, "duration: ")) {
         rest = rest["duration: ".len..];
-        var i: usize = 0;
-        while (i < rest.len and (std.ascii.isDigit(rest[i]) or rest[i] == '.')) : (i += 1) {}
-        if (!std.mem.startsWith(u8, rest[i..], " ms  ")) return false;
-        rest = rest[i + " ms  ".len ..];
+        var num_len: usize = 0;
+        while (num_len < rest.len and (std.ascii.isDigit(rest[num_len]) or rest[num_len] == '.')) : (num_len += 1) {}
+        if (!std.mem.startsWith(u8, rest[num_len..], " ms  ")) return false;
+        rest = rest[num_len + " ms  ".len ..];
     }
     return std.mem.startsWith(u8, rest, "parse ") or
         std.mem.startsWith(u8, rest, "bind ") or
@@ -267,6 +267,50 @@ pub fn redactPassword(dst: []u8, src: []const u8) Masked {
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
+/// The password cut for the detail/hint/context fields: only a value
+/// assigned to the token is masked — `password = '...'`, `password='...'`,
+/// `password '...'` lose the quoted value ('' inside is an escaped quote);
+/// everything around it stays verbatim. These fields carry PG's own runtime
+/// diagnostics, and the message/query semantics (everything after a
+/// standalone `password` token is dropped) would eat the standard
+/// `password authentication failed for user "x"` line whole; the value form
+/// covers what actually leaks next to the token and leaves the diagnosis
+/// readable. No token, or no quoted value after one, returns src untouched.
+pub fn redactPasswordValue(dst: []u8, src: []const u8) Masked {
+    var clipped = false;
+    var out_len: usize = 0;
+    var scan: usize = 0; // consumed prefix of src
+    var masked_any = false; // copying starts only at the first masked value
+    while (scan < src.len) {
+        const token_at = scan + (findWord(src[scan..], "password") orelse break);
+        var value_at = token_at + "password".len;
+        while (value_at < src.len and (src[value_at] == ' ' or src[value_at] == '\t')) value_at += 1;
+        if (value_at < src.len and src[value_at] == '=') {
+            value_at += 1;
+            while (value_at < src.len and (src[value_at] == ' ' or src[value_at] == '\t')) value_at += 1;
+        }
+        if (value_at >= src.len or src[value_at] != '\'') { // not an assignment
+            scan = token_at + "password".len;
+            continue;
+        }
+        var value_end = value_at + 1; // quoted: a lone ' ends it, '' escapes
+        while (value_end < src.len) {
+            if (src[value_end] != '\'') {
+                value_end += 1;
+            } else if (value_end + 1 < src.len and src[value_end + 1] == '\'') {
+                value_end += 2;
+            } else break;
+        }
+        out_len += put(dst[out_len..], src[scan..value_at], &clipped);
+        out_len += put(dst[out_len..], redacted, &clipped);
+        masked_any = true;
+        scan = if (value_end < src.len) value_end + 1 else src.len;
+    }
+    if (!masked_any) return .{ .text = src, .clipped = false };
+    if (scan < src.len) out_len += put(dst[out_len..], src[scan..], &clipped);
+    return .{ .text = dst[0..out_len], .clipped = clipped };
+}
+
 /// Bind-parameter values ride in DETAIL as `Parameters: $1 = '...'` (put
 /// there by log_parameter_max_length — the errdetail shape in
 /// exec_bind_message/exec_execute_message) — the statement text carries
@@ -288,17 +332,17 @@ pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
         return .{ .text = src, .clipped = false };
     var clipped = false;
     var out_len = put(dst, src[0..pfx.len], &clipped);
-    var i = pfx.len;
-    while (i < src.len) {
-        if (src[i] != '\'') { // between values: `$1 = `, `, ` — verbatim
-            var end = i;
+    var pos = pfx.len;
+    while (pos < src.len) {
+        if (src[pos] != '\'') { // between values: `$1 = `, `, ` — verbatim
+            var end = pos;
             while (end < src.len and src[end] != '\'') end += 1;
-            out_len += put(dst[out_len..], src[i..end], &clipped);
-            i = end;
+            out_len += put(dst[out_len..], src[pos..end], &clipped);
+            pos = end;
             continue;
         }
         // quoted value: a lone ' ends it, '' is an escaped quote inside it
-        var end = i + 1;
+        var end = pos + 1;
         while (end < src.len) {
             if (src[end] != '\'') {
                 end += 1;
@@ -307,7 +351,7 @@ pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
             } else break;
         }
         out_len += put(dst[out_len..], redacted, &clipped);
-        i = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
+        pos = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
     }
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
@@ -373,6 +417,36 @@ test "password token cut" {
     const underscored = "user_passwords table";
     try std.testing.expect(redactPassword(&buf, underscored).text.ptr == underscored.ptr);
     try std.testing.expectEqualStrings("select 1", redactPassword(&buf, "select 1").text);
+}
+
+test "password assignment values masked, diagnostics survive" {
+    var buf: [128]u8 = undefined;
+    // PG's standard failure line rides DETAIL constantly — untouched
+    const std_line = "password authentication failed for user \"alice\"";
+    try std.testing.expect(redactPasswordValue(&buf, std_line).text.ptr == std_line.ptr);
+    // assignment forms lose only the quoted value
+    try std.testing.expectEqualStrings(
+        "password = <REDACTED>",
+        redactPasswordValue(&buf, "password = 'hunter2'").text,
+    );
+    try std.testing.expectEqualStrings(
+        "set password=<REDACTED> now",
+        redactPasswordValue(&buf, "set password='hunter2' now").text,
+    );
+    try std.testing.expectEqualStrings(
+        "PASSWORD <REDACTED> left",
+        redactPasswordValue(&buf, "PASSWORD 'a''b' left").text,
+    );
+    // two assignments in one string, non-assignment text between verbatim
+    try std.testing.expectEqualStrings(
+        "password=<REDACTED> and password=<REDACTED>",
+        redactPasswordValue(&buf, "password='one' and password='two'").text,
+    );
+    // token without a quoted value after it: not ours to rewrite
+    const prose = "the password was rotated";
+    try std.testing.expect(redactPasswordValue(&buf, prose).text.ptr == prose.ptr);
+    const underscored = "user_passwords table";
+    try std.testing.expect(redactPasswordValue(&buf, underscored).text.ptr == underscored.ptr);
 }
 
 test "bind-parameter values masked on the Parameters line" {

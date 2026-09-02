@@ -12,6 +12,9 @@ fail() { echo "e2e-hook-chain: FAILED: $*" >&2; exit 1; }
 ok() { echo "  ok: $*"; }
 psql_ct() { docker exec "$PG_CT" psql -U postgres "$@"; }
 
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
+
 wait_ready() {
   n=0
   while [ "$n" -lt 60 ]; do

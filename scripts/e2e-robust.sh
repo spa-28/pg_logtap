@@ -50,6 +50,8 @@ ok() { echo "  ok: $*"; }
 # receiver port answering at boot).
 [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
   || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
+# A stale .so (copied without a restart) would test yesterday's code.
+"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
 docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 # the ready gate is a one-shot that stays exited/0 forever; a run that failed
 # inside backlog-bound leaves the receiver stopped and the next run would
@@ -178,19 +180,27 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redq$SUF 0 benign password note'; END \$do\$; -- password 'SECRET-do$SUF-abc123'" \
   >/dev/null 2>&1 || true
 setguc pg_logtap.redact_pattern 'SECRET-[a-z0-9-]+'; reload; sleep 1
+# Before the pattern switches on — the DETAIL probes below must be masked by
+# the password VALUE cut alone: a secret assigned to the token is masked,
+# PG's own "password authentication failed" phrasing survives verbatim.
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redd$SUF 0' USING DETAIL = 'password = ''SECRET-det$SUF-xyz789'' and user alice';
+  RAISE WARNING 'logtap robust redd$SUF 1' USING DETAIL = 'password authentication failed for user \"alice\"';
+  END \$do\$" >/dev/null 2>&1 || true
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redp$SUF 0 token=SECRET-msg$SUF-abc123'; END \$do\$" \
   >/dev/null 2>&1 || true
-wait_for redq 1 20; wait_for redp 1 20
+wait_for redq 1 20; wait_for redp 1 20; wait_for redd 2 20
 # vector-out.jsonl accumulates across runs BY DESIGN: the secrets carry this
 # run's suffix so stale lines from earlier runs cannot fail this one.
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: contract"
 import json, sys
 path, suf = sys.argv[1], sys.argv[2]
 whole = open(path, encoding="utf-8").read()
-for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123"):
+for secret in ("SECRET-query" + suf + "-abc123", "SECRET-do" + suf + "-abc123", "SECRET-msg" + suf + "-abc123",
+               "SECRET-det" + suf + "-xyz789", "SECRET-or" + suf + "-xyz789"):
     assert secret not in whole, secret + " reached the receiver unmasked"
-q = p = role = False
+q = p = role = det = False
 for line in whole.splitlines():
     if "logtap robust red" not in line:
         continue
@@ -205,6 +215,13 @@ for line in whole.splitlines():
     if m.startswith("logtap robust redp" + suf):
         assert "<REDACTED>" in m, m  # redact_pattern fired at capture
         p = True
+    if m.startswith("logtap robust redd" + suf):
+        d = e.get("detail") or ""
+        if m.endswith(" 0"):  # assigned value masked, surrounding text intact
+            assert d == "password = <REDACTED> and user alice", repr(d)
+        else:  # PG's standard failure phrasing: not ours to rewrite
+            assert d == 'password authentication failed for user "alice"', repr(d)
+        det = True
 for line in whole.splitlines():  # the role's duration line has no red marker
     if "tmp_red" + suf not in line:
         continue
@@ -213,7 +230,7 @@ for line in whole.splitlines():  # the role's duration line has no red marker
     if "CREATE ROLE" in m:
         assert "<REDACTED>" in m, m
         role = True
-assert q and p and role, "probe events missing (q=%s p=%s role=%s)" % (q, p, role)
+assert q and p and role and det, "probe events missing (q=%s p=%s role=%s det=%s)" % (q, p, role, det)
 EOF
 # truncated vs redacted are two different causes for a cut field (LT-1): a
 # redaction that expands past the scratch cap clips WITHOUT slot-truncating
@@ -226,13 +243,21 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redboth$SUF 0 x' USING DETAIL = repeat('ZZ ', 400);
   END \$do\$" >/dev/null 2>&1 || true
-wait_for redclip 1 20; wait_for redboth 1 20
+# The password value cut clips on this 1800-byte DETAIL (past the 1025-byte
+# scratch); redact_pattern 'ZZ' does not match the filler, so the regex layer
+# does not clip — the clip of the FIRST layer must still reach redacted_mask.
+docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redor$SUF 0' USING DETAIL =
+    'password = ''SECRET-or$SUF-xyz789'' tail ' || repeat('ab ', 600);
+  END \$do\$" >/dev/null 2>&1 || true
+wait_for redclip 1 20; wait_for redboth 1 20; wait_for redor 1 20
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
 import json, sys
 path, suf = sys.argv[1], sys.argv[2]
-clip = both = False
+clip = both = orflag = False
 for line in open(path, encoding="utf-8"):
-    if "logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line:
+    if ("logtap robust redclip" + suf not in line and "logtap robust redboth" + suf not in line
+            and "logtap robust redor" + suf not in line):
         continue
     e = json.loads(line)
     m = e.get("message", "")
@@ -249,7 +274,14 @@ for line in open(path, encoding="utf-8"):
         assert "detail" in e["truncated"] and "detail" in e["redacted"], e
         assert len(d.encode()) <= 256 and "<REDACTED>" in d, len(d.encode())
         both = True
-assert clip and both, "probes missing (clip=%s both=%s)" % (clip, both)
+    if m.startswith("logtap robust redor" + suf):
+        # the value cut clipped in layer one, the regex layer did not: the
+        # clip flag must survive the layer that came after it
+        d = e.get("detail") or ""
+        assert "detail" in e["redacted"], e
+        assert d.startswith("password = <REDACTED>"), repr(d)
+        orflag = True
+assert clip and both and orflag, "probes missing (clip=%s both=%s or=%s)" % (clip, both, orflag)
 EOF
 ok "redaction clip and slot overflow reported separately (redacted vs truncated)"
 docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true

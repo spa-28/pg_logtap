@@ -119,7 +119,10 @@ Beyond that the backlog drops **oldest-first** (`events_lost`), and on recovery
 the newest `export_backlog_max` events are delivered. 10 min at 1 k ev/s ≈ 600k
 events → ~535k lost, 65536 delivered. With `export_fallback_file` set (below):
 **zero lost, for any T** — failed batches are diverted to a compressed
-on-disk queue and replayed when the receiver answers.
+on-disk queue and replayed when the receiver answers. The one exception is
+`fallback_max_mb` (0.3.0+): once the outage outgrows the cap, the file is
+compacted to its newest half and the dropped events count as
+`events_compacted` (and `events_lost`) — see below.
 
 ### Postmaster SIGKILL / node crash
 
