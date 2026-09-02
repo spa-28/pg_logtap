@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.2 (2026-09-02)
+
+Delivery-hardening round from the second external review. Upgrade is the
+0.4.1 → 0.4.2 script (one new counter attribute) + binary replace +
+restart.
+
+### Fixed
+
+- A failed `fdatasync` no longer makes the sender re-send — and the
+  queue re-append — a batch that IS in the file. `fbAppend` now
+  distinguishes three outcomes: *failed* (partial writes rolled back,
+  batch retried from RAM), *appended*, and *not_durable* (member kept
+  and counted queued, never re-appended — the pre-fix behavior doubled
+  the member on every retry). The `file://` sink applies the same rule:
+  after a failed sync it rolls the batch back and reports failure only
+  if the rollback took, so a dying disk means one maybe-lost batch
+  instead of a guaranteed duplicate NDJSON batch.
+- A partial write into the queue is truncated back to the member
+  boundary before the retry — a torn `[len][half-member]` left in place
+  used to shift the framing of every later append (the whole tail then
+  read as "gzip damaged" instead of one batch retrying).
+
+### Added
+
+- `fb_sync_failures` counter — failed `fdatasync` calls on the fallback
+  queue, cumulative — in `pg_logtap_stats()`, the `pg_logtap_delivery`
+  view, the Prometheus exposition and as a `PgLogtapFbSyncFailing`
+  alert rule: the server-log WARNING is once per failure streak, the
+  counter is the monotonic dying-disk signal.
+
+### Internal
+
+- Fault-injection e2e, new `faults` matrix phase: a throwaway postgres
+  under an LD_PRELOAD shim fails `fdatasync` for one named file, N
+  times per process — the sync/write failure paths above are
+  regression-tested now, not just reasoned about.
+
 ## 0.4.1 (2026-09-01)
 
 Hardening round from the 0.4.0 external review. No schema or shmem

@@ -419,8 +419,9 @@ receiver).
 
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
 events_sent,events_queued,events_replayed,events_compacted,
-send_cycles_failed,events_lost,fb_sync_failures}_total`
-(counters) + `pg_logtap_ring_{events,capacity}` and
+send_cycles_failed,events_lost}_total` (counters) +
+`pg_logtap_fb_sync_failures` (counter, named like its SQL/stats field,
+no `_total`) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
