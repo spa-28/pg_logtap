@@ -287,7 +287,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
                 const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-                if (!fbAppend(alloc, chunk.body, false)) { // disk full → RAM-backlog semantics for the rest
+                if (fbAppend(alloc, chunk.body, false) != .appended) { // disk full → RAM-backlog semantics for the rest (sync=false cannot be not_durable)
                     failed += 1;
                     break;
                 }
@@ -335,7 +335,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
 
         if (pending.len() == 0) break;
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, chunk.body, true)) {
+        if (receiver_slow and guc_export_slow_ms > 0 and fbAppend(alloc, chunk.body, true) != .failed) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
@@ -368,10 +368,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             failed += 1;
             parkAll(alloc, pending, names, &queued, &lost);
             break;
-        } else if (fbAppend(alloc, chunk.body, true)) {
+        } else if (fbAppend(alloc, chunk.body, true) != .failed) {
             logFallback(true);
             pending.dropFront(chunk.consumed);
-            queued += chunk.consumed; // durably parked: counted replayed on delivery
+            queued += chunk.consumed; // parked in the file (a failed fdatasync keeps the member — fbAppend); counted replayed on delivery
             failed += 1; // the send DID fail — without this a diverting storm
             // reports send_cycles_failed=0 (the receiver-down signal) while
             // actively losing events
@@ -389,7 +389,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
-    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fb_broken));
+    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fb_broken), fb_sync_failures);
     logTransitions(sent + replayed, failed, lost);
 }
 
@@ -402,7 +402,7 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
     var appended = false;
     while (pending.len() > 0) {
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (!fbAppend(alloc, chunk.body, false)) break;
+        if (fbAppend(alloc, chunk.body, false) != .appended) break;
         pending.dropFront(chunk.consumed);
         queued.* += chunk.consumed;
         appended = true;
@@ -648,6 +648,9 @@ var fb_broken = false;
 /// streak means queued events nobody knows are not durable. Cleared by the
 /// first success, so a flapping disk is heard each time it starts failing.
 var fb_sync_warned = false;
+/// Cumulative failed fdatasync calls on the fallback queue — the counter
+/// behind the shmem gauge (the WARNING above is edge-triggered on purpose).
+var fb_sync_failures: u64 = 0;
 
 /// fdatasync with an edge-triggered WARNING: false = the pages are written
 /// but not durable (an OS crash loses them; postmaster death still does not).
@@ -660,6 +663,7 @@ fn fbDatasync(file_fd: c_int) bool {
         fb_sync_warned = true;
         elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): queued events are written but not durable", .{std.c._errno().*});
     }
+    fb_sync_failures += 1;
     return false;
 }
 /// Members skipped as unreadable (framing intact, gzip damaged) — folded into
@@ -785,39 +789,61 @@ fn fbQueued() bool {
     return if (fb_offset == 0) size > fb_magic_len else size > fb_offset;
 }
 
+/// Outcome of appending one batch. `failed` = nothing of it is in the file
+/// (a partial write is rolled back; the events stay in the caller's RAM
+/// backlog and the append may be retried). `appended` = in the file and
+/// fdatasynced. `not_durable` = in the file, fdatasync failed — the member
+/// STAYS (dropping it would be another write that can also fail) and must
+/// never be appended again: the caller drops the batch from RAM on anything
+/// but `failed`. Page cache survives postmaster death; an OS crash loses an
+/// unsynced tail (fbDatasync warns once).
+const FbAppend = enum { failed, appended, not_durable };
+
 /// Append one batch as a framed gzip member. `sync` fdatasyncs this member;
 /// false defers to one fbFsync() per flush cycle — per-member syncs on a
 /// WAL-shared disk stall the worker past the ring's drain window (measured:
 /// 5k dropped in a 16-client storm). Success = the events left pg_logtap
 /// (page cache survives postmaster death; an OS crash loses the unsynced tail).
-fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) bool {
-    if (fb_broken) return false;
-    const file_fd = fbOpen() orelse return false;
+fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) FbAppend {
+    if (fb_broken) return .failed;
+    const file_fd = fbOpen() orelse return .failed;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return false;
+    const size = fbSize(file_fd) orelse return .failed;
     if (size == 0) {
-        if (!writeAll(file_fd, fb_magic, false)) return false;
+        if (!writeAll(file_fd, fb_magic, false)) return .failed;
     } else {
         var magic: [fb_magic_len]u8 = undefined;
         if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
             fb_broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{fallbackPath() orelse ""});
-            return false;
+            return .failed;
         }
     }
-    const comp = gzip.compress(alloc, body) catch return false; // compression failed → RAM backlog retries
+    const comp = gzip.compress(alloc, body) catch return .failed; // compression failed → RAM backlog retries
     defer alloc.free(comp);
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
-    if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) return false;
-    if (sync and !fbDatasync(file_fd)) return false;
-    // Cap enforcement after the durable append: the member is safe on disk
-    // either way, and the compaction rewrite must never race a lost one.
-    // The fd and the post-append size are already in hand — the cap check
-    // costs no syscall, and only a file past the cap pays for the rewrite.
-    // A fresh file (size 0) also gained the framing magic with this member.
+    if (!writeAll(file_fd, &len_buf, false) or !writeAll(file_fd, comp, false)) {
+        // Roll the partial member back. A torn [len][half-member] left in
+        // place shifts the framing of every later append — the next member
+        // lands mid-garbage and the whole tail reads as "gzip damaged"
+        // instead of just this batch retrying from RAM.
+        if (c.ftruncate(file_fd, @intCast(size)) != 0) {
+            fb_broken = true;
+            elog.Warning(@src(), "pg_logtap fallback append could not roll back a partial member (errno={d}), replay disabled: {s}", .{ std.c._errno().*, fallbackPath() orelse "" });
+        }
+        return .failed;
+    }
+    var durable = true;
+    if (sync and !fbDatasync(file_fd)) durable = false;
+    // Cap enforcement after the append: the member is on disk either way
+    // (durability aside), and the compaction rewrite must never race a
+    // lost one. The fd and the post-append size are already in hand — the
+    // cap check costs no syscall, and only a file past the cap pays for the
+    // rewrite. A fresh file (size 0) also gained the framing magic with
+    // this member.
     fbCompact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + 4 + comp.len);
-    return true;
+    return if (durable) .appended else .not_durable;
 }
 
 /// Durability point for a cycle's deferred appends.
@@ -1121,6 +1147,12 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
     return true;
 }
 
+/// Warned-once latch for a file:// sink whose fdatasync failed and whose
+/// rollback failed too — the batch is reported delivered (the lines are in
+/// the page cache) while its durability is unknown. Same edge-triggered
+/// shape as fb_sync_warned: a dying disk would otherwise bury the log.
+var file_sync_warned = false;
+
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
     var pbuf: [4096]u8 = undefined;
@@ -1143,7 +1175,20 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     }
     // Durable per batch: the page cache survives process death but not OS
     // death. One fdatasync per flush cycle is cheap next to the write itself.
-    return c.fdatasync(conn_fd) == 0;
+    // A failed sync is NOT a failed write: the lines are in the file, and
+    // reporting failure would make the caller append the whole batch again —
+    // duplicate NDJSON. Try the rollback; if even that fails the disk cannot
+    // take a clean retry either, so report delivered with the durability
+    // caveat (better one maybe-lost batch than a guaranteed duplicate).
+    if (c.fdatasync(conn_fd) != 0) {
+        if (c.ftruncate(conn_fd, @intCast(end_before)) == 0) return false;
+        if (!file_sync_warned) {
+            file_sync_warned = true;
+            elog.Warning(@src(), "pg_logtap file:// fdatasync failed and rollback failed too (errno={d}): batch reported delivered but not durable: {s}", .{ std.c._errno().*, path });
+        }
+        return true;
+    }
+    return true;
 }
 
 extern fn __res_init() c_int;

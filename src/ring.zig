@@ -95,6 +95,11 @@ pub const ShmState = extern struct {
     /// 1 = the fallback file is foreign/corrupt and neither appended to nor
     /// replayed: durability is silently degraded to the RAM backlog bound.
     fallback_broken: u8 = 0,
+    /// Failed fdatasync calls on the fallback queue, cumulative. The events
+    /// of such a cycle are in the file but not durable (lost on OS crash,
+    /// not on postmaster death); the WARNING is edge-triggered, this counter
+    /// is not — it is the alertable signal of a dying disk.
+    fb_sync_failures: u64 = 0,
     /// 1 = pg_logtap.redact_pattern did not compile; that redaction layer is
     /// OFF (fail-open) until the pattern is fixed.
     redact_pattern_failed: u8 = 0,
@@ -138,6 +143,7 @@ pub const Stats = struct {
     export_lost: u64,
     dns_fail_streak: u32,
     fallback_broken: u8,
+    fb_sync_failures: u64,
     redact_pattern_failed: u8,
     count: u32,
     capacity: u32,
@@ -208,6 +214,7 @@ pub fn snapshot(r: Ring) Stats {
         .export_lost = r.state.export_lost,
         .dns_fail_streak = r.state.dns_fail_streak,
         .fallback_broken = r.state.fallback_broken,
+        .fb_sync_failures = r.state.fb_sync_failures,
         .redact_pattern_failed = r.state.redact_pattern_failed,
         .count = r.state.count,
         .capacity = r.state.capacity,

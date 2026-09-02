@@ -359,11 +359,12 @@ pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64,
 /// Worker-owned gauges, republished every flush cycle: the worker-local
 /// originals (dns_fail_streak, fb_broken) die with the process, so a restart
 /// must overwrite possibly-stale copies here within one cycle.
-pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8) void {
+pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8, fb_sync_fails: u64) void {
     if (!ready) return;
     lockRing();
     state.dns_fail_streak = dns_fail;
     state.fallback_broken = fb_broken;
+    state.fb_sync_failures = fb_sync_fails;
     unlockRing();
 }
 
@@ -446,8 +447,8 @@ pub fn statsText(buf: []u8) ?[]const u8 {
     if (!ready) return "shmem not initialized (shared_preload_libraries?)";
     const snap = snapshot();
     // Same names and order as the pg_logtap_delivery view columns.
-    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} events_compacted={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} redact_pattern_failed={d}", .{
-        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.compacted, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.redact_pattern_failed,
+    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} events_compacted={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} fb_sync_failures={d} redact_pattern_failed={d}", .{
+        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.compacted, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.fb_sync_failures, snap.redact_pattern_failed,
     }) catch "stats overflow";
 }
 
@@ -456,7 +457,7 @@ pub fn statsText(buf: []u8) ?[]const u8 {
 pub fn statsJson(buf: []u8) ?[]const u8 {
     if (!ready) return "{\"events_captured\":0}"; // shmem not up: zero row
     const snap = snapshot();
-    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"events_compacted\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"redact_pattern_failed\":{d}}}", .{
+    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"events_compacted\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"fb_sync_failures\":{d},\"redact_pattern_failed\":{d}}}", .{
         snap.captured,
         snap.dropped,
         snap.sent,
@@ -471,6 +472,7 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.capacity,
         snap.dns_fail_streak,
         snap.fallback_broken,
+        snap.fb_sync_failures,
         snap.redact_pattern_failed,
     }) catch "{\"events_captured\":0}";
 }
