@@ -64,6 +64,19 @@ groups:
             Delivery continues via the last-known-good address while it stays
             valid; check DNS/the receiver's network registration if it does
             not recover.
+      - alert: PgLogtapFbSyncFailing
+        expr: increase(pg_logtap_fb_sync_failures[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_logtap fallback queue syncs failing on {{ $labels.instance }}"
+          description: >-
+            fdatasync on the fallback queue keeps failing: parked members are
+            in the file and still replay, but an OS crash could lose them and
+            the disk is not making the queue durable. The server-log WARNING
+            fires once per failure streak; this counter is monotonic. Check
+            the device holding the queue (and PGDATA).
       - alert: PgLogtapRedactPatternFailed
         expr: pg_logtap_redact_pattern_failed == 1
         labels:

@@ -16,7 +16,7 @@ view) restarts from zero on every restart.
 | Scheme | Semantics | ACK | Duplicate window |
 |---|---|---|---|
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
-| `tcp://` | **at-most-once** | none — `write(2)` success counts as delivered | none; a receiver dying after accept loses silently. Use `http://` for loss-sensitive receivers |
+| `tcp://` | **at-most-once** live; **at-least-once** once `export_fallback_file` is set — a failed send (including a partial write the receiver did see) parks the batch to the queue and it is retried | none — `write(2)` success counts as delivered | with the queue set: the receiver accepted the data but the send failed anyway (torn write, timeout) → the parked retry resends it. Without the queue there is no duplicate window — a receiver dying after accept loses silently; use `http://` for loss-sensitive receivers |
 | `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle |
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
 
@@ -300,7 +300,8 @@ Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules
 - `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
 - `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
 - `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file failed its framing check (foreign content, or two clusters sharing one file) and delivery degraded to the RAM bound — needs an operator: point the GUC at a different path or restart.
-- `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile.
+- `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile. Not an outage by itself: delivery continues via the last-known-good address while it stays valid.
+- `PgLogtapFbSyncFailing` — `increase(pg_logtap_fb_sync_failures[5m]) > 0` for 5m: the fallback queue's `fdatasync` keeps failing — the disk is not making parked events durable. Events still replay (the members are in the file), so this is the dying-disk signal, not a loss signal.
 - `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` did not compile; redaction is OFF (fail-open by design — a bad pattern must not stop export), fix the pattern.
 
 Counters reset on restart (per cluster life) — `increase()` handles that
@@ -328,9 +329,10 @@ itself queued. Persisting the offset in the file header is on the roadmap.
 | `events_captured` | events | a log line entered the shared ring |
 | `events_dropped` | events | the ring was full at capture time (worker drain behind the capture rate) |
 | `events_sent` | events | delivered to the export URL by a live send |
-| `events_queued` | events | durably appended to the fallback file |
+| `events_queued` | events | appended to the fallback file (a lifecycle stage, not a durability claim — see `fb_sync_failures`) |
 | `events_replayed` | events | delivered out of the fallback file after the receiver recovered |
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while undelivered (also in `events_lost`; never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable queue member skipped, or a `fallback_max_mb` compaction dropping undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

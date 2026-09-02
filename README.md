@@ -404,11 +404,12 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `events_captured` | events | a log line entered the shared ring |
 | `events_dropped` | events | the ring was full at capture — worker drain behind the rate |
 | `events_sent` | events | delivered to the export URL by a live send |
-| `events_queued` | events | durably appended to the fallback file |
+| `events_queued` | events | appended to the fallback file (a lifecycle stage, not a durability claim — see `fb_sync_failures`) |
 | `events_replayed` | events | delivered out of the fallback file after recovery |
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while still undelivered (also counted in `events_lost`, never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable queue member, or the `fallback_max_mb` cap trimming undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
 The view adds two derived columns: `queue_backlog` (`events_queued −
@@ -418,13 +419,13 @@ receiver).
 
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
 events_sent,events_queued,events_replayed,events_compacted,
-send_cycles_failed,events_lost}_total`
+send_cycles_failed,events_lost,fb_sync_failures}_total`
 (counters) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
-dropped, export failing, fallback file broken, DNS failing, redact pattern
-failed).
+dropped, export failing, fallback file broken, DNS failing, queue sync
+failing, redact pattern failed).
 
 ## Development & Testing
 
