@@ -14,6 +14,9 @@
 #                        replay stays on
 #   corrupt-member     : a damaged gzip member mid-queue (framing intact) is
 #                        skipped and counted lost; later members still replay
+#   symlink-queue      : a symlink at the fallback path is refused — the file
+#                        it names stays intact, fallback_broken=1 + one
+#                        WARNING, events ride the RAM backlog
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -268,8 +271,17 @@ while [ "$off" -lt "$sz" ]; do
   len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
   [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "corrupt member: framing unreadable at $off (len='$len')"
   end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
-  if docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null \
-    | grep -q "logtap kill cmX"; then hits="$hits $off"; nhits=$((nhits + 1)); fi
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null || true)
+  case "$body" in
+    *"logtap kill cmX"*)
+      # A member holding cmX AND another marker means a flush-cycle stall
+      # merged two gens: smashing it would eat intact events and every assert
+      # below would point at the wrong thing. Scenario arithmetic broke, not
+      # the product — say so instead of failing cryptically.
+      echo "$body" | grep -qE "logtap kill cm[ABC]" \
+        && fail "corrupt member: cmX shares its member with A/B/C (flush stall merged the gens) — rerun the scenario"
+      hits="$hits $off"; nhits=$((nhits + 1)) ;;
+  esac
   off=$end
 done
 [ "$nhits" -ge 1 ] || fail "corrupt member: no cmX member found in the queue"
@@ -304,19 +316,25 @@ echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # queue at another file: a symlink at the fallback path is refused
 # (O_NOFOLLOW, like the compaction temp), the file it points at stays
 # byte-identical, and delivery degrades to the RAM backlog — zero loss
-# once the receiver returns.
+# once the receiver returns. The refusal is visible like any other broken
+# queue: fallback_broken=1 and one WARNING (fb_broken stops the re-opens;
+# repointing the GUC or a restart re-checks — the foreign-file recovery).
 docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
+warn0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true)
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 gen sl1 20; sleep 3
 canary=$(docker exec "$PG_CT" cat "$FB_DIR/pg_logtap-canary" 2>/dev/null || echo GONE)
 [ "$canary" = "CANARY-INTACT" ] || fail "symlink queue: canary written through the symlink ('$canary')"
+[ "$(statf fallback_broken)" = 1 ] || fail "symlink queue: fallback_broken=$(statf fallback_broken), want 1 — a refused open must show on the gauge"
+warn=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true) - warn0 ))
+[ "$warn" = 1 ] || fail "symlink queue: 'cannot be opened' warned $warn time(s), want 1 (once — fb_broken stops the re-opens)"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for sl1 20
 [ "$(received sl1)" = 20 ] || fail "symlink queue: RAM backlog did not drain ($(received sl1)/20)"
 docker exec "$PG_CT" sh -c "rm -f '$FB' '$FB_DIR/pg_logtap-canary'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
-ok "symlink refused: canary intact, 20/20 via the RAM backlog"
+ok "symlink refused: canary intact, fallback_broken=1 warned once, 20/20 via the RAM backlog"
 
 echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log
