@@ -17,20 +17,30 @@ update path) + binary replace + restart; no new GUCs or counters.
   compaction temp has since 0.4.1; a refused queue degrades to the RAM
   backlog (delivery contract unchanged). The failed `O_EXCL` create is
   also retried on `EEXIST` only — `EACCES`/`EROFS`/`ENOTDIR` now fail as
-  they are instead of being masked by a second open.
+  they are instead of being masked by a second open — and an unopenable
+  queue sets `fallback_broken=1` with one WARNING, exactly like a foreign
+  one, instead of silently retrying the open every flush cycle.
 - Truncating the fully delivered queue is a durability point now: the
   `fdatasync` after `ftruncate(0)` closes the crash window in which
   members the receiver already has could resurrect from an unsynced
   inode and replay as duplicates. A failed sync counts into
   `fb_sync_failures` like any other; it only re-opens the documented
-  at-least-once duplicate window, losing nothing.
+  at-least-once duplicate window, losing nothing. The truncate also
+  re-verifies the queue magic on the file it is about to zero — one
+  swapped into the path by a rename between the drain and the truncate
+  is left alone — and a partially written queue header is rolled back to
+  empty instead of disabling the fallback as "foreign content" on the
+  next open.
 
 ### Internal
 
 - e2e: a damaged gzip member mid-queue (framing intact) is skipped,
   counted lost, and the later members still replay, with replay staying
   on; and a symlink at the queue path is refused, the file it names
-  stays untouched, and the events ride the RAM backlog to the receiver.
+  stays untouched, and the events ride the RAM backlog to the receiver
+  (asserting `fallback_broken=1` and the single refusal WARNING; the
+  corrupt-member walk fails fast if a flush stall merged two marker
+  generations into one member).
 
 ## 0.4.2 (2026-09-02)
 

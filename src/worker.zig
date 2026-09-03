@@ -637,6 +637,12 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) b
 const fb_magic = "PGLTFB01";
 const fb_magic_len = 8;
 
+/// Linux O_NOFOLLOW (0o400000) as a raw flag value: std.os.linux.O is a
+/// packed bool struct, unusable with the extern open. Every open of the
+/// queue path (and the compaction temp) passes it — anything able to write
+/// the data directory must not aim the queue at another file.
+const fb_no_follow: c_int = 0o400000;
+
 /// Consumed prefix of the queue (magic + members), worker-local. 0 also means
 /// "magic not verified yet".
 var fb_offset: u64 = 0;
@@ -661,7 +667,7 @@ fn fbDatasync(file_fd: c_int) bool {
     }
     if (!fb_sync_warned) {
         fb_sync_warned = true;
-        elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): queued events are written but not durable", .{std.c._errno().*});
+        elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): the queue's latest change is written but not durable", .{std.c._errno().*});
     }
     fb_sync_failures += 1;
     return false;
@@ -746,17 +752,24 @@ fn fbOpen() ?c_int {
     var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 128, @as(c_uint, 0o600));
     if (file_fd >= 0) {
         fsyncDirOf(fb_path_buf[0..fb_path_len]);
-    } else if (std.c._errno().* == 17) { // EEXIST, the usual case
-        // 131072 = O_NOFOLLOW: the queue lives in the data directory, and
-        // anything able to write there must not aim the queue at another
-        // file — the rule fbCompact already enforces for its temp. ELOOP
-        // (the path IS a symlink) just fails the open: the caller parks in
-        // RAM instead.
-        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 131072, @as(c_uint, 0o600));
+    } else if (std.c._errno().* == @intFromEnum(std.c.E.EXIST)) { // the usual case
+        // fb_no_follow: the queue lives in the data directory, and anything
+        // able to write there must not aim the queue at another file — the
+        // rule fbCompact already enforces for its temp. ELOOP (the path IS
+        // a symlink) just fails the open: the caller parks in RAM instead.
+        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | fb_no_follow, @as(c_uint, 0o600));
     }
     // Any other errno (EACCES, EROFS, ENOTDIR, …) fails as is — a retrying
-    // open would only mask the real reason.
-    return if (file_fd >= 0) file_fd else null;
+    // open would only mask the real reason. An unopenable queue is as
+    // unusable as a foreign one: mark it broken so the fallback_broken gauge
+    // says so, and say it once — fb_broken stops the re-opens; repointing
+    // the GUC or a restart re-checks, the same recovery as a foreign file.
+    if (file_fd < 0) {
+        fb_broken = true;
+        elog.Warning(@src(), "pg_logtap fallback queue cannot be opened (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, fallbackPath() orelse "" });
+        return null;
+    }
+    return file_fd;
 }
 
 /// fsync the parent of a path: makes a fresh directory entry durable. Best
@@ -819,7 +832,18 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) FbAppend {
     defer _ = c.close(file_fd);
     const size = fbSize(file_fd) orelse return .failed;
     if (size == 0) {
-        if (!writeAll(file_fd, fb_magic, false)) return .failed;
+        if (!writeAll(file_fd, fb_magic, false)) {
+            // Roll the fresh file back to empty. A short write can stop
+            // mid-magic, and a 1..7-byte file is "foreign content" to the
+            // next open — fallback disabled over a torn header. The file
+            // holds no members yet, so the rollback costs nothing; the next
+            // append writes the magic whole again.
+            if (c.ftruncate(file_fd, 0) != 0) {
+                fb_broken = true;
+                elog.Warning(@src(), "pg_logtap fallback append could not roll back a partial queue header (errno={d}), replay disabled: {s}", .{ std.c._errno().*, fallbackPath() orelse "" });
+            }
+            return .failed;
+        }
     } else {
         var magic: [fb_magic_len]u8 = undefined;
         if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
@@ -960,19 +984,23 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
 }
 
 /// Queue fully delivered: zero it (the next append re-creates the magic) and
-/// return to direct sends. The fdatasync makes the removal a durability
-/// point: ftruncate only edits the inode, and without a sync a crash right
-/// after a full drain can resurrect members the receiver already has — the
-/// documented at-least-once duplicates, but the window stays open exactly
-/// when the outage ends and nothing parks again to sync it shut. Best effort
-/// one way: a failed sync (counted in fb_sync_failures) only re-opens that
-/// duplicate window; the events are already delivered. O_NOFOLLOW (131072)
-/// as in fbOpen — and this open truncates, the worst thing a planted
-/// symlink could aim at.
+/// return to direct sends. Opened through fbOpen — one open discipline,
+/// O_NOFOLLOW included — and the magic is re-verified before the destructive
+/// call: a rename swapping some other file into the path between the drain's
+/// read and here must not have that file zeroed; without our magic it is not
+/// ours, leave it. The fdatasync makes the removal a durability point:
+/// ftruncate only edits the inode, and without a sync a crash right after a
+/// full drain can resurrect members the receiver already has — the documented
+/// at-least-once duplicates, but the window stays open exactly when the
+/// outage ends and nothing parks again to sync it shut. Best effort one way:
+/// a failed sync (counted in fb_sync_failures) only re-opens that duplicate
+/// window; the events are already delivered.
 fn fbTruncate() void {
-    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1 | 131072, @as(c_uint, 0o600)); // O_WRONLY|O_NOFOLLOW
-    if (file_fd < 0) return;
+    if (fb_broken) return;
+    const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
+    var magic: [fb_magic_len]u8 = undefined;
+    if (fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) return;
     if (c.ftruncate(file_fd, 0) == 0) {
         fb_offset = 0;
         _ = fbDatasync(file_fd);
@@ -1078,7 +1106,7 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     // litter from a crashed compaction — unlink it (never a symlink's
     // target) and retry once. Anything still in the way aborts quietly:
     // the original queue stands, the cap retries on the next append.
-    const tmp_flags = 2 | 64 | 128 | 131072; // O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
+    const tmp_flags = 2 | 64 | 128 | fb_no_follow; // O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
     var tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
     if (tmp_fd < 0) {
         if (c.unlink(tmp_path) != 0) return;
