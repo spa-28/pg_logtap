@@ -740,13 +740,22 @@ fn fbOpen() ?c_int {
     // Create via O_EXCL|O_CREAT (Linux: 128|64) first: its success is the
     // only reliable "the file just came into existence" signal — the moment
     // to fsync the directory, so the creation itself (not just the data,
-    // which fdatasync covers) survives a power loss.
+    // which fdatasync covers) survives a power loss. O_EXCL|O_CREAT also
+    // never follows a symlink (POSIX), so the create branch needs no
+    // O_NOFOLLOW of its own.
     var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 128, @as(c_uint, 0o600));
     if (file_fd >= 0) {
         fsyncDirOf(fb_path_buf[0..fb_path_len]);
-    } else { // EEXIST (the usual case) or a real error — plain open tells which
-        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024, @as(c_uint, 0o600));
+    } else if (std.c._errno().* == 17) { // EEXIST, the usual case
+        // 131072 = O_NOFOLLOW: the queue lives in the data directory, and
+        // anything able to write there must not aim the queue at another
+        // file — the rule fbCompact already enforces for its temp. ELOOP
+        // (the path IS a symlink) just fails the open: the caller parks in
+        // RAM instead.
+        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 131072, @as(c_uint, 0o600));
     }
+    // Any other errno (EACCES, EROFS, ENOTDIR, …) fails as is — a retrying
+    // open would only mask the real reason.
     return if (file_fd >= 0) file_fd else null;
 }
 
@@ -838,7 +847,11 @@ fn fbAppend(alloc: std.mem.Allocator, body: []const u8, sync: bool) FbAppend {
     if (sync and !fbDatasync(file_fd)) durable = false;
     // Cap enforcement after the append: the member is on disk either way
     // (durability aside), and the compaction rewrite must never race a
-    // lost one. The fd and the post-append size are already in hand — the
+    // lost one. A failed fdatasync above does not skip it either:
+    // compaction is tmp+rename where every failure leaves the original
+    // file untouched, so it can only enforce the cap — never worsen the
+    // not-durable state or drop a member the failed sync left in place.
+    // The fd and the post-append size are already in hand — the
     // cap check costs no syscall, and only a file past the cap pays for the
     // rewrite. A fresh file (size 0) also gained the framing magic with
     // this member.
@@ -947,12 +960,23 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
 }
 
 /// Queue fully delivered: zero it (the next append re-creates the magic) and
-/// return to direct sends.
+/// return to direct sends. The fdatasync makes the removal a durability
+/// point: ftruncate only edits the inode, and without a sync a crash right
+/// after a full drain can resurrect members the receiver already has — the
+/// documented at-least-once duplicates, but the window stays open exactly
+/// when the outage ends and nothing parks again to sync it shut. Best effort
+/// one way: a failed sync (counted in fb_sync_failures) only re-opens that
+/// duplicate window; the events are already delivered. O_NOFOLLOW (131072)
+/// as in fbOpen — and this open truncates, the worst thing a planted
+/// symlink could aim at.
 fn fbTruncate() void {
-    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1, @as(c_uint, 0o600)); // O_WRONLY
+    const file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 1 | 131072, @as(c_uint, 0o600)); // O_WRONLY|O_NOFOLLOW
     if (file_fd < 0) return;
     defer _ = c.close(file_fd);
-    if (c.ftruncate(file_fd, 0) == 0) fb_offset = 0;
+    if (c.ftruncate(file_fd, 0) == 0) {
+        fb_offset = 0;
+        _ = fbDatasync(file_fd);
+    }
 }
 
 /// The fallback file can outlive the shmem counters: a postmaster restart
