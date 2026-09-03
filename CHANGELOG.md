@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.4.3 (2026-09-03)
+
+Filesystem-hardening round from the third external review. Upgrade is the
+0.4.2 → 0.4.3 script (schema unchanged — the script only provides the
+update path) + binary replace + restart; no new GUCs or counters.
+
+### Fixed
+
+- A symlink planted at the fallback queue's path is no longer followed.
+  `fbOpen` retried its failed `O_EXCL` create with a plain open (no
+  `O_NOFOLLOW`), so a symlink resolved — and `fbTruncate` opened the path
+  `O_WRONLY` the same way, then truncated it to zero: anything with write
+  access to the data directory could aim the queue at another file and
+  have it appended to or wiped. Both opens now refuse symlinks, as the
+  compaction temp has since 0.4.1; a refused queue degrades to the RAM
+  backlog (delivery contract unchanged). The failed `O_EXCL` create is
+  also retried on `EEXIST` only — `EACCES`/`EROFS`/`ENOTDIR` now fail as
+  they are instead of being masked by a second open — and an unopenable
+  queue sets `fallback_broken=1` with one WARNING, exactly like a foreign
+  one, instead of silently retrying the open every flush cycle.
+- Truncating the fully delivered queue is a durability point now: the
+  `fdatasync` after `ftruncate(0)` closes the crash window in which
+  members the receiver already has could resurrect from an unsynced
+  inode and replay as duplicates. A failed sync counts into
+  `fb_sync_failures` like any other; it only re-opens the documented
+  at-least-once duplicate window, losing nothing. The truncate also
+  re-verifies the queue magic on the file it is about to zero — one
+  swapped into the path by a rename between the drain and the truncate
+  is left alone — and a partially written queue header is rolled back to
+  empty instead of disabling the fallback as "foreign content" on the
+  next open.
+
+### Internal
+
+- e2e: a damaged gzip member mid-queue (framing intact) is skipped,
+  counted lost, and the later members still replay, with replay staying
+  on; and a symlink at the queue path is refused, the file it names
+  stays untouched, and the events ride the RAM backlog to the receiver
+  (asserting `fallback_broken=1` and the single refusal WARNING; the
+  corrupt-member walk fails fast if a flush stall merged two marker
+  generations into one member).
+
 ## 0.4.2 (2026-09-02)
 
 Delivery-hardening round from the second external review. Upgrade is the

@@ -12,6 +12,11 @@
 #                        holds (crash mid-append) is cut at the member
 #                        boundary at the next read; appends resume there,
 #                        replay stays on
+#   corrupt-member     : a damaged gzip member mid-queue (framing intact) is
+#                        skipped and counted lost; later members still replay
+#   symlink-queue      : a symlink at the fallback path is refused — the file
+#                        it names stays intact, fallback_broken=1 + one
+#                        WARNING, events ride the RAM backlog
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -243,6 +248,93 @@ corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt
 [ "$corr" = 0 ] || fail "torn queue tail: misparsed as corrupt instead of cut"
 ok "torn tail cut at the member boundary, appends resumed, 20/20 replayed"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+
+echo "== corrupt member mid-queue: skipped, later members still replay =="
+# A/CORRUPT/B/C: park four marker batches with the receiver dead, smash
+# every member holding cmX (gzip payload, framing [len] intact), restart,
+# revive the receiver. The walk must skip exactly the damaged members
+# (counted lost), credit and replay the rest — and NOT escalate to
+# "replay disabled", which a framing-level corruption would cause.
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+gen cmA 10; sleep 1; gen cmX 10; sleep 1; gen cmB 10; sleep 1; gen cmC 10; sleep 2
+# Find EVERY member holding cmX by walking the framing ([len:4][gzip
+# payload] per member after the 8-byte magic) and inflating each candidate
+# on the spot. Two reasons a marker is not "one member": noise events
+# (scenario-switch traffic) park ahead of or between the markers, and a
+# flush-cycle boundary mid-burst splits one gen across members (a 10-event
+# gen parks 1+9). Smash them all; each [len] framing around them survives.
+sz=$(docker exec "$PG_CT" stat -c %s "$FB")
+off=8; hits=""; nhits=0
+while [ "$off" -lt "$sz" ]; do
+  len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
+  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "corrupt member: framing unreadable at $off (len='$len')"
+  end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null || true)
+  case "$body" in
+    *"logtap kill cmX"*)
+      # A member holding cmX AND another marker means a flush-cycle stall
+      # merged two gens: smashing it would eat intact events and every assert
+      # below would point at the wrong thing. Scenario arithmetic broke, not
+      # the product — say so instead of failing cryptically.
+      echo "$body" | grep -qE "logtap kill cm[ABC]" \
+        && fail "corrupt member: cmX shares its member with A/B/C (flush stall merged the gens) — rerun the scenario"
+      hits="$hits $off"; nhits=$((nhits + 1)) ;;
+  esac
+  off=$end
+done
+[ "$nhits" -ge 1 ] || fail "corrupt member: no cmX member found in the queue"
+for h in $hits; do
+  docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=$((h + 4)) count=16 conv=notrunc" >/dev/null 2>&1
+done
+skip0=$(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true)
+corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
+docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
+[ "$(received cmA)" = 10 ] && [ "$(received cmB)" = 10 ] && [ "$(received cmC)" = 10 ] \
+  || fail "corrupt member: intact members not replayed (cmA=$(received cmA) cmB=$(received cmB) cmC=$(received cmC))"
+[ "$(received cmX)" = 0 ] || fail "corrupt member: damaged member delivered $(received cmX) events"
+# Fresh shmem at the restart: the skips are the only thing that touched
+# lost — one per damaged member (the member, not its events, is the loss
+# unit)
+[ "$(statf events_lost)" = "$nhits" ] || fail "corrupt member: events_lost=$(statf events_lost), want $nhits"
+skip=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true) - skip0 ))
+# twice per member by design: the boot walk that credits the backlog logs
+# it, then the drain's own read of the damaged member logs it again
+[ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
+corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
+[ "$corr" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
+fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
+[ "$fb_sz" = 0 ] || fail "corrupt member: queue not truncated after replay ($fb_sz bytes left)"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "$nhits damaged member(s) skipped (lost=$(statf events_lost)), A/B/C replayed 30/30, framing held"
+
+echo "== symlink at the queue path: refused, RAM backlog carries the events =="
+# Anything able to write to the data directory must not be able to aim the
+# queue at another file: a symlink at the fallback path is refused
+# (O_NOFOLLOW, like the compaction temp), the file it points at stays
+# byte-identical, and delivery degrades to the RAM backlog — zero loss
+# once the receiver returns. The refusal is visible like any other broken
+# queue: fallback_broken=1 and one WARNING (fb_broken stops the re-opens;
+# repointing the GUC or a restart re-checks — the foreign-file recovery).
+docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+warn0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true)
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+gen sl1 20; sleep 3
+canary=$(docker exec "$PG_CT" cat "$FB_DIR/pg_logtap-canary" 2>/dev/null || echo GONE)
+[ "$canary" = "CANARY-INTACT" ] || fail "symlink queue: canary written through the symlink ('$canary')"
+[ "$(statf fallback_broken)" = 1 ] || fail "symlink queue: fallback_broken=$(statf fallback_broken), want 1 — a refused open must show on the gauge"
+warn=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true) - warn0 ))
+[ "$warn" = 1 ] || fail "symlink queue: 'cannot be opened' warned $warn time(s), want 1 (once — fb_broken stops the re-opens)"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for sl1 20
+[ "$(received sl1)" = 20 ] || fail "symlink queue: RAM backlog did not drain ($(received sl1)/20)"
+docker exec "$PG_CT" sh -c "rm -f '$FB' '$FB_DIR/pg_logtap-canary'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "symlink refused: canary intact, fallback_broken=1 warned once, 20/20 via the RAM backlog"
 
 echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log

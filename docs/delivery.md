@@ -233,10 +233,11 @@ endpoint — the debug-storm profile): 0.82 MB/s of queue at ~12.2k ev/s,
 reached after ~10 minutes of that storm; ordinary production rates (tens
 to hundreds of events/s) fill it over hours to days.
 
-A file the worker did not write (foreign content, or framing damaged past
-the readable) sets `fallback_broken=1`: the queue is disabled — neither
-appended to nor replayed — and durability degrades to the RAM-backlog bound
-until the GUC points at a **different** path or the worker restarts (the
+A file the worker cannot open at all (a symlink at the path, `EACCES`,
+`EROFS`), or did not write (foreign content, framing damaged past the
+readable), sets `fallback_broken=1` with one WARNING: the queue is disabled —
+neither appended to nor replayed — and durability degrades to the RAM-backlog
+bound until the GUC points at a **different** path or the worker restarts (the
 repoint re-checks the file; pointing back at the same bad path changes
 nothing).
 
@@ -299,7 +300,7 @@ Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules
 - `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow — capture sustained past export capacity (receiver too slow or down longer than export_backlog_max/r).
 - `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
 - `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
-- `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file failed its framing check (foreign content, or two clusters sharing one file) and delivery degraded to the RAM bound — needs an operator: point the GUC at a different path or restart.
+- `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file cannot be opened (a symlink at its path, permissions, a read-only disk) or failed its framing check (foreign content, two clusters sharing one file) — delivery degraded to the RAM bound; needs an operator: point the GUC at a different path or restart.
 - `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile. Not an outage by itself: delivery continues via the last-known-good address while it stays valid.
 - `PgLogtapFbSyncFailing` — `increase(pg_logtap_fb_sync_failures[5m]) > 0` for 5m: the fallback queue's `fdatasync` keeps failing — the disk is not making parked events durable. Events still replay (the members are in the file), so this is the dying-disk signal, not a loss signal.
 - `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` did not compile; redaction is OFF (fail-open by design — a bad pattern must not stop export), fix the pattern.

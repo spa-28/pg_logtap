@@ -41,6 +41,18 @@ The `bench` job is not in the default PHASES: benchmark numbers from shared
 CI runners are garbage. Run locally, CPU governor on `performance` (a
 scaling governor halves TPS on developer boxes — the script warns).
 
+`scripts/storm.sh [secs] [pg_major] [modes]` is the same load without the
+baseline half: it builds the current tree, brings up the stand, and storms
+the "on" profiles (`loud,quiet,mute`, default `loud`) back to back on one
+stand — a mode flip is a reload. `plain` is statement volume without
+timings (`log_statement=all`), and `chain` is the loud profile
+exported to the real compose sinks (vector → console+file+victoria-logs),
+with delivery verified three ways: stats counters, the file sink's line
+count, and a count() from victoria-logs itself. Use the script to check a
+build's health (events/s, exact delivery, worker RSS, capture→receiver
+latency) before a release; use `bench` when you need the TPS delta against
+a no-extension baseline.
+
 ## Reference numbers
 
 pg_logtap 0.2.1, commit 12c5fea, pg18, x86_64, governor=performance,

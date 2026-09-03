@@ -1,6 +1,6 @@
 .{
     .name = .pg_logtap,
-    .version = "0.4.2",
+    .version = "0.4.3",
     .fingerprint = 0xa4a7ecd69b38e118,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
