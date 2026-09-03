@@ -11,6 +11,12 @@
 #   mute  — the loud config with log_destination='' (valid; mutes the
 #           server's own stderr while emit_log_hook still fires): isolates
 #           pg_logtap's cost from the server's own logging
+#   chain — the loud profile exported to the REAL compose chain (vector →
+#           console+file+victoria-logs) instead of the one-shot receiver:
+#           load-tests the prod-shaped sinks. Delivery is verified three
+#           ways: pg_logtap_stats(), the file sink's line count, and a
+#           count() straight from victoria-logs. No latency percentiles —
+#           the chain doesn't stamp arrival times.
 # The benchmark's off/jobs (extension not loaded) are deliberately not here:
 # without a baseline run there is nothing to compare them against — use
 # bench-overhead.sh for that. No baseline jobs, so one run answers "how does
@@ -31,6 +37,7 @@ SEED=20260825
 RX=pglogtap-storm-rx
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-storm
+DUMP=/tmp/logtap-e2e/vector-out.jsonl # the compose vector's file sink (host side)
 mkdir -p "$OUT"
 
 case "$(uname -m)" in
@@ -60,10 +67,10 @@ stats_field() { # <name> — value from pg_logtap_stats()
 
 # Every knob is assigned explicitly (nothing toggled), so a rerun reproduces
 # the mode from any stand state. ALTER SYSTEM one statement per -qc.
-set_mode() { # <loud|quiet|mute>
+set_mode() { # <loud|quiet|mute|chain>
   local msg_min=warning lvl=15 dest=stderr
   case $1 in
-    loud | mute) msg_min=debug1 lvl=10 ;;
+    loud | mute | chain) msg_min=debug1 lvl=10 ;;
     quiet) ;;
     *) echo "unknown mode '$1' (loud|quiet|mute)" >&2; exit 1 ;;
   esac
@@ -155,10 +162,20 @@ docker exec "$C" pgbench -i -q -s 8 -U postgres postgres >/dev/null 2>&1
 for mode in ${MODES//,/ }; do
   echo "== mode=$mode: warmup ${WARMUP}s (discarded) + storm ${SECS}s =="
   set_mode "$mode"
-  start_rx
-  docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$RX:8687'" \
-    -qc "SELECT pg_reload_conf()" >/dev/null
-  sleep 2
+  if [ "$mode" = chain ]; then
+    # export stays on the compose chain: vector sinks to console+file+vlogs
+    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
+      -qc "SELECT pg_reload_conf()" >/dev/null
+    # rotate the file sink's dump so its line count is this run's delivery
+    # (host-side truncate: the container keeps its fd and the space is freed)
+    [ -f "$DUMP" ] && : > "$DUMP"
+    sleep 2
+  else
+    start_rx
+    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$RX:8687'" \
+      -qc "SELECT pg_reload_conf()" >/dev/null
+    sleep 2
+  fi
 
   docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1
   base_cap=$(stats_field events_captured); base_snt=$(stats_field events_sent)
@@ -185,6 +202,17 @@ for mode in ${MODES//,/ }; do
   snt=$(( $(stats_field events_sent) - base_snt ))
   rss=$(docker exec "$C" ps -eo rss=,args= | awk '/pg_logtap exporter/ {print $1; exit}')
   echo "RESULT[$mode] events/s=$((cap / SECS)) captured=$cap sent=$snt dropped=$drp lost=$lst worker_rss=$((rss / 1024))MB cpu=${cpu}%"
+
+  if [ "$mode" = chain ]; then
+    lines=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
+    echo "RESULT[chain] vector_file_lines=$lines (end-to-end delivery into the file sink)"
+    # ask victoria-logs itself how much it ingested over this window
+    docker run --rm --network "$NET" curlimages/curl:8.8.0 -G -s \
+      'http://pglogtap-vlogs-e2e:9428/select/logsql/query' \
+      --data-urlencode 'query=* | count()' --data-urlencode "time_range=${SECS}s" \
+      | sed 's/^/RESULT[chain] vlogs_count=/' || echo "RESULT[chain] vlogs_count=query failed"
+    continue
+  fi
 
   docker logs "$RX" 2>/dev/null | grep -E '^[0-9.]+$' > "$OUT/lat.$mode"
   # quiet legitimately captures nothing the receiver would see — no samples
