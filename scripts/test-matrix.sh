@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,faults,robust,hook-chain,metrics,wide}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e
 mkdir -p "$OUT"
@@ -201,6 +201,13 @@ phase_slow() { # <v>: slow-but-answering receiver: export_slow_ms parks live
   scripts/e2e-slow-receiver.sh "pglogtap-mx$1"
 }
 
+phase_faults() { # <v>: fault injection — a throwaway postgres under an
+  # LD_PRELOAD shim that fails fdatasync for one named file: rollback-and-
+  # retry on a file:// sink, keep-but-count on the fallback queue, and
+  # /dev/full write failure. Owns its own container; the stand is untouched.
+  scripts/e2e-faults.sh "$1"
+}
+
 phase_robust() { # <v>: robustness classes beyond the happy path — fields past
   # their ring slots, a logging backend SIGKILLed mid-emit (the PANIC/
   # emergency-restart path), and the RAM backlog's memory bound under a
@@ -256,6 +263,9 @@ for v in $VERSIONS; do
   fi
   if [ "$ok" = 1 ] && has_phase slow; then
     phase_slow "$v" || { echo "pg$v: slow-receiver FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase faults; then
+    phase_faults "$v" || { echo "pg$v: faults FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase robust; then
     phase_robust "$v" || { echo "pg$v: robust FAILED"; STATUS=1; ok=0; }

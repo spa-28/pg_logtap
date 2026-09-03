@@ -78,16 +78,19 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_fallback_broken 1 = the fallback queue file is foreign or corrupt and is neither appended to nor replayed: durability degraded to the RAM backlog bound until the GUC points at a different path or the worker restarts.
         \\# TYPE pg_logtap_fallback_broken gauge
         \\pg_logtap_fallback_broken {d}
+        \\# HELP pg_logtap_fb_sync_failures Failed fdatasync calls on the fallback queue, cumulative. Events of such a cycle are in the file but not durable (lost on OS crash, not on postmaster death); the log WARNING is once per failure streak, this counter is not — a growing value is a dying disk.
+        \\# TYPE pg_logtap_fb_sync_failures counter
+        \\pg_logtap_fb_sync_failures {d}
         \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern did not compile and that redaction layer is OFF (fail-open). The compile error text is in the server log.
         \\# TYPE pg_logtap_redact_pattern_failed gauge
         \\pg_logtap_redact_pattern_failed {d}
         \\
     , .{
-        snap.captured,              snap.dropped,         snap.sent,
-        snap.queued,                snap.replayed,        snap.compacted,
-        snap.send_failed,           snap.export_lost,     snap.count,
-        snap.capacity,              snap.dns_fail_streak, snap.fallback_broken,
-        snap.redact_pattern_failed,
+        snap.captured,         snap.dropped,               snap.sent,
+        snap.queued,           snap.replayed,              snap.compacted,
+        snap.send_failed,      snap.export_lost,           snap.count,
+        snap.capacity,         snap.dns_fail_streak,       snap.fallback_broken,
+        snap.fb_sync_failures, snap.redact_pattern_failed,
     });
 }
 
@@ -97,6 +100,7 @@ test "metrics response" {
     snap.capacity = 1024;
     snap.dns_fail_streak = 12;
     snap.fallback_broken = 1;
+    snap.fb_sync_failures = 3;
     snap.redact_pattern_failed = 1;
     var wbuf: [4096]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&wbuf);
@@ -108,6 +112,7 @@ test "metrics response" {
     // health gauges render with their values and stay inside the body buffer
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_dns_fail_streak 12\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fb_sync_failures 3\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;

@@ -59,8 +59,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.0/pg_logtap-0.4.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.4.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.2/pg_logtap-0.4.2-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.4.2-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -404,11 +404,12 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `events_captured` | events | a log line entered the shared ring |
 | `events_dropped` | events | the ring was full at capture — worker drain behind the rate |
 | `events_sent` | events | delivered to the export URL by a live send |
-| `events_queued` | events | durably appended to the fallback file |
+| `events_queued` | events | appended to the fallback file (a lifecycle stage, not a durability claim — see `fb_sync_failures`) |
 | `events_replayed` | events | delivered out of the fallback file after recovery |
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while still undelivered (also counted in `events_lost`, never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable queue member, or the `fallback_max_mb` cap trimming undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
 The view adds two derived columns: `queue_backlog` (`events_queued −
@@ -418,13 +419,14 @@ receiver).
 
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
 events_sent,events_queued,events_replayed,events_compacted,
-send_cycles_failed,events_lost}_total`
-(counters) + `pg_logtap_ring_{events,capacity}` and
+send_cycles_failed,events_lost}_total` (counters) +
+`pg_logtap_fb_sync_failures` (counter, named like its SQL/stats field,
+no `_total`) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
-dropped, export failing, fallback file broken, DNS failing, redact pattern
-failed).
+dropped, export failing, fallback file broken, DNS failing, queue sync
+failing, redact pattern failed).
 
 ## Development & Testing
 
@@ -465,6 +467,7 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: 
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
+scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
 PHASES=stand,bench scripts/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
 scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
