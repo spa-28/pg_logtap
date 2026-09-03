@@ -59,8 +59,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.0/pg_logtap-0.4.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.4.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.2/pg_logtap-0.4.2-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.4.2-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -467,6 +467,7 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: 
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
+scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
 PHASES=stand,bench scripts/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
 scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
