@@ -44,7 +44,8 @@ scaling governor halves TPS on developer boxes — the script warns).
 `scripts/storm.sh [secs] [pg_major] [modes]` is the same load without the
 baseline half: it builds the current tree, brings up the stand, and storms
 the "on" profiles (`loud,quiet,mute`, default `loud`) back to back on one
-stand — a mode flip is a reload. The `chain` mode is the loud profile
+stand — a mode flip is a reload. `plain` is statement volume without
+timings (`log_statement=all`), and `chain` is the loud profile
 exported to the real compose sinks (vector → console+file+victoria-logs),
 with delivery verified three ways: stats counters, the file sink's line
 count, and a count() from victoria-logs itself. Use the script to check a

@@ -11,6 +11,11 @@
 #   mute  — the loud config with log_destination='' (valid; mutes the
 #           server's own stderr while emit_log_hook still fires): isolates
 #           pg_logtap's cost from the server's own logging
+#   plain — every statement logged by name (log_statement=all, LOG level),
+#           no durations, no debug noise: statement volume like loud with
+#           the server's timing overhead off and readable message bodies.
+#           The prefix follows lc_messages («оператор:» under ru_RU) — grep
+#           by level, not by the prefix
 #   chain — the loud profile exported to the REAL compose chain (vector →
 #           console+file+victoria-logs) instead of the one-shot receiver:
 #           load-tests the prod-shaped sinks. Delivery is verified three
@@ -67,18 +72,20 @@ stats_field() { # <name> — value from pg_logtap_stats()
 
 # Every knob is assigned explicitly (nothing toggled), so a rerun reproduces
 # the mode from any stand state. ALTER SYSTEM one statement per -qc.
-set_mode() { # <loud|quiet|mute|chain>
-  local msg_min=warning lvl=15 dest=stderr
+set_mode() { # <loud|quiet|mute|chain|plain>
+  local msg_min=warning lvl=15 dest=stderr stmt=none
   case $1 in
     loud | mute | chain) msg_min=debug1 lvl=10 ;;
+    plain) stmt=all ;; # every statement by name (LOG level), no timings
     quiet) ;;
-    *) echo "unknown mode '$1' (loud|quiet|mute)" >&2; exit 1 ;;
+    *) echo "unknown mode '$1' (loud|quiet|mute|chain|plain)" >&2; exit 1 ;;
   esac
   local dur=-1
   [ "$msg_min" = debug1 ] && dur=0
   [ "$1" = mute ] && dest=""
   docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET log_min_messages = '$msg_min'" \
     -qc "ALTER SYSTEM SET log_min_duration_statement = $dur" \
+    -qc "ALTER SYSTEM SET log_statement = '$stmt'" \
     -qc "ALTER SYSTEM SET pg_logtap.level_min = $lvl" \
     -qc "ALTER SYSTEM SET log_destination = '$dest'" \
     -qc "SELECT pg_reload_conf()" >/dev/null
@@ -166,9 +173,10 @@ for mode in ${MODES//,/ }; do
     # export stays on the compose chain: vector sinks to console+file+vlogs
     docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
       -qc "SELECT pg_reload_conf()" >/dev/null
-    # rotate the file sink's dump so its line count is this run's delivery
-    # (host-side truncate: the container keeps its fd and the space is freed)
-    [ -f "$DUMP" ] && : > "$DUMP"
+    # delivery into the file sink is counted as a line delta: the dump is
+    # root-owned (vector's container creates it), so no truncating from the
+    # host — and it grows unbounded, clean /tmp/logtap-e2e between runs
+    lines0=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
     sleep 2
   else
     start_rx
@@ -204,7 +212,7 @@ for mode in ${MODES//,/ }; do
   echo "RESULT[$mode] events/s=$((cap / SECS)) captured=$cap sent=$snt dropped=$drp lost=$lst worker_rss=$((rss / 1024))MB cpu=${cpu}%"
 
   if [ "$mode" = chain ]; then
-    lines=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
+    lines=$(( $(wc -l < "$DUMP" 2>/dev/null || echo 0) - lines0 ))
     echo "RESULT[chain] vector_file_lines=$lines (end-to-end delivery into the file sink)"
     # ask victoria-logs itself how much it ingested over this window
     docker run --rm --network "$NET" curlimages/curl:8.8.0 -G -s \
@@ -232,6 +240,7 @@ done
 echo "-- restore quiet config"
 docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET log_min_messages = 'warning'" \
   -qc "ALTER SYSTEM SET log_min_duration_statement = -1" \
+  -qc "ALTER SYSTEM SET log_statement = 'none'" \
   -qc "ALTER SYSTEM SET pg_logtap.level_min = 15" \
   -qc "ALTER SYSTEM RESET log_destination" \
   -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
