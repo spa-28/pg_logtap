@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.4 (2026-09-04)
+
+TCP-stream parsing and accounting round from the fourth external review.
+Upgrade is the 0.4.3 → 0.4.4 script (schema unchanged — the script only
+provides the update path) + binary replace + restart; no new GUCs or
+counters.
+
+### Fixed
+
+- The HTTP status line is read across recv boundaries. A receiver whose
+  "HTTP/1.1 200" lands as two reads (TCP preserves no write boundaries)
+  failed the one-recv read — a batch the receiver had already accepted
+  got parked and replayed (a contract-legal duplicate) while the fallback
+  divert fired on a live receiver. The read now accumulates to the bytes
+  the status parse needs; each recv stays bounded by the send timeout.
+- A /metrics request line is read across recv boundaries the same way: a
+  fragmented GET parsed as a wrong path and was answered 404 (the scraper
+  retries, but the endpoint now sees a complete request line; the whole
+  read is still bounded by the previous ~100ms wait).
+- Compaction counts an unreadable (corrupt gzip) member it drops as one
+  lost event, exactly as the replay path counts the same member — before,
+  the same corrupt file produced a lower `events_lost` through compaction
+  than through replay.
+- A file:// rollback that itself fails (the `ftruncate` cutting away a
+  torn write's prefix) warns once instead of passing silently: one torn
+  line stays in the sink and the next batch appends after it — a
+  dying-disk signal. Both file:// warned-once latches (sync, rollback)
+  re-arm after a clean batch, so the next independent failure is visible.
+
+### Hardening
+
+- Fallback framing sanity bound: a member's compressed length is refused
+  above `body_cap` + one serialized event (+64K of slack) — the largest
+  member this build (or 0.3.x, ≤ ~371KB) can write — instead of the
+  previous 512 MiB catch-all, so garbage framing cannot request an
+  absurd allocation before the short-pread/torn-tail check frees it.
+
+### Internal
+
+- e2e: a receiver answering "HTTP/1." … "1 200 OK" in two writes 300ms
+  apart is accepted (every event delivered once, nothing parked on the
+  live receiver); a fragmented `GET /metrics` gets the metrics body
+  instead of a 404.
+
 ## 0.4.3 (2026-09-03)
 
 Filesystem-hardening round from the third external review. Upgrade is the

@@ -59,8 +59,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.3/pg_logtap-0.4.3-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.4.3-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.4.4/pg_logtap-0.4.4-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.4.4-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```

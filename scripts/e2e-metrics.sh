@@ -60,5 +60,28 @@ sleep 2
 echo "scrapes_with_metrics=$got"
 tail -1 "$OUT" 2>/dev/null || true
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
+
+# Fragmented GET: TCP owes the client no write boundaries — a request line
+# straddling recvs must still parse. A one-recv request read sees "GET /met",
+# parses the path as "/met" and answers 404. Send in two pieces (gap well
+# inside the read's ~100ms wait, far above container-network RTT) and demand
+# the real metrics body.
+echo "== fragmented GET: the request line straddles recvs =="
+docker run --rm --network "$NET" python:3-alpine python -c "
+import socket, time
+s = socket.create_connection(('$PG_CT', $PORT), timeout=8)
+s.sendall(b'GET /met')
+time.sleep(0.03)
+s.sendall(b'rics HTTP/1.1\r\n\r\n')
+time.sleep(0.3)
+data = s.recv(65536)
+assert data.startswith(b'HTTP/1.1 200'), data.split(b'\r\n', 1)[0]
+assert b'pg_logtap_' in data, 'metrics body missing'
+print('frag-get ok:', data.split(b'\r\n', 1)[0].decode())
+" || {
+  echo "e2e-metrics: FAILED: fragmented GET not answered with the metrics body" >&2
+  docker rm -f pglogtap-vector-metrics >/dev/null
+  exit 1
+}
 docker rm -f pglogtap-vector-metrics >/dev/null
 [ "$got" -ge 1 ]

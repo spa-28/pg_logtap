@@ -17,7 +17,7 @@ view) restarts from zero on every restart.
 |---|---|---|---|
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
 | `tcp://` | **at-most-once** live; **at-least-once** once `export_fallback_file` is set — a failed send (including a partial write the receiver did see) parks the batch to the queue and it is retried | none — `write(2)` success counts as delivered | with the queue set: the receiver accepted the data but the send failed anyway (torn write, timeout) → the parked retry resends it. Without the queue there is no duplicate window — a receiver dying after accept loses silently; use `http://` for loss-sensitive receivers |
-| `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle |
+| `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle; a rollback that fails too is warned once — one torn line stays and the next batch appends after it (dying-disk signal) |
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
 
 Three honesty notes on those ACKs. `http://`: **any 2xx** counts as
