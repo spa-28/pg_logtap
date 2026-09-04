@@ -153,9 +153,17 @@ fn shmemStartupHook() callconv(.c) void {
         state.message_max = @intCast(guc_message_max);
         // Seed seq from the wall clock (µs since 2000-01-01): each second of
         // uptime advances the seed by 1e6 but consumes <1e6 values unless the
-        // capture rate exceeds 1M events/s, so seq never repeats on a host
+        // capture rate exceeds 1M events/s, so seq does not repeat on a host
         // across restarts — receivers may dedup on (host, seq) long-term.
-        state.seq_next = @intCast(pg.GetCurrentTimestamp());
+        // Caveat: a wall clock stepped backwards between restarts regresses
+        // the seed (delivery.md: dedup on (host, seq, timestamp) to be safe).
+        // @max: a pre-2000 clock (dead CMOS battery, pre-NTP boot) makes the
+        // raw value negative — @intCast would panic in the postmaster during
+        // shmem init and take the whole boot down; at 0 the ordering and
+        // dedup claims still hold. Per-cluster state: two clusters on one
+        // host seed overlapping ranges (delivery.md: set cluster_name and
+        // include it in the dedup key).
+        state.seq_next = @intCast(@max(pg.GetCurrentTimestamp(), 0));
         @memset(entries_base[0 .. @as(usize, stride) * cap], 0);
     }
     pg.LWLockInitialize(@ptrCast(&state.lock), tranche_id);

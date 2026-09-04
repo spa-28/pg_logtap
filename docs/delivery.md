@@ -53,8 +53,12 @@ reordering.
 JSON/JS-safe) at shared-memory init. Each second of uptime advances the seed by
 10⁶ µs but consumes fewer than 10⁶ values unless capture exceeds 1M events/s,
 so `seq` never repeats on a host across restarts and `(host, seq)` is a safe
-dedup key long-term. Caveat: a wall clock stepped backwards can regress the
-seed; for absolute safety dedup on `(host, seq, timestamp)`.
+dedup key long-term. Caveats: a wall clock stepped backwards can regress the
+seed — for absolute safety dedup on `(host, seq, timestamp)`; and `seq` is
+per-cluster state — two Postgres clusters on one host seed overlapping ranges,
+so there set `cluster_name` (it is empty by default) and dedup on
+`(host, cluster, seq)`. The seed is clamped at 0: a pre-2000 wall clock (dead
+CMOS battery, pre-NTP boot) would otherwise be negative and unrepresentable.
 
 Receiver-side dedup recipe (Vector):
 
@@ -63,7 +67,9 @@ transforms:
   dedup:
     type: dedup
     inputs: ["pg_logtap"]
-    fields.match: ["host", "seq"]
+    # cluster is null while cluster_name is unset — matches everything,
+    # i.e. the one-cluster-per-host case; set it to make the key cluster-safe
+    fields.match: ["host", "cluster", "seq"]
     cache.num_events: 100000   # ~one retry window of duplicates
 ```
 
