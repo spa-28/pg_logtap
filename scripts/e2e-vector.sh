@@ -3,7 +3,7 @@
 # The receiver is the compose stand's vector (tests/e2e/compose.yaml); its
 # output file accumulates across runs, so counting is by distinct markers.
 # Usage: scripts/e2e-vector.sh [pg_container] [events]
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init vector "${1:-}"
 EVENTS="${2:-20}"
@@ -19,7 +19,7 @@ i=0
 while [ "$i" -lt "$EVENTS" ]; do
   # Distinct messages, run-unique ($$ suffix — the output accumulates across
   # runs): identical markers would hide fan-out, dedup and this-run bugs.
-  docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'logtap e2e event -$$ %', $i; END \$\$" >/dev/null 2>&1 || true
+  docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'logtap e2e event -$$ %', $i; END \$\$" >/dev/null 2>&1
   i=$((i + 1))
 done
 

@@ -4,7 +4,7 @@
 # is preloaded BEFORE pg_logtap, which makes it pg_logtap's prev_hook — every
 # event must reach it first AND still be captured by pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init hookchain "${1:-}"
 e2e_gate
@@ -41,7 +41,7 @@ restore() {
   psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = '$SAVED_LIST'" \
     -qc "ALTER SYSTEM SET pg_logtap.export_url = '$URL_SAVED'" >/dev/null
   docker restart "$PG_CT" >/dev/null
-  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1 || true
+  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1
   wait_ready
 }
 trap restore EXIT INT TERM

@@ -1,13 +1,13 @@
 #!/bin/sh
 # M4 acceptance: worker serves /metrics; Vector prometheus_scrape reads it.
 # Usage: scripts/e2e-metrics.sh [pg_container] [port]
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init metrics "${1:-}"
 PORT="${2:-9187}"
 e2e_gate
 OUT=/tmp/logtap-metrics/vector-metrics.jsonl
-docker rm -f pglogtap-vector-metrics >/dev/null 2>&1 || true
+docker rm -f pglogtap-vector-metrics >/dev/null 2>&1
 mkdir -p /tmp/logtap-metrics
 : > "$OUT" # fresh scrape log for this run's count
 # Scrape target follows $PG_CT (no hardcoded container); the listener is
@@ -38,11 +38,11 @@ sleep 3
 # default; Vector scrapes from another container, so open it up explicitly.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.metrics_addr = '0.0.0.0'" \
   -qc "ALTER SYSTEM SET pg_logtap.metrics_port = $PORT" -qc "SELECT pg_reload_conf()" >/dev/null
-docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'metrics e2e'; END \$\$" >/dev/null 2>&1 || true
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'metrics e2e'; END \$\$" >/dev/null 2>&1
 
 got=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-  [ -f "$OUT" ] && got=$(grep -c 'pg_logtap_events_captured_total' "$OUT" 2>/dev/null || true)
+  [ -f "$OUT" ] && got=$(grep -c 'pg_logtap_events_captured_total' "$OUT" 2>/dev/null)
   [ "$got" -ge 1 ] && break
   sleep 1
 done
@@ -50,7 +50,7 @@ done
 sleep 2
 
 echo "scrapes_with_metrics=$got"
-tail -1 "$OUT" 2>/dev/null || true
+tail -1 "$OUT" 2>/dev/null
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
 
 # Fragmented GET: TCP owes the client no write boundaries — a request line

@@ -33,7 +33,7 @@
 # Usage: scripts/e2e-robust.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init robust "${1:-}"
 e2e_gate
@@ -56,7 +56,7 @@ drain_ring
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'logtap robust huge$SUF % %', 0, repeat('é', 8000)
     USING DETAIL = repeat('д', 1000), ERRCODE = '01000';
-  END \$\$" >/dev/null 2>&1 || true
+  END \$\$" >/dev/null 2>&1
 wait_for huge 1 "" 20
 [ "$(received huge)" = 1 ] || fail "huge-fields: $(received huge) events for one RAISE (expected exactly 1)"
 json_check huge >/dev/null || fail "huge-fields: delivered line is not valid JSON/UTF-8"
@@ -88,7 +88,7 @@ docker exec "$PG_CT" psql -U postgres -qc \
 # token only in the statement text (trailing comment), not in the message
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redq$SUF 0 benign password note'; END \$do\$; -- password 'SECRET-do$SUF-abc123'" \
-  >/dev/null 2>&1 || true
+  >/dev/null 2>&1
 setguc pg_logtap.redact_pattern 'SECRET-[a-z0-9-]+'; reload; sleep 1
 # Before the pattern switches on — the DETAIL probes below must be masked by
 # the password VALUE cut alone: a secret assigned to the token is masked,
@@ -96,10 +96,10 @@ setguc pg_logtap.redact_pattern 'SECRET-[a-z0-9-]+'; reload; sleep 1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redd$SUF 0' USING DETAIL = 'password = ''SECRET-det$SUF-xyz789'' and user alice';
   RAISE WARNING 'logtap robust redd$SUF 1' USING DETAIL = 'password authentication failed for user \"alice\"';
-  END \$do\$" >/dev/null 2>&1 || true
+  END \$do\$" >/dev/null 2>&1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redp$SUF 0 token=SECRET-msg$SUF-abc123'; END \$do\$" \
-  >/dev/null 2>&1 || true
+  >/dev/null 2>&1
 wait_for redq 1 "" 20; wait_for redp 1 "" 20; wait_for redd 2 "" 20
 # vector-out.jsonl accumulates across runs BY DESIGN: the secrets carry this
 # run's suffix so stale lines from earlier runs cannot fail this one.
@@ -149,17 +149,17 @@ EOF
 setguc pg_logtap.redact_pattern 'ZZ'; reload; sleep 1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redclip$SUF 0 %', repeat('ZZ ', 316);
-  END \$do\$" >/dev/null 2>&1 || true
+  END \$do\$" >/dev/null 2>&1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redboth$SUF 0 x' USING DETAIL = repeat('ZZ ', 400);
-  END \$do\$" >/dev/null 2>&1 || true
+  END \$do\$" >/dev/null 2>&1
 # The password value cut clips on this 1800-byte DETAIL (past the 1025-byte
 # scratch); redact_pattern 'ZZ' does not match the filler, so the regex layer
 # does not clip — the clip of the FIRST layer must still reach redacted_mask.
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redor$SUF 0' USING DETAIL =
     'password = ''SECRET-or$SUF-xyz789'' tail ' || repeat('ab ', 600);
-  END \$do\$" >/dev/null 2>&1 || true
+  END \$do\$" >/dev/null 2>&1
 wait_for redclip 1 "" 20; wait_for redboth 1 "" 20; wait_for redor 1 "" 20
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
 import json, sys
@@ -194,7 +194,7 @@ for line in open(path, encoding="utf-8"):
 assert clip and both and orflag, "probes missing (clip=%s both=%s or=%s)" % (clip, both, orflag)
 EOF
 ok "redaction clip and slot overflow reported separately (redacted vs truncated)"
-docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1 || true
+docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
 
@@ -215,7 +215,7 @@ ok "redact_pattern_failed: invalid pattern → 1, reset → 0 (fail-open is visi
 # the token cut can mask.
 setguc log_min_duration_statement 0; reload; sleep 1
 docker exec "$PG_CT" sh -c "printf '%s\n' \"SELECT 'ext$SUF' AS tag, 'password' AS kw, 'SECRET-exec$SUF-abc123' AS val;\" > /tmp/probe-ext.sql"
-docker exec "$PG_CT" pgbench -U postgres -M extended -c 1 -t 1 -f /tmp/probe-ext.sql postgres >/dev/null 2>&1 || true
+docker exec "$PG_CT" pgbench -U postgres -M extended -c 1 -t 1 -f /tmp/probe-ext.sql postgres >/dev/null 2>&1
 n=0; while [ "$n" -lt 20 ]; do
   # tail: vector-out.jsonl grows to GiB across runs, but this run's lines
   # land at the end — grepping the tail keeps the wait cheap
@@ -255,7 +255,7 @@ vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
 if [ "$vnum" -ge 160000 ]; then
   # -i: without it docker exec does not forward stdin, psql reads an empty
   # buffer and silently runs nothing
-  docker exec -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF || true
+  docker exec -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF
 SELECT 'bindtag$SUF' AS tag, \$1::text, \$2::text \bind 'SECRET-bind$SUF-xyz789' 'pw''d'
 \g
 EOF
@@ -291,7 +291,7 @@ else
 SELECT 'p15bind$SUF' AS tag, :v::text;
 EOF"
   docker exec "$PG_CT" pgbench -U postgres -M extended -t 1 -c 1 \
-    -f /tmp/p15bind.sql -D "v=SECRET-p15bind$SUF-xyz789" postgres >/dev/null 2>&1 || true
+    -f /tmp/p15bind.sql -D "v=SECRET-p15bind$SUF-xyz789" postgres >/dev/null 2>&1
   docker exec "$PG_CT" rm -f /tmp/p15bind.sql
   n=0; while [ "$n" -lt 20 ]; do
     [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -c "p15bind$SUF")" -gt 0 ] && break
@@ -329,7 +329,14 @@ END \$\$" >/dev/null 2>&1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'exc-control$SUF no token anywhere';
 END \$\$" >/dev/null 2>&1
-wait_for "exc-control$SUF" 1 "" 10
+# The control event carries free text (no numbered marker tail), so wait on
+# the raw line count, not the marker counter.
+n=0; while [ "$n" -lt 10 ]; do
+  [ "$(grep -c "exc-control$SUF" "$OUT/vector-out.jsonl")" -ge 1 ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "$(grep -c "exc-control$SUF" "$OUT/vector-out.jsonl")" -ge 1 ] \
+  || fail "pattern_exclude: the token-free neighbor never reached the receiver"
 [ "$(grep -c "exc-suppressed$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
   || fail "pattern_exclude: event with the token in DETAIL reached the receiver"
 [ "$(grep -c "HIDEME$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
@@ -344,7 +351,7 @@ echo "== backend kill mid-emit: the PANIC path (emergency restart) =="
 # rebuild, recovery.
 setguc log_min_duration_statement 0; reload
 # -i is idempotent; the storm phase may not have run before this suite.
-docker exec "$PG_CT" pgbench -i -q -U postgres postgres >/dev/null 2>&1 || true
+docker exec "$PG_CT" pgbench -i -q -U postgres postgres >/dev/null 2>&1
 # premax BEFORE pgbench starts: scanning the accumulated output file can take
 # seconds, and pgbench's whole run is 30s — grep first, kill while the backend
 # is guaranteed alive (the race killed a pg18 run: backend exited, "kill: No
@@ -361,7 +368,7 @@ done
 [ -n "$bepid" ] || fail "backend-kill: no pgbench backend appeared"
 # The pid can vanish between the lookup and the kill (seen in CI: a pgbench
 # client hitting its -T deadline, or finishing, right in the window) — "kill:
-# No such process" then aborts the whole suite under set -e. Re-find until
+# No such process" then fails the loop body — Re-find until
 # the kill lands: the scenario needs an abnormal death, not a specific pid.
 n=0; while [ "$n" -lt 10 ]; do
   docker exec "$PG_CT" bash -c "kill -9 $bepid" 2>/dev/null && break
@@ -412,7 +419,7 @@ rss1=$(vmrss_kb)
 # High-water mark of the whole container (cgroup v2, v1 fallback): the wall
 # must never even be touched — no reclaim storms, no OOM victim of any kind.
 peak=$(docker exec "$PG_CT" cat /sys/fs/cgroup/memory.peak 2>/dev/null || \
-       docker exec "$PG_CT" cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null || true)
+       docker exec "$PG_CT" cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null)
 [ -z "$peak" ] || [ "$peak" -lt $((OOM_LIMIT_MB * 1024 * 1024)) ] \
   || fail "backlog-bound: cgroup memory peak ${peak}B touched the ${OOM_LIMIT_MB}MB ceiling"
 docker update --memory 0 --memory-swap 0 "$PG_CT" >/dev/null
@@ -490,7 +497,7 @@ echo "== fragmented HTTP status: the line straddles recvs =="
 # dns_good cache exists for — but that cache cannot bootstrap a first-ever
 # name), and this scenario tests the status read, not the resolver.
 FRAG=pglogtap-frag-sink
-docker rm -f "$FRAG" >/dev/null 2>&1 || true
+docker rm -f "$FRAG" >/dev/null 2>&1
 docker run -d --rm --name "$FRAG" --network "$NET" python:3-alpine python -u -c '
 import socket, time
 srv = socket.socket()
@@ -557,7 +564,7 @@ n=0; while [ "$n" -lt 30 ]; do
   n=$((n + 1)); sleep 1
 done
 setguc pg_logtap.export_fallback_file ''; reload
-docker rm -f "$FRAG" >/dev/null 2>&1 || true
+docker rm -f "$FRAG" >/dev/null 2>&1
 [ "${uni:-0}" -ge 300 ] || fail "frag-status: the sink saw ${uni:-0}/300 unique events — delivery itself broke"
 [ "$tot" = "$uni" ] \
   || fail "frag-status: $tot lines delivered for $uni events — a delivered batch was retried (one-recv status read)"

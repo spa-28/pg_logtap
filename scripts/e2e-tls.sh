@@ -12,7 +12,7 @@
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init tls "${1:-}"
 N="${2:-10}"
@@ -89,7 +89,7 @@ httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 PYEOF
 RECV=$!
-trap 'kill $RECV 2>/dev/null || true' EXIT INT TERM
+trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
 until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
@@ -111,7 +111,7 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_tls_server_name = 'localhost'" \
   "pg_logtap.export_tls_verify = on"
 gen p1 "$N"
-wait_for p1 "$N" "$OUT" || { echo "e2e-tls: phase 1 (verified https) delivered $(received p1 "$OUT")/$N"; exit 1; }
+wait_for p1 "$N" "$OUT"
 echo "phase 1 ok: verified https delivered $N/$N"
 
 # --- phase 2: no CA → handshake must fail, then recover with replay
@@ -127,8 +127,8 @@ FAILED=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" |
 [ "$(received p2fail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2 leaked $(received p2fail "$OUT") events through an unverified handshake"; exit 1; }
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen p2re "$N" # live events join the buffered ones on recovery
-wait_for p2fail "$N" "$OUT" || { echo "e2e-tls: phase 2 (replay after ca restored) delivered p2fail $(received p2fail "$OUT")/$N"; exit 1; }
-wait_for p2re "$N" "$OUT" || { echo "e2e-tls: phase 2 (live on recovery) delivered p2re $(received p2re "$OUT")/$N"; exit 1; }
+wait_for p2fail "$N" "$OUT"
+wait_for p2re "$N" "$OUT"
 echo "phase 2 ok: $FAILED failed cycles, nothing delivered unverified, $N buffered + $N live replayed"
 
 # --- phase 2b: a CA file that exists but holds no certificates (created
@@ -144,23 +144,38 @@ FAILED2=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" 
 [ "$(received p2bfail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2b leaked $(received p2bfail "$OUT") events through a certificate-less CA"; exit 1; }
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen p2bre "$N"
-wait_for p2bfail "$N" "$OUT" || { echo "e2e-tls: phase 2b (replay after ca restored) delivered p2bfail $(received p2bfail "$OUT")/$N"; exit 1; }
-wait_for p2bre "$N" "$OUT" || { echo "e2e-tls: phase 2b (live on recovery) delivered p2bre $(received p2bre "$OUT")/$N"; exit 1; }
+wait_for p2bfail "$N" "$OUT"
+wait_for p2bre "$N" "$OUT"
 echo "phase 2b ok: empty-ca file failed $((FAILED2 - FAILED)) cycles, nothing delivered"
 
 # --- phase 3: tcps, raw NDJSON over TLS
 set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TCPS'"
 gen p3 "$N"
-wait_for p3 "$N" "$TCPS_OUT" || { echo "e2e-tls: phase 3 (tcps) delivered $(received p3 "$TCPS_OUT")/$N"; exit 1; }
+wait_for p3 "$N" "$TCPS_OUT"
 echo "phase 3 ok: tcps delivered $N/$N"
 
 # --- phase 4: verify=off keeps delivering but says so — exactly one WARNING
-# per worker life, the operator-visible trace of the footgun
+# per worker life, the operator-visible trace of the footgun. Restart the
+# worker (postmaster respawns the bgworker; shmem counters survive) so the
+# once-per-life flag is provably fresh: this phase must add exactly one
+# warn_tls_no_verify, whatever earlier runs left in the counter. verify
+# goes back ON first — a previously failed run may have left it off, and a
+# worker booting with it off would warn before the baseline is taken.
+set_gucs "pg_logtap.export_tls_verify = 'on'"
+old_wpid=$(worker_pid)
+docker exec "$PG_CT" kill -TERM "$old_wpid"
+n=0; while [ "$n" -lt 15 ]; do
+  newpid=$(worker_pid)
+  [ -n "$newpid" ] && [ "$newpid" != "$old_wpid" ] && break
+  n=$((n + 1)); sleep 1
+done
+[ -n "${newpid:-}" ] && [ "$newpid" != "$old_wpid" ] || fail "e2e-tls: worker did not respawn after TERM"
+warns0=$(statf warn_tls_no_verify)
 set_gucs "pg_logtap.export_tls_verify = 'off'"
 sleep 3
 gen p4 "$N"
-wait_for p4 "$N" "$TCPS_OUT" || { echo "e2e-tls: phase 4 (verify=off) delivered $(received p4 "$TCPS_OUT")/$N"; exit 1; }
-WARNS=$(docker logs "$PG_CT" 2>&1 | grep -c "export_tls_verify=off")
+wait_for p4 "$N" "$TCPS_OUT"
+WARNS=$(( $(statf warn_tls_no_verify) - warns0 ))
 [ "$WARNS" -eq 1 ] || { echo "e2e-tls: phase 4 expected exactly one verify=off WARNING, got $WARNS"; exit 1; }
 set_gucs "pg_logtap.export_tls_verify = 'on'"
 echo "phase 4 ok: verify=off delivered, warned once"

@@ -37,7 +37,11 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
    and the queue is disabled; redact_pattern_failed — 1 = redact_pattern did
    not compile, redaction is off (fail-open).
    0.4.2 gauge: fb_sync_failures — failed fdatasync calls on the fallback
-   queue, cumulative (queued events written but not durable). */
+   queue, cumulative (queued events written but not durable).
+   0.5.0 counters: warn_tls_no_verify / warn_fb_open / warn_fb_skipped /
+   warn_fb_unbounded — operator-facing WARNING lines the extension emitted,
+   cumulative per kind (the lines are edge-triggered, once per worker life
+   or per transition; these are the queryable copy for tests and alerts). */
 CREATE TYPE pg_logtap_stats_t AS (
     events_captured      bigint,
     events_dropped       bigint,
@@ -54,7 +58,11 @@ CREATE TYPE pg_logtap_stats_t AS (
     dns_fail_streak      bigint,
     fallback_broken      bigint,
     fb_sync_failures     bigint,
-    redact_pattern_failed bigint
+    redact_pattern_failed bigint,
+    warn_tls_no_verify   bigint,
+    warn_fb_open         bigint,
+    warn_fb_skipped      bigint,
+    warn_fb_unbounded    bigint
 );
 
 CREATE VIEW pg_logtap_delivery AS

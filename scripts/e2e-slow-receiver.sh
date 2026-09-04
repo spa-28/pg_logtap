@@ -9,7 +9,7 @@
 # Usage: scripts/e2e-slow-receiver.sh [pg_container] [sink_port]
 # The stand (tests/e2e/compose.yaml) provides the network; this sink is
 # suite-local on purpose — the test toggles its delay mid-run (up_sink).
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init slow "${1:-}"
 PORT="${2:-9498}"
@@ -20,13 +20,13 @@ e2e_gate
 # bare 200 after N seconds while `cat` drains the request body. N=1: every
 # send succeeds (failure path never fires) yet every send is "slow".
 up_sink() { # $1 = seconds to delay the response
-  docker rm -f "$SINK" >/dev/null 2>&1 || true
+  docker rm -f "$SINK" >/dev/null 2>&1
   docker run -d --name "$SINK" --network "$NET" alpine/socat \
     "TCP-LISTEN:$PORT,reuseaddr,fork" \
     SYSTEM:"(sleep $1; printf 'HTTP/1.0 200 OK\r\n\r\n') & cat >/dev/null" >/dev/null
   sleep 1
 }
-cleanup() { docker rm -f "$SINK" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$SINK" >/dev/null 2>&1; }
 trap cleanup EXIT
 
 # 250ms slow threshold, 1s answers, 3s hard timeout.
@@ -60,7 +60,7 @@ que=$((que - bque)); sent=$((sent - bsent))
 # bash read -t pattern is deliberate — see e2e-silent-receiver.sh.
 healthz=$(docker exec "$PG_CT" bash -c \
   'exec 3<>/dev/tcp/127.0.0.1/9187 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && IFS= read -r -t 8 line <&3 && echo "$line"' \
-  2>/dev/null || true)
+  2>/dev/null)
 
 echo "  phaseA: parked=$que sent=$sent dropped=$drp lost=$lost healthz=${healthz:-none}"
 [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ]

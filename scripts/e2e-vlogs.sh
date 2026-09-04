@@ -5,7 +5,7 @@
 # counts only this run's markers (PID suffix), so count < N is loss and
 # count > N is duplicate delivery — both fail.
 # Usage: scripts/e2e-vlogs.sh [pg_container] [events]
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init vlogs "${1:-}"
 EVENTS="${2:-50}"
@@ -32,8 +32,8 @@ n=0
 while [ "$n" -lt 20 ]; do
   resp=$(docker run --rm --quiet --network "$NET" alpine:3.20 \
     wget -qO- "http://vlogs:9428/select/logsql/query?query=$(enc "\"$M\" | limit 10000")" \
-    2>/dev/null || true)
-  count=$(printf '%s' "$resp" | grep -c "\"_msg\":\"$M " || true)
+    2>/dev/null)
+  count=$(printf '%s' "$resp" | grep -c "\"_msg\":\"$M ")
   [ "${count:-0}" -ge "$EVENTS" ] && break
   n=$((n + 1)); sleep 1
 done

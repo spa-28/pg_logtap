@@ -636,6 +636,7 @@ var warned_tls_no_verify = false;
 fn tlsOpts() tls_mod.Options {
     if (!guc_export_tls_verify and !warned_tls_no_verify) {
         warned_tls_no_verify = true;
+        capture.noteWarn(.tls_no_verify);
         elog.Warning(@src(), "pg_logtap export_tls_verify=off: https/tcps certificate verification is DISABLED — a man in the middle can read the logs", .{});
     }
     return .{

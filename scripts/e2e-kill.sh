@@ -29,7 +29,7 @@
 # Usage: scripts/e2e-kill.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init kill "${1:-}"
 e2e_gate
@@ -43,10 +43,10 @@ fail_extra() {
     docker exec "$E2E_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
     n=$((n + 1)); sleep 2
   done
-  docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2 || true
-  docker exec "$E2E_CT" getent hosts "$E2E_CT" >&2 || true
-  docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2 || true
-  docker logs --tail 8 "$VEC" >&2 2>&1 || true
+  docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2
+  docker exec "$E2E_CT" getent hosts "$E2E_CT" >&2
+  docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2
+  docker logs --tail 8 "$VEC" >&2 2>&1
 }
 
 echo "== receiver outage: down → up =="
@@ -115,19 +115,17 @@ FB="$FB_DIR/$FB_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
-# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so in
-# the log — exactly one WARNING per divert, not one per append. docker logs
-# --since does not reliably bound the window on a long-lived container (its
-# filter misses older entries), so count the DELTA over the whole log: what
-# the scenario added is what the divert produced.
-warns0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
+# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so —
+# exactly one WARNING per divert, not one per append. The warn_fb_unbounded
+# counter (in pg_logtap_stats) is the queryable copy of that log line.
+warns0=$(statf warn_fb_unbounded)
 setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-warns=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true) - warns0 ))
+warns=$(( $(statf warn_fb_unbounded) - warns0 ))
 [ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
 ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
@@ -148,9 +146,8 @@ echo "== torn queue tail: crash mid-append =="
 # The exact shape a crash mid-append leaves: magic, a member header claiming
 # 1000 bytes, then only 100. The worker's next read (its boot-time queue
 # walk) must cut the file back to the member boundary and append there —
-# not disable replay, not misparse the framing. (docker logs --since does
-# not bound the window on a long-lived container — count the delta.)
-corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
+# not disable replay, not misparse the framing (fallback_broken stays 0).
+corr0=$(statf fallback_broken)
 # Write the template while the fallback is still off (export_fallback_file=''
 # since the previous scenario) — the worker does not open the file at all.
 # Writing it after the reload instead raced the worker's own appends: parking
@@ -168,8 +165,7 @@ sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for torn1 20
 [ "$(received torn1)" = 20 ] || fail "torn queue tail: replay broken (torn1=$(received torn1)/20)"
-corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
-[ "$corr" = 0 ] || fail "torn queue tail: misparsed as corrupt instead of cut"
+[ "$(statf fallback_broken)" = "$corr0" ] || fail "torn queue tail: misparsed as corrupt instead of cut (fallback_broken=$(statf fallback_broken))"
 ok "torn tail cut at the member boundary, appends resumed, 20/20 replayed"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
@@ -195,7 +191,7 @@ while [ "$off" -lt "$sz" ]; do
   len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
   [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "corrupt member: framing unreadable at $off (len='$len')"
   end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
-  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null || true)
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
   case "$body" in
     *"logtap kill cmX"*)
       # A member holding cmX AND another marker means a flush-cycle stall
@@ -212,8 +208,6 @@ done
 for h in $hits; do
   docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=$((h + 4)) count=16 conv=notrunc" >/dev/null 2>&1
 done
-skip0=$(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true)
-corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
@@ -224,12 +218,11 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 # lost — one per damaged member (the member, not its events, is the loss
 # unit)
 [ "$(statf events_lost)" = "$nhits" ] || fail "corrupt member: events_lost=$(statf events_lost), want $nhits"
-skip=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true) - skip0 ))
-# twice per member by design: the boot walk that credits the backlog logs
-# it, then the drain's own read of the damaged member logs it again
+skip=$(statf warn_fb_skipped)
+# twice per member by design: the boot walk that credits the backlog counts
+# it, then the drain's own read of the damaged member counts it again
 [ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
-corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
-[ "$corr" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
+[ "$(statf fallback_broken)" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 [ "$fb_sz" = 0 ] || fail "corrupt member: queue not truncated after replay ($fb_sz bytes left)"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
@@ -245,13 +238,13 @@ echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # repointing the GUC or a restart re-checks — the foreign-file recovery).
 docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
-warn0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true)
+warn0=$(statf warn_fb_open)
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 gen sl1 20; sleep 3
 canary=$(docker exec "$PG_CT" cat "$FB_DIR/pg_logtap-canary" 2>/dev/null || echo GONE)
 [ "$canary" = "CANARY-INTACT" ] || fail "symlink queue: canary written through the symlink ('$canary')"
 [ "$(statf fallback_broken)" = 1 ] || fail "symlink queue: fallback_broken=$(statf fallback_broken), want 1 — a refused open must show on the gauge"
-warn=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true) - warn0 ))
+warn=$(( $(statf warn_fb_open) - warn0 ))
 [ "$warn" = 1 ] || fail "symlink queue: 'cannot be opened' warned $warn time(s), want 1 (once — fb_broken stops the re-opens)"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for sl1 20
@@ -325,7 +318,7 @@ wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
 gen dterm 300; sleep 1
 docker exec "$PG_CT" kill -TERM "$wpid"
 sleep 2 # flush entered its recv against the mute receiver
-docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null || true # worker ignores? no: exit now
+docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null # worker ignores? no: exit now
 gone_s=-1; n=0
 while [ "$n" -lt 10 ]; do
   docker exec "$PG_CT" psql -U postgres -Atc \

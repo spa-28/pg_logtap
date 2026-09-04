@@ -186,6 +186,7 @@ fn fbOpen() ?c_int {
     // the GUC or a restart re-checks, the same recovery as a foreign file.
     if (file_fd < 0) {
         broken = true;
+        capture.noteWarn(.fb_open);
         elog.Warning(@src(), "pg_logtap fallback queue cannot be opened (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, path() orelse "" });
         return null;
     }
@@ -388,6 +389,7 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
         const skip_at = offset; // framing is intact: skip past, count as loss
         offset += 4 + mlen;
         lost += 1;
+        capture.noteWarn(.fb_skipped);
         elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{skip_at});
         return null;
     };
@@ -585,8 +587,10 @@ pub fn logDivert(active: bool) void {
         // The transition guard above makes this once per divert, not once
         // per append: an unattended outage with no cap parks events until
         // the disk is full, and that deserves an operator-visible line.
-        if (guc_max_mb == 0)
+        if (guc_max_mb == 0) {
+            capture.noteWarn(.fb_unbounded);
             elog.Warning(@src(), "pg_logtap fallback queue is unbounded (fallback_max_mb=0): a long outage grows it until the disk is full; set fallback_max_mb to bound it", .{});
+        }
     } else {
         elog.Log(@src(), "pg_logtap fallback closed, receiver delivery resumed", .{});
     }

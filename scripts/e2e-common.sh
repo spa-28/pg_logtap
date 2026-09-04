@@ -50,11 +50,11 @@ e2e_gate() { # the compose stand must be up, freshly deployed, reachable
     || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
   # A stale .so (copied without a restart) would test yesterday's code.
   "$(dirname "$0")/e2e-require-ext.sh" "$E2E_CT"
-  docker network connect "$NET" "$E2E_CT" 2>/dev/null || true # non-stand pg arg
+  docker network connect "$NET" "$E2E_CT" 2>/dev/null # non-stand pg arg
   # A run that failed mid-suite may have left the receiver stopped; the next
   # run would fail its first scenario on a dead hostname. Start is a no-op
   # when already running.
-  docker start "$VEC" >/dev/null 2>&1 || true
+  docker start "$VEC" >/dev/null 2>&1
 }
 
 fail() {
@@ -63,12 +63,12 @@ fail() {
   # lines, both containers' state. The server-log grep scans the WHOLE log
   # and only then tails: a burst of the very events being lost once pushed
   # the "export failing (fail_reason)" line past a plain tail -15.
-  docker exec "$E2E_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
+  docker exec "$E2E_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2
   docker exec "$E2E_CT" psql -U postgres -Atc \
-    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
-  docker logs "$E2E_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2 || true
-  docker inspect -f "pg: {{.State.Status}} oom={{.State.OOMKilled}}" "$E2E_CT" >&2 || true
-  [ -n "${VEC:-}" ] && docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2 || true
+    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2
+  docker logs "$E2E_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2
+  docker inspect -f "pg: {{.State.Status}} oom={{.State.OOMKilled}}" "$E2E_CT" >&2
+  [ -n "${VEC:-}" ] && docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2
   command -v fail_extra >/dev/null 2>&1 && fail_extra # suite-specific extras
   exit 1
 }
@@ -120,12 +120,15 @@ received() { # received <marker> [file] — DISTINCT numbered marker events.
   grep -oE "logtap $E2E_TAG $1$E2E_SUF [0-9]+" "${2:-$OUT/vector-out.jsonl}" 2>/dev/null | sort -u | wc -l
 }
 seqs_of() { grep -E "logtap $E2E_TAG $1$E2E_SUF [0-9]+" "${2:-$OUT/vector-out.jsonl}" | grep -o '"seq":[0-9]*' | cut -d: -f2; }
-wait_for() { # wait_for <marker> <count> [file] [tries] — until received>=count
+wait_for() { # wait_for <marker> <count> [file] [tries] — FAILS on timeout
   n=0; tries=${4:-15}
   while [ "$n" -lt "$tries" ]; do
     [ "$(received "$1" "${3:-}")" -ge "$2" ] && return 0
     n=$((n + 1)); sleep 1
   done
+  # POSIX while returns the last body command (sleep = 0): falling through
+  # here silently once green-lit suites on follow-up asserts or on nothing.
+  fail "wait_for $1: received $(received "$1" "${3:-}") of $2 in ${tries}s"
 }
 worker_pid() { docker exec "$E2E_CT" psql -U postgres -Atc \
   "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE '%logtap%' LIMIT 1"; }

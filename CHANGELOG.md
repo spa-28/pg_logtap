@@ -3,8 +3,8 @@
 ## 0.5.0 (2026-09-04)
 
 TLS export and HTTP auth-header round. Upgrade is binary replace + restart
-(schema unchanged — the 0.5.0 script provides the install path); no new
-counters.
+(the 0.4.x view keeps working — `jsonb_populate_record` ignores the new
+stats fields); no new GUCs.
 
 ### Added
 
@@ -28,6 +28,14 @@ counters.
   https delivery, handshake must fail (and later replay) with the CA cleared
   and with an empty CA file, tcps delivery, verify=off delivering with
   exactly one WARNING.
+- Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
+  `warn_tls_no_verify`, `warn_fb_open`, `warn_fb_skipped`,
+  `warn_fb_unbounded` — the cumulative, queryable copy of the
+  operator-facing WARNING lines (verify=off seen, fallback queue
+  unopenable, unreadable member skipped, divert into an unbounded queue).
+  The log lines stay edge-triggered; the counters are for alerts and the
+  e2e suites. In `pg_logtap_delivery` only on fresh installs (the view
+  type gained the columns there); `/metrics` does not export them.
 
 ### Hardening
 
@@ -54,6 +62,15 @@ counters.
   e2e-kill's no-loss asserts became deltas — the counters are
   per-cluster-life and a reused container already carried a previous run's
   deliberate losses.
+- The e2e suites run under plain `set -u` (asserts are explicit; `set -e`
+  only bred `|| true` noise around every expected-to-fail command), and
+  `wait_for` FAILS on timeout instead of silently falling through — a wait
+  that rode the fall-through once green-lit suites on follow-up asserts or
+  on nothing. The four WARNING-count checks read the new warn_* counters
+  via `pg_logtap_stats()` instead of grepping `docker logs` (torn-tail
+  escalations via the `fallback_broken` gauge), and robust's
+  pattern_exclude control event is actually awaited now — the old marker
+  never matched.
 - The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
   the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
   chunk bounds shared with buildBody, and its boot path (compaction-litter

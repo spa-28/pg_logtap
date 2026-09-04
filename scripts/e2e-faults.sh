@@ -14,7 +14,7 @@
 #                       rolled back, events held in the RAM backlog, delivered
 #                       whole on the next receiver
 # Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
-set -eu
+set -u
 . "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
@@ -28,8 +28,8 @@ SO=dist/pg$V/lib/pg_logtap.so
 
 fail_extra() { # shim-specific post-mortem
   echo "shim target: $(docker exec "$CT" cat /tmp/fsyncfail-target 2>/dev/null || echo '<unset>')" >&2
-  docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2 || true
-  docker exec "$CT" sh -c "ls -la '${PGDATA_C:-}/$FB_REL' 2>/dev/null" >&2 || true
+  docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2
+  docker exec "$CT" sh -c "ls -la '${PGDATA_C:-}/$FB_REL' 2>/dev/null" >&2
 }
 
 mkdir -p "$OUT"
@@ -37,13 +37,13 @@ e2e_lock
 cc -shared -fPIC -Wall -Wextra tests/e2e/fsyncfail.c -o "$OUT/fsyncfail.so" -ldl
 
 FB_REL=pgfaults-queue.bin # PGDATA-relative, like a real deployment
-docker rm -f -v "$CT" >/dev/null 2>&1 || true
+docker rm -f -v "$CT" >/dev/null 2>&1
 docker run -d --name "$CT" -e POSTGRES_PASSWORD=dev \
   -v "$OUT/fsyncfail.so:/tmp/fsyncfail.so:ro" \
   -e LD_PRELOAD=/tmp/fsyncfail.so \
   -e FSYNCFAIL_COUNT=2 \
   postgres:"$V" >/dev/null || fail "could not start postgres:$V"
-cleanup() { docker rm -f -v "$CT" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f -v "$CT" >/dev/null 2>&1; }
 trap cleanup EXIT INT TERM
 
 wait_ready
