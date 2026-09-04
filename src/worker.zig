@@ -14,6 +14,7 @@ const ring = @import("ring.zig");
 const jsonl = @import("jsonl.zig");
 const capture = @import("capture.zig");
 const dest_mod = @import("export.zig");
+const tls_mod = @import("tls.zig");
 const gzip = @import("gzip.zig");
 const metrics = @import("metrics.zig");
 
@@ -59,6 +60,10 @@ var drain_msg: []u8 = &.{};
 var guc_export_url: [*c]u8 = null;
 var guc_cluster_name: [*c]u8 = null;
 var guc_export_gzip: bool = false;
+var guc_export_tls_ca: [*c]u8 = null;
+var guc_export_tls_verify: bool = true;
+var guc_export_tls_server_name: [*c]u8 = null;
+var guc_export_http_header: [*c]u8 = null;
 var guc_export_fallback_file: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
@@ -123,6 +128,10 @@ fn compactAborted() bool {
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_header", "Extra header line(s) appended verbatim to every http(s):// request after the fixed headers — e.g. E'Authorization: Bearer <token>\r\n' for VictoriaLogs. Multi-line values must carry their own CRLFs (write them as E'' strings). Empty = none.", null, &guc_export_http_header, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it. See docs/delivery.md.", null, &guc_export_fallback_file, "", pg.PGC_SIGHUP, 0, checkFallbackFile, null, null);
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -628,9 +637,43 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) b
     _ = url;
     return switch (dest) {
         .http => |h| sendHttp(h, body, gzipped),
-        .tcp => |t| sendRaw(dialTcp(t.host, t.port), body),
+        .tcp => |t| sendRaw(dialTcp(t.host, t.port), body, t.host, t.tls),
         .file => |path| sendFile(path, body),
     };
+}
+
+/// A GUC string as a plain slice; null (unset) reads as empty.
+fn gucSpan(v: [*c]u8) []const u8 {
+    return if (v == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+}
+
+fn tlsOpts() tls_mod.Options {
+    return .{
+        .ca = gucSpan(guc_export_tls_ca),
+        .server_name = gucSpan(guc_export_tls_server_name),
+        .verify = guc_export_tls_verify,
+    };
+}
+
+/// Fold tls.zig's detailed reason into the transition-log failure reason.
+fn tlsFail() bool {
+    fail_reason = std.fmt.bufPrint(&fail_reason_buf, "{s}", .{tls_mod.last_error}) catch "tls";
+    return false;
+}
+
+/// Abort-aware body write over TLS: one tls chunk may drain several socket
+/// writes (each bounded by SO_SNDTIMEO), so the shutdown/cycle budget is
+/// checked between chunks instead of between syscalls.
+fn tlsWriteBody(tc: *tls_mod.Conn, head: []const u8, body: []const u8) bool {
+    if (!tc.write(head)) return tlsFail();
+    var off: usize = 0;
+    while (off < body.len) {
+        if (sendAborted()) return failSend("tls abort", 0);
+        const want = @min(body.len - off, 64 * 1024);
+        if (!tc.write(body[off..][0..want])) return tlsFail();
+        off += want;
+    }
+    return true;
 }
 
 // --- fallback file: compressed durable queue, replayed on recovery ------------
@@ -1181,14 +1224,17 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
     // Fixed headers (method line, Host, content type/encoding/length) run
-    // ~110 bytes; 2048 leaves room for any realistic path and host, and one
-    // that still does not fit fails the send with the reason — not a torn
-    // header on the wire.
+    // ~110 bytes; 2048 leaves room for any realistic path, host and auth
+    // header, and one that still does not fit fails the send with the
+    // reason — not a torn header on the wire.
     var head_buf: [2048]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
+    const extra_hdr = gucSpan(guc_export_http_header);
+    if (extra_hdr.len > 0) head.writeAll(extra_hdr) catch return failSend("head build", 0);
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
+    if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
     if (!writeAll(conn_fd, head.buffered(), true)) return failSend("write head", std.c._errno().*);
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
@@ -1204,17 +1250,45 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
         if (nread == 0) return failSend("status read", std.c._errno().*);
         got += nread;
     }
-    if (!std.mem.startsWith(u8, status_buf[0..got], "HTTP/1.") or status_buf[9] != '2') {
-        return failSend("status code", @as(c_int, status_buf[9]));
+    return status2xx(status_buf[0..got]);
+}
+
+fn status2xx(status: []const u8) bool {
+    if (!std.mem.startsWith(u8, status, "HTTP/1.") or status[9] != '2') {
+        return failSend("status code", @as(c_int, status[9]));
     }
     return true;
 }
 
-fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
+fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) bool {
+    const tc = tls_mod.connect(conn_fd, h.host, tlsOpts()) orelse return tlsFail();
+    if (!tlsWriteBody(tc, head, body)) return false;
+    // sendAborted between reads here: the plain path checks it inside
+    // recvSome, but the TLS read goes through tls_mod's connection.
+    var status_buf: [32]u8 = undefined;
+    var got: usize = 0;
+    while (got < 12) {
+        if (sendAborted()) return failSend("tls abort", 0);
+        const nread = tc.readSome(status_buf[got..]);
+        if (nread == 0) return failSend("status read", 0); // detail, if any, sits in tls_mod.last_error
+        got += nread;
+    }
+    if (!status2xx(status_buf[0..got])) return false;
+    tc.end();
+    return true;
+}
+
+fn sendRaw(fd_opt: ?c_int, body: []const u8, host: []const u8, use_tls: bool) bool {
     // As sendHttp: the dial path already recorded why it failed.
     const conn_fd = fd_opt orelse return false;
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
+    if (use_tls) {
+        const tc = tls_mod.connect(conn_fd, host, tlsOpts()) orelse return tlsFail();
+        if (!tlsWriteBody(tc, "", body)) return false;
+        tc.end();
+        return true;
+    }
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     return true;
 }
@@ -1438,7 +1512,7 @@ fn failSend(stage: []const u8, err: c_int) bool {
     return false;
 }
 
-var fail_reason_buf: [64]u8 = undefined;
+var fail_reason_buf: [96]u8 = undefined; // wide enough for a tls.zig reason verbatim
 var fail_reason: []const u8 = "";
 
 fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool) bool {

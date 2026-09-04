@@ -1,12 +1,14 @@
 //! Export destination URL (pure, unit-tested). Formats:
-//!   http://host:port[/path]  plain HTTP POST, no TLS — Vector on localhost
-//!   tcp://host:port          raw JSON lines
-//!   file:///abs/path         append (0600)
+//!   http://host:port[/path]   plain HTTP POST — Vector on localhost
+//!   https://host:port[/path]  HTTP POST over TLS (see export_tls_* GUCs)
+//!   tcp://host:port           raw JSON lines
+//!   tcps://host:port          JSON lines over TLS
+//!   file:///abs/path          append (0600)
 //! IPv6 literal hosts are not supported (bracket parsing); hostname or IPv4 only.
 const std = @import("std");
 
-pub const Endpoint = struct { host: []const u8, port: u16 };
-pub const Http = struct { host: []const u8, port: u16, path: []const u8 };
+pub const Endpoint = struct { host: []const u8, port: u16, tls: bool = false };
+pub const Http = struct { host: []const u8, port: u16, path: []const u8, tls: bool = false };
 
 pub const Dest = union(enum) {
     http: Http,
@@ -15,9 +17,15 @@ pub const Dest = union(enum) {
 };
 
 pub fn parseUrl(url: []const u8) ?Dest {
-    if (std.mem.startsWith(u8, url, "http://")) return parseHttp(url["http://".len..]);
+    if (std.mem.startsWith(u8, url, "http://")) return parseHttp(url["http://".len..], false);
+    if (std.mem.startsWith(u8, url, "https://")) return parseHttp(url["https://".len..], true);
     if (std.mem.startsWith(u8, url, "tcp://")) {
         const endpoint = parseEndpoint(url["tcp://".len..]) orelse return null;
+        return .{ .tcp = endpoint };
+    }
+    if (std.mem.startsWith(u8, url, "tcps://")) {
+        var endpoint = parseEndpoint(url["tcps://".len..]) orelse return null;
+        endpoint.tls = true;
         return .{ .tcp = endpoint };
     }
     if (std.mem.startsWith(u8, url, "file://")) {
@@ -29,12 +37,12 @@ pub fn parseUrl(url: []const u8) ?Dest {
     return null;
 }
 
-fn parseHttp(rest: []const u8) ?Dest {
+fn parseHttp(rest: []const u8, tls: bool) ?Dest {
     const slash = std.mem.findScalar(u8, rest, '/');
     const hostport = if (slash) |i| rest[0..i] else rest;
     const path = if (slash) |i| rest[i..] else "/";
     const endpoint = parseEndpoint(hostport) orelse return null;
-    return .{ .http = .{ .host = endpoint.host, .port = endpoint.port, .path = path } };
+    return .{ .http = .{ .host = endpoint.host, .port = endpoint.port, .path = path, .tls = tls } };
 }
 
 fn parseEndpoint(hostport: []const u8) ?Endpoint {
@@ -50,12 +58,23 @@ test "parse http" {
     try std.testing.expectEqualStrings("v", dest_v.http.host);
     try std.testing.expectEqual(@as(u16, 8686), dest_v.http.port);
     try std.testing.expectEqualStrings("/events", dest_v.http.path);
+    try std.testing.expectEqual(false, dest_v.http.tls);
 }
 
 test "parse http no path, default port explicit" {
     const dest_v = parseUrl("http://127.0.0.1:80").?;
     try std.testing.expectEqualStrings("/", dest_v.http.path);
     try std.testing.expectEqualStrings("127.0.0.1", dest_v.http.host);
+}
+
+test "parse https and tcps" {
+    const dest_v = parseUrl("https://logs.example.com:443/insert/jsonline").?;
+    try std.testing.expectEqual(true, dest_v.http.tls);
+    try std.testing.expectEqualStrings("logs.example.com", dest_v.http.host);
+    const t = parseUrl("tcps://fluent:24224").?;
+    try std.testing.expectEqual(true, t.tcp.tls);
+    try std.testing.expectEqual(@as(u16, 24224), t.tcp.port);
+    try std.testing.expectEqual(false, parseUrl("tcp://fluent:24224").?.tcp.tls);
 }
 
 test "parse tcp and file" {
@@ -65,7 +84,7 @@ test "parse tcp and file" {
 }
 
 test "reject garbage" {
-    try std.testing.expect(parseUrl("https://v:8686") == null); // TLS not supported
+    try std.testing.expect(parseUrl("gopher://v:8686") == null); // unknown scheme
     try std.testing.expect(parseUrl("tcp://v") == null); // no port
     try std.testing.expect(parseUrl("file://relative") == null);
     try std.testing.expect(parseUrl("http://:80/x") == null);

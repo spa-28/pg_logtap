@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0 (2026-09-04)
+
+TLS export and HTTP auth-header round. Upgrade is binary replace + restart
+(schema unchanged — the 0.5.0 script provides the install path); no new
+counters.
+
+### Added
+
+- `https://` and `tcps://` export URLs — the existing http/tcp transports
+  over TLS 1.2/1.3 (std.crypto.tls; no new dependencies; client
+  certificates / mTLS not supported). One handshake per batch over the
+  already-dialed socket, inside the existing `export_timeout_ms` and
+  SIGTERM-abort discipline; a failed handshake is an ordinary failed send.
+- `export_tls_ca` — PEM file with the receiver's CA (the receiver's own
+  certificate for a self-signed one); empty = the system CA roots, a set
+  file replaces them. Re-read before every handshake, so rotation needs no
+  restart — clearing the GUC falls back to the system roots on the next
+  handshake.
+- `export_tls_verify` (default on) and `export_tls_server_name` — the name
+  to verify and the SNI to send when it differs from the URL host:
+  IP-literal URLs (name verification matches dNSName SANs only) and
+  TLS-terminating load balancers.
+- `export_http_header` — extra header line(s) appended verbatim to every
+  http(s) request, e.g. `E'Authorization: Bearer <token>\r\n'`.
+- `scripts/e2e-tls.sh` — three-phase acceptance against a self-signed
+  receiver: verified https delivery, handshake must fail (and later replay)
+  with the CA cleared, tcps delivery.
+
 ## 0.4.5 (2026-09-04)
 
 Boot-safety and delivery-contract documentation round from the fifth

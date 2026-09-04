@@ -16,7 +16,9 @@ view) restarts from zero on every restart.
 | Scheme | Semantics | ACK | Duplicate window |
 |---|---|---|---|
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
+| `https://` | same transport over TLS (see the TLS section below) | any HTTP 2xx status line | same as `http://` |
 | `tcp://` | **at-most-once** live; **at-least-once** once `export_fallback_file` is set — a failed send (including a partial write the receiver did see) parks the batch to the queue and it is retried | none — `write(2)` success counts as delivered | with the queue set: the receiver accepted the data but the send failed anyway (torn write, timeout) → the parked retry resends it. Without the queue there is no duplicate window — a receiver dying after accept loses silently; use `http://` for loss-sensitive receivers |
+| `tcps://` | same transport over TLS | none — `write(2)` success counts as delivered | same as `tcp://` |
 | `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle; a rollback that fails too is warned once — one torn line stays and the next batch appends after it (dying-disk signal) |
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
 
@@ -41,6 +43,32 @@ captures at ~12 k ev/s, above).
 
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
+
+## TLS (`https://`, `tcps://`)
+
+Both network schemes have TLS twins — same transports, same ACKs and
+duplicate windows, encrypted with TLS 1.2/1.3 (std.crypto.tls; client
+certificates / mTLS are not supported). One handshake per batch, inside the
+existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
+handshake is an ordinary failed send — the batch parks on the fallback file
+/ RAM backlog and retries. Three SIGHUP GUCs control verification:
+
+- `export_tls_ca` — PEM file with the CA to verify the receiver against
+  (for a self-signed receiver, the receiver's own certificate). Empty = the
+  system CA roots; a set file **replaces** them. The file is re-read before
+  every handshake, so certificate rotation needs no restart.
+- `export_tls_verify` — `off` disables chain and name verification.
+  Development only: with it off, a man in the middle can read the logs.
+- `export_tls_server_name` — certificate name to verify and SNI to send when
+  it differs from the URL host. Two cases need it: IP-literal URLs (name
+  verification matches DNS `dNSName` SANs only — an `iPAddress` SAN never
+  matches an IP-literal host) and a TLS-terminating load balancer in front
+  of the receiver. Empty = the URL host.
+
+`export_http_header` (plain `http://` included) appends extra header
+line(s) verbatim to every http(s) request after the fixed headers — e.g.
+`E'Authorization: Bearer <token>\r\n'` for VictoriaLogs. Multi-line values
+carry their own CRLFs (write them as `E''` strings).
 
 ## Ordering and identity
 
