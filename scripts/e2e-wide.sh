@@ -9,48 +9,14 @@
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 set -eu
-PG_CT="${1:-pglogtap-pg}"
-NET=pglogtap-e2e_default
-OUT=/tmp/logtap-e2e
-VEC=pglogtap-vector
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init wide "${1:-}"
+e2e_gate
 WIDE=8192
 
-fail() {
-  echo "e2e-wide: FAILED: $*" >&2
-  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  exit 1
-}
-ok() { echo "  ok: $*"; }
-
-# Stand gate: the compose one-shot must have passed.
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
-  || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
-
-setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-SUF="-$$" # per-run marker suffix
+# wide's markers carry free text (not a trailing number) after the marker
+# word, so counting is line-based — override the common DISTINCT-counter.
 received() { grep -c "logtap wide $1$SUF" "$OUT/vector-out.jsonl" 2>/dev/null || true; }
-stats() { docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
-wait_ready() { # TCP probe: the restarting server's socket comes and goes
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
-wait_vector() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "receiver $VEC not accepting connections after 60s"
-}
 wait_for() { # wait_for <marker> <count> [tries]
   n=0; tries=${3:-30}
   while [ "$n" -lt "$tries" ]; do

@@ -10,15 +10,11 @@
 # The stand (tests/e2e/compose.yaml) provides the network; this sink is
 # suite-local on purpose — the test toggles its delay mid-run (up_sink).
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init slow "${1:-}"
 PORT="${2:-9498}"
-NET=pglogtap-e2e_default
 SINK=pglogtap-slow
-
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
+e2e_gate
 
 # socat forks per connection; the background (sleep N; printf) answers with a
 # bare 200 after N seconds while `cat` drains the request body. N=1: every

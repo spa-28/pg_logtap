@@ -8,18 +8,11 @@
 # Usage: scripts/e2e-silent-receiver.sh [pg_container] [sink_port]
 # The mute receiver is the compose stand's `silent` service.
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init silent "${1:-}"
 PORT="${2:-9499}"
-NET=pglogtap-e2e_default
 SINK=pglogtap-silent
-
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
-  echo "e2e-silent: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
-  exit 1
-}
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
+e2e_gate
 
 # 1s timeout, fallback file on: failed sends must divert, not lose.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_timeout_ms = 1000" \

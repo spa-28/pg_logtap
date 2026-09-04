@@ -6,19 +6,11 @@
 # count > N is duplicate delivery — both fail.
 # Usage: scripts/e2e-vlogs.sh [pg_container] [events]
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init vlogs "${1:-}"
 EVENTS="${2:-50}"
-VEC=pglogtap-vector
-NET=pglogtap-e2e_default
 M="logtap vlogs -$$"
-
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
-  echo "e2e-vlogs: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
-  exit 1
-}
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
+e2e_gate
 
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" -qc "SELECT pg_reload_conf()" >/dev/null
 sleep 2

@@ -2,19 +2,11 @@
 # M4 acceptance: worker serves /metrics; Vector prometheus_scrape reads it.
 # Usage: scripts/e2e-metrics.sh [pg_container] [port]
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init metrics "${1:-}"
 PORT="${2:-9187}"
+e2e_gate
 OUT=/tmp/logtap-metrics/vector-metrics.jsonl
-NET=pglogtap-e2e_default
-
-# Its own throwaway Vector (a scrape config, unlike the stand's receiver).
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
-  echo "e2e-metrics: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
-  exit 1
-}
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 docker rm -f pglogtap-vector-metrics >/dev/null 2>&1 || true
 mkdir -p /tmp/logtap-metrics
 : > "$OUT" # fresh scrape log for this run's count

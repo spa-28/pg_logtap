@@ -4,19 +4,11 @@
 # output file accumulates across runs, so counting is by distinct markers.
 # Usage: scripts/e2e-vector.sh [pg_container] [events]
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init vector "${1:-}"
 EVENTS="${2:-20}"
+e2e_gate
 OUT=/tmp/logtap-e2e/vector-out.jsonl
-VEC=pglogtap-vector
-NET=pglogtap-e2e_default
-
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
-  echo "e2e-vector: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
-  exit 1
-}
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
 
 # Point pg_logtap at Vector (URL is re-read every flush cycle, no restart
 # needed) and reset the counters' baseline.

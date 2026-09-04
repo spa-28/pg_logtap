@@ -34,104 +34,9 @@
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 set -eu
-PG_CT="${1:-pglogtap-pg}"
-NET=pglogtap-e2e_default
-OUT=/tmp/logtap-e2e
-VEC=pglogtap-vector
-
-fail() {
-  echo "e2e-robust: FAILED: $*" >&2
-  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  docker exec "$PG_CT" psql -U postgres -Atc \
-    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
-  docker logs "$PG_CT" 2>&1 | grep -iE "logtap|PANIC|terminated by signal|interrupted|reinitializ" | tail -12 >&2 || true
-  docker inspect -f "pg: {{.State.Status}} oom={{.State.OOMKilled}}" "$PG_CT" >&2 || true
-  docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}}" "$VEC" >&2 || true
-  exit 1
-}
-ok() { echo "  ok: $*"; }
-
-# Stand gate: the compose one-shot must have passed (pg healthy AND the
-# receiver port answering at boot).
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
-  || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-# the ready gate is a one-shot that stays exited/0 forever; a run that failed
-# inside backlog-bound leaves the receiver stopped and the next run would
-# fail its first scenario on a dead hostname — start is a no-op when running
-docker start "$VEC" >/dev/null 2>&1 || true
-mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
-
-setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$PG_CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
-SUF="-$$" # per-run marker suffix: vector-out.jsonl accumulates across runs
-gen() { # gen <marker> <count> — distinct events from one psql round trip.
-  docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
-    WHILE i < $2 LOOP
-      RAISE WARNING 'logtap robust $1$SUF %', i;
-      i := i + 1;
-    END LOOP; END \$\$" >/dev/null 2>&1 || echo "  gen $1: psql FAILED (events never emitted)" >&2
-}
-received() { grep -oE "logtap robust $1$SUF [0-9]+" "$OUT/vector-out.jsonl" 2>/dev/null | sort -u | wc -l; }
-seqs_of() { grep -E "logtap robust $1$SUF [0-9]+" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | cut -d: -f2; }
-wait_ready() { # TCP probe: the restarting server's socket comes and goes
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
-wait_vector() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "receiver $VEC not accepting connections after 60s"
-}
-stats() { docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
-worker_pid() { docker exec "$PG_CT" psql -U postgres -Atc \
-  "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE '%logtap%' LIMIT 1"; }
-vmrss_kb() { # resident set of the worker inside the container
-  docker exec "$PG_CT" cat "/proc/$(worker_pid)/status" 2>/dev/null | awk '/^VmRSS/{print $2}'
-}
-wait_for() { # wait_for <marker> <count> [tries]
-  n=0; tries=${3:-30}
-  while [ "$n" -lt "$tries" ]; do
-    [ "$(received "$1")" -ge "$2" ] && return 0
-    n=$((n + 1)); sleep 1
-  done
-}
-
-# Wait for the worker to empty the ring: markers emitted into a full ring
-# are dropped at emit (counted in events_dropped, never delivered).
-drain_ring() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    [ "$(statf ring_events)" = 0 ] && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "ring never drained (ring_events=$(statf ring_events))"
-}
-
-# Every delivered marker line must parse as JSON — a torn slot or a botched
-# sanitization would surface here as invalid JSON or broken UTF-8.
-json_check() { # json_check <marker>: prints "json_ok <n>"
-  python3 - "$OUT/vector-out.jsonl" "logtap robust $1$SUF" <<'EOF'
-import json, sys
-path, marker = sys.argv[1], sys.argv[2]
-n = 0
-for line in open(path, encoding="utf-8"):
-    if marker in line:
-        json.loads(line)  # raises on invalid JSON or non-UTF-8 bytes
-        n += 1
-print(n)
-EOF
-}
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init robust "${1:-}"
+e2e_gate
 
 echo "== huge fields: message and detail past their ring slots =="
 # Reset every GUC a previous (possibly failed) run may have left armed — the
@@ -152,7 +57,7 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'logtap robust huge$SUF % %', 0, repeat('é', 8000)
     USING DETAIL = repeat('д', 1000), ERRCODE = '01000';
   END \$\$" >/dev/null 2>&1 || true
-wait_for huge 1 20
+wait_for huge 1 "" 20
 [ "$(received huge)" = 1 ] || fail "huge-fields: $(received huge) events for one RAISE (expected exactly 1)"
 json_check huge >/dev/null || fail "huge-fields: delivered line is not valid JSON/UTF-8"
 python3 - "$OUT/vector-out.jsonl" "logtap robust huge$SUF" <<'EOF' || fail "huge-fields: truncation contract"
@@ -195,7 +100,7 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
 docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redp$SUF 0 token=SECRET-msg$SUF-abc123'; END \$do\$" \
   >/dev/null 2>&1 || true
-wait_for redq 1 20; wait_for redp 1 20; wait_for redd 2 20
+wait_for redq 1 "" 20; wait_for redp 1 "" 20; wait_for redd 2 "" 20
 # vector-out.jsonl accumulates across runs BY DESIGN: the secrets carry this
 # run's suffix so stale lines from earlier runs cannot fail this one.
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: contract"
@@ -255,7 +160,7 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$do\$ BEGIN
   RAISE WARNING 'logtap robust redor$SUF 0' USING DETAIL =
     'password = ''SECRET-or$SUF-xyz789'' tail ' || repeat('ab ', 600);
   END \$do\$" >/dev/null 2>&1 || true
-wait_for redclip 1 20; wait_for redboth 1 20; wait_for redor 1 20
+wait_for redclip 1 "" 20; wait_for redboth 1 "" 20; wait_for redor 1 "" 20
 python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: truncated/redacted split"
 import json, sys
 path, suf = sys.argv[1], sys.argv[2]
@@ -424,7 +329,7 @@ END \$\$" >/dev/null 2>&1
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'exc-control$SUF no token anywhere';
 END \$\$" >/dev/null 2>&1
-wait_for "exc-control$SUF" 1 10
+wait_for "exc-control$SUF" 1 "" 10
 [ "$(grep -c "exc-suppressed$SUF" "$OUT/vector-out.jsonl")" = 0 ] \
   || fail "pattern_exclude: event with the token in DETAIL reached the receiver"
 [ "$(grep -c "HIDEME$SUF" "$OUT/vector-out.jsonl")" = 0 ] \

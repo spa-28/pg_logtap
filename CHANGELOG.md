@@ -45,6 +45,15 @@ counters.
 
 ### Internal
 
+- The eleven e2e scripts share `scripts/e2e-common.sh` instead of a
+  copy-pasted prologue: container/GUC/marker helpers, the ready gate and a
+  per-container `flock` so two suites cannot race one stand. The container
+  argument is now optional everywhere (defaults to the running compose
+  stand), and e2e-tls counts per-phase named markers instead of number
+  ranges, so one phase's asserts cannot be satisfied by another's events.
+  e2e-kill's no-loss asserts became deltas — the counters are
+  per-cluster-life and a reused container already carried a previous run's
+  deliberate losses.
 - The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
   the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
   chunk bounds shared with buildBody, and its boot path (compaction-litter

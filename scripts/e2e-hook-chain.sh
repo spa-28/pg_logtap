@@ -5,24 +5,12 @@
 # event must reach it first AND still be captured by pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
 set -eu
-PG_CT="${1:-pglogtap-pg}"
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init hookchain "${1:-}"
+e2e_gate
 OUT=/tmp/logtap-hookchain
 
-fail() { echo "e2e-hook-chain: FAILED: $*" >&2; exit 1; }
-ok() { echo "  ok: $*"; }
 psql_ct() { docker exec "$PG_CT" psql -U postgres "$@"; }
-
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
 
 # Build hookchain.so against the target major's server headers (the fmgr
 # magic block is version-checked at load, so a pg18 .so won't load into 15).

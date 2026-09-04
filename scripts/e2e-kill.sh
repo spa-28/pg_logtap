@@ -30,106 +30,30 @@
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 set -eu
-PG_CT="${1:-pglogtap-pg}"
-NET=pglogtap-e2e_default
-OUT=/tmp/logtap-e2e
-VEC=pglogtap-vector
-SILENT=pglogtap-silent
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init kill "${1:-}"
+e2e_gate
 
-fail() {
-  echo "e2e-kill: FAILED: $*" >&2
-  # Post-mortem for the log: counters, worker liveness, export transition
-  # lines, the receiver's own log. The server-log grep scans the WHOLE log
-  # and only then tails: a burst of the very events being lost once pushed
-  # the "export failing (fail_reason)" line past a plain tail -15.
-  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  docker exec "$PG_CT" psql -U postgres -Atc \
-    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
-  docker logs "$PG_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2 || true
-  # Receiver state: a vector that died mid-scenario (observed in CI: silent
-  # death ~1s after docker start) leaves the worker's dials failing fast while
-  # every count comes up short — name the killer.
-  docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2 || true
-  # Ground truth on the name at the moment of failure: a fresh glibc lookup
-  # (what the bash probe uses) vs the worker's wedged one, plus the container's
-  # actual network registration — repeated, because the wedge sets in AFTER a
-  # brief good window following docker start.
+# Ground truth on the receiver name at failure time: a fresh glibc lookup
+# (what the bash probe uses) vs the worker's wedged one, plus the container's
+# actual network registration — repeated, because the wedge sets in AFTER a
+# brief good window following docker start.
+fail_extra() {
   n=1; while [ "$n" -le 3 ]; do
-    docker exec "$PG_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
+    docker exec "$E2E_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
     n=$((n + 1)); sleep 2
   done
   docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2 || true
-  docker exec "$PG_CT" getent hosts "$PG_CT" >&2 || true
+  docker exec "$E2E_CT" getent hosts "$E2E_CT" >&2 || true
   docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2 || true
   docker logs --tail 8 "$VEC" >&2 2>&1 || true
-  exit 1
-}
-ok() { echo "  ok: $*"; }
-
-wait_vector() { # until the receiver actually accepts TCP again after the
-  # suite itself stopped it (docker start): vector rebinds its port SLOWLY on
-  # a loaded host (observed 30 s locally), and generating before that fails
-  # every send and burns the wait_for windows.
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "receiver $VEC not accepting connections after 60s"
-}
-
-# Stand gate: the compose one-shot must have passed — pg healthy AND the
-# receiver port answering at boot (tests/e2e/compose.yaml, `ready`).
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
-  || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN:
-                # counting is marker-based, never line-total-based
-
-setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$PG_CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
-SUF="-$$" # per-run marker suffix: vector-out.jsonl accumulates across runs
-gen() { # gen <marker> <count> — distinct events from one psql round trip.
-  # Markers carry the run's PID ($SUF): vector-out.jsonl accumulates across
-  # runs, and identical markers would make an old run's lines satisfy this
-  # run's asserts. WARNING: above the default log_min_messages (so it reaches
-  # the hook) and not an error (so the loop is not aborted); a caught RAISE
-  # EXCEPTION never reaches the server log at all.
-  docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
-    WHILE i < $2 LOOP
-      RAISE WARNING 'logtap kill $1$SUF %', i;
-      i := i + 1;
-    END LOOP; END \$\$" >/dev/null 2>&1 || echo "  gen $1: psql FAILED (events never emitted)" >&2
-}
-# Count distinct marker events; the trailing digit requirement keeps out the
-# duration-log line of the generating DO statement itself (its message quotes
-# the RAISE format string when log_min_duration_statement is on).
-received() { grep -oE "logtap kill $1$SUF [0-9]+" "$OUT/vector-out.jsonl" 2>/dev/null | sort -u | wc -l; }
-seqs_of() { grep -E "logtap kill $1$SUF [0-9]+" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | cut -d: -f2; }
-# TCP probe only: the official image's temporary initdb server answers a plain
-# pg_isready on the unix socket before the real server exists.
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
-stats() { docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
-wait_for() { # wait_for <marker> <count>
-  n=0
-  while [ "$n" -lt 15 ]; do
-    [ "$(received "$1")" -ge "$2" ] && return 0
-    n=$((n + 1)); sleep 1
-  done
 }
 
 echo "== receiver outage: down → up =="
+# Counters are per-cluster-life: a previous kill run's lossy scenarios
+# (fallback_max_mb) leave them non-zero on a reused container, so the
+# no-loss asserts below are DELTAS from here, not absolute zeros.
+lost0=$(statf events_lost); drp0=$(statf events_dropped)
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 gen outage1 20; wait_for outage1 20
 gen outage2 100 # more baseline traffic, all delivered while the receiver is up
@@ -154,8 +78,8 @@ dups=$(grep 'logtap kill' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sor
 [ "$(received outage1)" = 20 ] && [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ] \
   || fail "receiver outage: loss (outage1=$(received outage1) outage3=$(received outage3) outage4=$(received outage4))"
 [ "$dups" = 0 ] || fail "receiver outage: $dups duplicate seqs — dedup-by-seq contract broken"
-[ "$(statf events_lost)" = 0 ] && [ "$(statf events_dropped)" = 0 ] \
-  || fail "receiver outage: counters lost=$(statf events_lost) dropped=$(statf events_dropped)"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] && [ "$(( $(statf events_dropped) - drp0 ))" = 0 ] \
+  || fail "receiver outage: counters lost=$(( $(statf events_lost) - lost0 )) dropped=$(( $(statf events_dropped) - drp0 ))"
 ok "140/140 delivered, 0 duplicate seqs, lost=0 dropped=0"
 
 echo "== postmaster kill: SIGKILL with a RAM backlog =="
@@ -166,7 +90,7 @@ base_cap=$(statf events_captured); base_exp=$(statf events_sent)
 gen kill1 300; sleep 3
 [ $(( $(statf events_captured) - base_cap )) -ge 300 ] || fail "postmaster kill: events not captured"
 [ $(( $(statf events_sent) - base_exp )) = 0 ] || fail "postmaster kill: sent moved with a dead receiver"
-[ "$(statf events_lost)" = 0 ] || fail "postmaster kill: backlog overflowed (ring too small for 300 events?)"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "postmaster kill: backlog overflowed (ring too small for 300 events?)"
 pre_seq=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" | cut -d: -f2 | sort -n | tail -1)
 docker kill "$PG_CT" >/dev/null # SIGKILL: postmaster, worker, shmem — all gone
 docker start "$PG_CT" >/dev/null; wait_ready

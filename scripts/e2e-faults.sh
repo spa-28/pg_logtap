@@ -15,25 +15,25 @@
 #                       whole on the next receiver
 # Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -eu
+. "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
 CT=pglogtap-faults
+E2E_TAG=fault
+E2E_CT=$CT
+E2E_SUF= # throwaway container: fresh sinks each run, no per-run suffix needed
 OUT=/tmp/logtap-faults
 SO=dist/pg$V/lib/pg_logtap.so
 [ -f "$SO" ] || { echo "e2e-faults: $SO missing — run the stand phase first" >&2; exit 2; }
 
-fail() {
-  echo "e2e-faults: FAILED: $*" >&2
-  docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
+fail_extra() { # shim-specific post-mortem
   echo "shim target: $(docker exec "$CT" cat /tmp/fsyncfail-target 2>/dev/null || echo '<unset>')" >&2
   docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2 || true
-  docker exec "$CT" sh -c "ls -la '$PGDATA_C/$FB_REL' 2>/dev/null" >&2 || true
-  docker logs "$CT" 2>&1 | grep -iE "logtap.*(fdatasync|fallback|divert|failing)" | tail -5 >&2 || true
-  exit 1
+  docker exec "$CT" sh -c "ls -la '${PGDATA_C:-}/$FB_REL' 2>/dev/null" >&2 || true
 }
-ok() { echo "  ok: $*"; }
 
 mkdir -p "$OUT"
+e2e_lock
 cc -shared -fPIC -Wall -Wextra tests/e2e/fsyncfail.c -o "$OUT/fsyncfail.so" -ldl
 
 FB_REL=pgfaults-queue.bin # PGDATA-relative, like a real deployment
@@ -46,15 +46,6 @@ docker run -d --name "$CT" -e POSTGRES_PASSWORD=dev \
 cleanup() { docker rm -f -v "$CT" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  docker logs --tail 30 "$CT" >&2 || true
-  fail "postgres in $CT not ready after 60s"
-}
 wait_ready
 
 # The shim's watched path depends on PGDATA, which differs across majors
@@ -82,18 +73,9 @@ docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.flush_interva
 docker exec "$CT" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 "$(dirname "$0")/e2e-require-ext.sh" "$CT"
 
-setguc() { docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
-stats() { docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
 # Markers in a file:// sink: count distinct events and duplicate seqs there.
 sink_lines() { docker exec "$CT" sh -c "grep -oE 'logtap fault $1 [0-9]+' /tmp/$2.log 2>/dev/null" | sort -u | wc -l; }
 sink_dups() { docker exec "$CT" sh -c "grep 'logtap fault' /tmp/$1.log 2>/dev/null" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l; }
-gen() { docker exec "$CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
-  WHILE i < $2 LOOP
-    RAISE WARNING 'logtap fault $1 %', i;
-    i := i + 1;
-  END LOOP; END \$\$" >/dev/null; }
 
 echo "== file:// sink: fdatasync fails -> rollback + whole retry, one copy =="
 SUF=f$$
