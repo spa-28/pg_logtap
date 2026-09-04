@@ -237,7 +237,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     if (final) send_deadline_us = pg.GetCurrentTimestamp() + 1_000_000 + @as(i64, guc_export_timeout_ms) * 1000;
 
     var sent: u64 = 0; // delivered by a live send
-    var queued: u64 = 0; // durably appended to the fallback file
+    var queued: u64 = 0; // appended to the fallback file (a lifecycle stage, not a durability claim — fb_sync_failures says which)
     var replayed: u64 = 0; // delivered out of the fallback file
     var failed: u64 = 0;
     var lost: u64 = 0;

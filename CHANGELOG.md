@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.5 (2026-09-04)
+
+Boot-safety and delivery-contract documentation round from the fifth
+external review. No schema, GUC or counter changes; upgrade is binary
+replace + restart.
+
+### Fixed
+
+- The `seq` seed is clamped at zero: a wall clock before 2000-01-01 (a
+  dead CMOS battery, a boot ahead of NTP sync) made the raw seed
+  negative and the `@intCast` panicked in ReleaseSafe during shared
+  memory init — inside the postmaster, so the cluster failed to boot
+  with pg_logtap preloaded. At 0 the ordering and dedup claims hold;
+  the bound is noted where the seed is set.
+
+### Documentation
+
+- `events_queued` is commented as what delivery.md already declares: a
+  lifecycle stage, not a durability claim — `fb_sync_failures` says
+  which cycles are not durable.
+- The receiver dedup recipe is cluster-safe: `fields.match` includes
+  `cluster` (null while `cluster_name` is unset, matching everything —
+  the one-cluster-per-host case, so the recipe is never worse than
+  before). The ordering/identity section now spells out both caveats: a
+  wall clock stepped backwards can regress the seed (dedup on
+  `(host, seq, timestamp)` for absolute safety), and two clusters on
+  one host seed overlapping `seq` ranges (set `cluster_name` and dedup
+  on `(host, cluster, seq)`).
+
 ## 0.4.4 (2026-09-04)
 
 TCP-stream parsing and accounting round from the fourth external review.
