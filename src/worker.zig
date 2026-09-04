@@ -40,10 +40,17 @@ const chunk_max = 256; // events per request / queue member. 1024 measured
 // glibc's mmap threshold and every flush cycle munmaps ~1MB — TLB shootdown
 // IPIs tax every core, postgres backends included. 256 keeps allocations on
 // the malloc heap and 4x more fdatasyncs cost less than that.
-const body_cap = 4 << 20; // byte ceiling per request body / queue member: at
+const body_cap = 4 << 20; // byte target per request body / queue member
+// (buildBody admits the event that crosses it): at
 // message_max=1MB a full 256-event chunk would be ~67MB — past proxy body
 // limits and the flush cycle's time budget. buildBody stops at whichever
 // bound, events or bytes, comes first.
+
+/// Framing sanity bound, shared by the compressed-size check (fbNextMember,
+/// fbCompact) and the inflated-output check below it: a member this build (or
+/// 0.3.x, ≤ ~371KB) writes can never exceed body_cap + one serialized event,
+/// and gzip does not inflate its input beyond that +64K of slack.
+const fb_member_max = body_cap + ring.max_message + 65536;
 
 /// Message staging for ring drains (capture.messageMax() bytes, allocated
 /// once at worker start, outside every lock).
@@ -932,7 +939,7 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     var len_buf: [4]u8 = undefined;
     if (fbPread(file_fd, &len_buf, fb_offset) != 4) return null;
     const mlen = std.mem.readInt(u32, &len_buf, .little);
-    if (mlen == 0 or mlen > 512 * 1024 * 1024) {
+    if (mlen == 0 or mlen > fb_member_max) {
         fb_broken = true;
         elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{fb_offset});
         return null;
@@ -973,7 +980,7 @@ fn fbNextMember(alloc: std.mem.Allocator) ?FbMember {
     // message_max. A byte bound, not a ratio: a wide repetitive body
     // legitimately inflates past 64:1 and a ratio bound would flag it
     // corrupt and lose it.
-    if (dec_state.body.writer.end > body_cap + ring.max_message + 65536) { // inflated absurdly: corrupt, skip
+    if (dec_state.body.writer.end > fb_member_max) { // inflated absurdly: corrupt, skip
         const skip_at = fb_offset;
         fb_offset += 4 + mlen;
         fb_lost += 1;
@@ -1069,7 +1076,7 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
         var len_buf: [4]u8 = undefined;
         if (fbPread(file_fd, &len_buf, off) != 4) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
-        if (mlen == 0 or mlen > 512 * 1024 * 1024) return;
+        if (mlen == 0 or mlen > fb_member_max) return;
         const end = off + 4 + mlen;
         if (end > size) break; // torn tail
         if (size - end < keep_bytes) break; // dropping would undercut the budget
@@ -1085,10 +1092,14 @@ fn fbCompact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
             var src_reader: std.Io.Reader = .fixed(comp);
             var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
             dec_state.body.writer.end = 0;
-            // a member that will not inflate has no countable events; the
-            // replay path would skip it as a loss anyway
-            _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {};
-            lost_events += std.mem.countScalar(u8, dec_state.body.writer.buffer[0..dec_state.body.writer.end], '\n');
+            // a member that will not inflate has no countable events; replay
+            // counts it as one loss per member (fbNextMember's fb_lost += 1)
+            // — match that here or events_lost undercounts the compaction drop
+            var readable = true;
+            _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {
+                readable = false;
+            };
+            lost_events += if (readable) std.mem.countScalar(u8, dec_state.body.writer.buffer[0..dec_state.body.writer.end], '\n') else 1;
         }
         off = end;
     }
@@ -1181,9 +1192,18 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     if (!writeAll(conn_fd, head.buffered(), true)) return failSend("write head", std.c._errno().*);
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
+    // TCP does not preserve write boundaries: the line may straddle recvs, and
+    // a false failure here retries a body the receiver already accepted (a
+    // contract-legal duplicate plus a spurious fallback divert). Loop to the
+    // 12 bytes "HTTP/1.1 200" needs — RCVTIMEO bounds each recv (dialTcp), so
+    // a receiver that stalls mid-line still fails with "status read".
     var status_buf: [32]u8 = undefined;
-    const got = recvSome(conn_fd, &status_buf);
-    if (got < 12) return failSend("status read", std.c._errno().*);
+    var got: usize = 0;
+    while (got < 12) {
+        const nread = recvSome(conn_fd, status_buf[got..]);
+        if (nread == 0) return failSend("status read", std.c._errno().*);
+        got += nread;
+    }
     if (!std.mem.startsWith(u8, status_buf[0..got], "HTTP/1.") or status_buf[9] != '2') {
         return failSend("status code", @as(c_int, status_buf[9]));
     }
@@ -1204,6 +1224,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8) bool {
 /// the page cache) while its durability is unknown. Same edge-triggered
 /// shape as fb_sync_warned: a dying disk would otherwise bury the log.
 var file_sync_warned = false;
+var file_rollback_warned = false; // same shape: a torn write whose rollback failed
 
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
@@ -1221,8 +1242,15 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         // A partial write (ENOSPC mid-batch) leaves a torn line in the
         // sink's NDJSON stream forever; with O_APPEND a plain retry would
         // append the whole batch AGAIN after the torn prefix. Roll back to
-        // the last full batch — the next cycle rewrites it whole.
-        _ = c.ftruncate(conn_fd, @intCast(end_before));
+        // the last full batch — the next cycle rewrites it whole. A failed
+        // rollback is warned once and the sink is left as-is: ftruncate on a
+        // regular file that just took the write only fails on a dying disk,
+        // the damage is one torn line, and a broken-sink state machine buys
+        // nothing the warning does not.
+        if (c.ftruncate(conn_fd, @intCast(end_before)) != 0 and !file_rollback_warned) {
+            file_rollback_warned = true;
+            elog.Warning(@src(), "pg_logtap file:// rollback of a torn write failed (errno={d}): a torn line stays in {s} and the next batch appends after it", .{ std.c._errno().*, path });
+        }
         return false;
     }
     // Durable per batch: the page cache survives process death but not OS
@@ -1240,6 +1268,10 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         }
         return true;
     }
+    // A clean batch clears both warned-once latches so the NEXT independent
+    // failure is visible again (edge-triggered, re-armed by success).
+    file_sync_warned = false;
+    file_rollback_warned = false;
     return true;
 }
 
@@ -1520,10 +1552,23 @@ fn scrapeAll() void {
 
 fn serveOne(conn_fd: c_int) void {
     // The scraper sends its request right after connect; wait briefly for it.
+    // TCP does not preserve the sender's write boundaries: a GET straddling
+    // recvs parses as a wrong path and answers 404, so read to the end of the
+    // request line (writeResponse parses only that first line). The socket is
+    // nonblocking (accept4 SOCK_NONBLOCK) — poll between recvs, the whole
+    // read bounded by the same ~100ms the single-poll version waited.
     var poll_fds = [1]net.pollfd{.{ .fd = conn_fd, .events = 1, .revents = 0 }}; // POLLIN
-    if (net.poll(&poll_fds, 1, 100) <= 0) return;
+    const deadline = pg.GetCurrentTimestamp() + 100_000; // µs
     var req_buf: [512]u8 = undefined;
-    const got = recvSome(conn_fd, &req_buf);
+    var got: usize = 0;
+    while (got < req_buf.len) {
+        const left_ms: c_int = @intCast(@divTrunc(@max(0, deadline - pg.GetCurrentTimestamp()), 1000));
+        if (net.poll(&poll_fds, 1, left_ms) <= 0) break;
+        const nread = recvSome(conn_fd, req_buf[got..]);
+        if (nread == 0) break;
+        got += nread;
+        if (std.mem.findScalar(u8, req_buf[0..got], '\n') != null) break; // line complete
+    }
     if (got == 0) return;
     // metrics.body_cap + the status line/headers (metrics.writeResponse
     // renders the body into its own body_cap buffer, then copies it here).
