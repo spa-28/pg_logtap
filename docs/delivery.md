@@ -59,6 +59,11 @@ handshake is an ordinary failed send — the batch parks on the fallback file
   every handshake, so certificate rotation needs no restart.
 - `export_tls_verify` — `off` disables chain and name verification.
   Development only: with it off, a man in the middle can read the logs.
+  The first TLS send with it off logs one WARNING per worker life, and
+  handshake failures carry the likely fix in the transition-log reason
+  (the `export_tls_server_name` / `export_tls_ca` hint, or "the receiver
+  may not be speaking TLS on this port" for an https:// URL at a
+  plain-http port).
 - `export_tls_server_name` — certificate name to verify and SNI to send when
   it differs from the URL host. Two cases need it: IP-literal URLs (name
   verification matches DNS `dNSName` SANs only — an `iPAddress` SAN never

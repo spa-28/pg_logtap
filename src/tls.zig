@@ -105,7 +105,8 @@ var ca_bundle: std.crypto.Certificate.Bundle = .empty;
 var ca_lock: std.Io.RwLock = .init;
 
 /// Last failure, set by connect/write/read. Stable until the next one.
-pub var last_error_buf: [96]u8 = undefined;
+/// 160: fits an error name plus the misconfiguration hint below verbatim.
+pub var last_error_buf: [160]u8 = undefined;
 pub var last_error: []const u8 = "";
 
 fn fail(comptime fmt: []const u8, args: anytype) void {
@@ -120,6 +121,9 @@ fn fail(comptime fmt: []const u8, args: anytype) void {
 /// clears the bundle too — empty means SYSTEM roots, not "whatever the
 /// previous value loaded" — and the TLS client's own incremental rescan of
 /// the system roots then fills it.
+/// Two operator mistakes fail HERE, with the path in the reason, instead of
+/// later as an opaque chain error: a wrong/unreadable path, and a file that
+/// parses but holds no certificates (created empty, or the wrong file).
 fn bundleReady(ca_path: []const u8) bool {
     ca_bundle.deinit(alloc);
     ca_bundle = .empty;
@@ -128,10 +132,17 @@ fn bundleReady(ca_path: []const u8) bool {
         fail("tls ca path too long ({d} bytes)", .{ca_path.len});
         return false;
     }
+    // Tail of the path, so a long data-directory-relative path still names
+    // the file in the 160-byte reason.
+    const tail = ca_path[ca_path.len - @min(ca_path.len, 64) ..];
     ca_bundle.addCertsFromFilePathAbsolute(alloc, io(), now(), ca_path) catch |e| {
-        fail("tls ca file: {s}", .{@errorName(e)});
+        fail("tls ca file: {s}: {s}", .{ @errorName(e), tail });
         return false;
     };
+    if (ca_bundle.map.count() == 0) {
+        fail("tls ca file holds no certificates: {s}", .{tail});
+        return false;
+    }
     return true;
 }
 
@@ -166,9 +177,22 @@ pub fn connect(fd: c_int, url_host: []const u8, opts: Options) ?*Conn {
         o.ca = .{ .bundle = .{ .gpa = alloc, .io = i, .lock = &ca_lock, .bundle = &ca_bundle } };
     }
     c.client = tls.Client.init(&c.stream_reader.interface, &c.stream_writer.interface, o) catch |e| {
-        fail("tls handshake: {s}", .{@errorName(e)});
+        // The error name alone is a riddle for the three misconfigurations
+        // that dominate real setups; append the GUC that fixes each. String
+        // compares (not a switch) so an error outside this set still formats.
+        const name = @errorName(e);
+        const hint: []const u8 = if (std.mem.eql(u8, name, "CertificateHostMismatch"))
+            " — name mismatch: set export_tls_server_name (IP-literal URLs always need it)"
+        else if (std.mem.eql(u8, name, "CertificateIssuerNotFound"))
+            " — unknown CA: set export_tls_ca to the receiver's CA"
+        else if (std.mem.eql(u8, name, "TlsCertificateNotVerified"))
+            " — chain rejected: check the export_tls_ca file"
+        else if (std.mem.eql(u8, name, "TlsDecodeError") or std.mem.eql(u8, name, "TlsUnexpectedMessage") or std.mem.eql(u8, name, "TlsBadLength") or std.mem.eql(u8, name, "Unexpected"))
+            " — the receiver may not be speaking TLS on this port"
+        else
+            "";
+        fail("tls handshake: {s}{s}", .{ name, hint });
         return null;
     };
     return c;
 }
-

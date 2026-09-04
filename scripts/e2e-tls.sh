@@ -5,7 +5,10 @@
 #   phase 2  ca cleared → handshake must FAIL (send_cycles_failed grows,
 #            nothing delivered); ca restored → the buffered events arrive
 #            (RAM backlog / fallback replay over TLS)
+#   phase 2b ca file exists but holds no certificates → handshake fails the
+#            same way (send_cycles_failed grows, nothing delivered)
 #   phase 3  tcps:// → raw NDJSON over TLS, no HTTP framing
+#   phase 4  verify=off → delivery continues, exactly one WARNING in the log
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
 set -eu
 PG_CT="${1:-pglogtap-e2e}"
@@ -149,14 +152,42 @@ BEFORE=$(got "$OUT")
 [ "$BEFORE" -eq "$N" ] || { echo "e2e-tls: phase 2 leaked $((BEFORE - N)) events through an unverified handshake"; exit 1; }
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen $((2 * N)) "$N" # live events join the buffered ones on recovery
-wait_for "$OUT" $((3 * N)) || { echo "e2e-tls: phase 2 (replay after ca restored) delivered $(got "$OUT"))/$((3 * N))"; exit 1; }
+wait_for "$OUT" $((3 * N)) || { echo "e2e-tls: phase 2 (replay after ca restored) delivered $(got "$OUT")/$((3 * N))"; exit 1; }
 echo "phase 2 ok: $FAILED failed cycles, nothing delivered unverified, $((2 * N)) buffered+live replayed"
+
+# --- phase 2b: a CA file that exists but holds no certificates (created
+# empty, or the wrong file pointed at) must fail the handshake the same way
+# — not silently fall back to any verification path
+docker exec "$PG_CT" touch "$CA_IN_CT.empty"
+set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT.empty'"
+sleep 3
+gen $((3 * N)) "$N" # numbers 3N..4N-1: got() counts DISTINCT markers, so a
+# range reused from an earlier phase can never grow the count
+sleep 3
+FAILED2=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
+[ "$FAILED2" -gt "$FAILED" ] 2>/dev/null || { echo "e2e-tls: phase 2b expected failed cycles with an empty ca file, got $FAILED2 (was $FAILED)"; exit 1; }
+[ "$(got "$OUT")" -eq "$((3 * N))" ] || { echo "e2e-tls: phase 2b leaked $(( $(got "$OUT") - 3 * N )) events through a certificate-less CA"; exit 1; }
+set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
+gen $((4 * N)) "$N"
+wait_for "$OUT" $((5 * N)) || { echo "e2e-tls: phase 2b (replay after ca restored) delivered $(got "$OUT")/$((5 * N))"; exit 1; }
+echo "phase 2b ok: empty-ca file failed $((FAILED2 - FAILED)) cycles, nothing delivered"
 
 # --- phase 3: tcps, raw NDJSON over TLS
 set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TCPS'"
 gen $((3 * N)) "$N"
 wait_for "$TCPS_OUT" "$N" || { echo "e2e-tls: phase 3 (tcps) delivered $(got "$TCPS_OUT")/$N"; exit 1; }
 echo "phase 3 ok: tcps delivered $N/$N"
+
+# --- phase 4: verify=off keeps delivering but says so — exactly one WARNING
+# per worker life, the operator-visible trace of the footgun
+set_gucs "pg_logtap.export_tls_verify = 'off'"
+sleep 3
+gen "$N" "$N"
+wait_for "$TCPS_OUT" $((2 * N)) || { echo "e2e-tls: phase 4 (verify=off) delivered $(got "$TCPS_OUT"))/$((2 * N))"; exit 1; }
+WARNS=$(docker logs "$PG_CT" 2>&1 | grep -c "export_tls_verify=off")
+[ "$WARNS" -eq 1 ] || { echo "e2e-tls: phase 4 expected exactly one verify=off WARNING, got $WARNS"; exit 1; }
+set_gucs "pg_logtap.export_tls_verify = 'on'"
+echo "phase 4 ok: verify=off delivered, warned once"
 
 echo "events_per_phase=$N https_total=$(got "$OUT") tcps_total=$(got "$TCPS_OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

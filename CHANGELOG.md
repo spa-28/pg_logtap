@@ -24,9 +24,33 @@ counters.
   TLS-terminating load balancers.
 - `export_http_header` — extra header line(s) appended verbatim to every
   http(s) request, e.g. `E'Authorization: Bearer <token>\r\n'`.
-- `scripts/e2e-tls.sh` — three-phase acceptance against a self-signed
-  receiver: verified https delivery, handshake must fail (and later replay)
-  with the CA cleared, tcps delivery.
+- `scripts/e2e-tls.sh` — acceptance against a self-signed receiver: verified
+  https delivery, handshake must fail (and later replay) with the CA cleared
+  and with an empty CA file, tcps delivery, verify=off delivering with
+  exactly one WARNING.
+
+### Hardening
+
+- TLS failures name their fix instead of an error name: a certificate name
+  mismatch appends the `export_tls_server_name` hint (IP-literal URLs always
+  need it), an unknown CA appends the `export_tls_ca` hint, decode-class
+  errors say the receiver may not be speaking TLS on that port (an https://
+  URL at a plain-http port is the classic). A `export_tls_ca` file that
+  cannot be read, or parses but holds no certificates (created empty, wrong
+  file), fails with the path in the reason instead of an opaque chain error
+  on every handshake.
+- `export_tls_verify=off` logs one WARNING per worker life at the first
+  TLS send — the documented development escape hatch now leaves an
+  operator-visible trace in the server log.
+
+### Internal
+
+- The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
+  the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
+  chunk bounds shared with buildBody, and its boot path (compaction-litter
+  cleanup, backlog credit). No behavior change — the same functions under
+  `fb.` with namespaced state; the worker keeps the transports, deadlines
+  and the metrics server.
 
 ## 0.4.5 (2026-09-04)
 
