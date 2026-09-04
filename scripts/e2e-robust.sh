@@ -25,6 +25,11 @@
 #                   captured == sent + lost to the event — nothing vanishes
 #                   outside the trim, nothing the receiver never got counts
 #                   as sent
+#   frag-status   : a receiver that answers "HTTP/1." … "1 200 OK" in two
+#                   writes 300ms apart (TCP owes no write boundaries): the
+#                   status line straddles recvs, the send must still count
+#                   as delivered — a false failure parks a batch the
+#                   receiver already has (duplicate + divert on live)
 # Usage: scripts/e2e-robust.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
@@ -565,6 +570,93 @@ docker exec "$PG_CT" psql -U postgres -qc "SELECT 1" >/dev/null 2>&1 || fail "re
 [ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid pattern under load did not set redact_pattern_failed=1"
 setguc pg_logtap.redact_pattern ''; setguc log_min_duration_statement -1; reload; sleep 1
 ok "redact_pattern reloaded 8x under pgbench statement load: postmaster survived, gauge set"
+
+echo "== fragmented HTTP status: the line straddles recvs =="
+# TCP owes the sender no message boundaries: a receiver whose "HTTP/1.1 200"
+# lands as two recvs ("HTTP/1." then "1 200 OK…", 300ms apart — past any
+# coalescing) is perfectly legal, and the batch is already in its hands. A
+# one-recv status read fails such a send → the batch parks on the fallback
+# queue and replays as a DUPLICATE of what the receiver already had. The
+# regression signal is that duplicate, not the divert itself (a divert is
+# documented for any send failure): the suite-local python sink counts total
+# marker lines ever delivered vs unique ones — they must be equal. The sink
+# is dialed by CONTAINER IP, not name: resolving a fresh name from the
+# long-lived worker can wedge in glibc/docker DNS (the outage the worker's
+# dns_good cache exists for — but that cache cannot bootstrap a first-ever
+# name), and this scenario tests the status read, not the resolver.
+FRAG=pglogtap-frag-sink
+docker rm -f "$FRAG" >/dev/null 2>&1 || true
+docker run -d --rm --name "$FRAG" --network "$NET" python:3-alpine python -u -c '
+import socket, time
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 8687)); srv.listen(64)
+seen = set()
+total = 0
+while True:
+    conn, _ = srv.accept()
+    try:
+        hdr = b""
+        while b"\r\n\r\n" not in hdr:
+            d = conn.recv(4096)
+            if not d:
+                break
+            hdr += d
+        if b"\r\n\r\n" in hdr:
+            clen = 0
+            for line in hdr.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    clen = int(line.split(b":")[1])
+            body = hdr.split(b"\r\n\r\n", 1)[1]
+            while len(body) < clen:
+                d = conn.recv(65536)
+                if not d:
+                    break
+                body += d
+            conn.sendall(b"HTTP/1.")  # 7 bytes: below the 12 a status line needs
+            time.sleep(0.3)           # two recvs for sure, still inside send timeout
+            conn.sendall(b"1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            lines = [l for l in body.splitlines() if b"logtap robust" in l]
+            total += len(lines)
+            seen.update(lines)
+            print("FRAGSTAT total=%d uniq=%d" % (total, len(seen)), flush=True)
+    except OSError:  # readiness probes close without sending: EPIPE must not kill the sink
+        pass
+    finally:
+        conn.close()
+' >/dev/null
+n=0; SIP=''
+while [ "$n" -lt 30 ]; do
+  SIP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$FRAG" 2>/dev/null)
+  [ -n "$SIP" ] && docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$SIP/8687" 2>/dev/null && break
+  n=$((n + 1)); sleep 1
+done
+[ "$n" -lt 30 ] || { docker rm -f "$FRAG" >/dev/null 2>&1; fail "frag-status: sink never answered on $FRAG:8687"; }
+setguc pg_logtap.export_url "http://$SIP:8687"; setguc pg_logtap.export_fallback_file 'pg_logtap-fallback.bin'; reload; sleep 2
+gen frag 300
+fragstat() { docker logs "$FRAG" 2>/dev/null | grep -oE 'FRAGSTAT total=[0-9]+ uniq=[0-9]+' | tail -1; }
+n=0; while [ "$n" -lt 30 ]; do
+  st=$(fragstat); uni=${st#*uniq=}
+  [ "$uni" -ge 300 ] 2>/dev/null && break
+  n=$((n + 1)); sleep 1
+done
+st=$(fragstat); tot=${st#*total=}; tot=${tot%% *}; uni=${st#*uniq=}
+# Restore the stand's chain BEFORE asserting (a failed assert exits the
+# suite): live sends go back to vector with the fallback file still armed so
+# anything the scenario parked drains there, and only then does the file GUC
+# come off — clearing it first would strand parked events in the file.
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+n=0; while [ "$n" -lt 30 ]; do
+  qb=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
+  [ "$qb" -le 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+setguc pg_logtap.export_fallback_file ''; reload
+docker rm -f "$FRAG" >/dev/null 2>&1 || true
+[ "${uni:-0}" -ge 300 ] || fail "frag-status: the sink saw ${uni:-0}/300 unique events — delivery itself broke"
+[ "$tot" = "$uni" ] \
+  || fail "frag-status: $tot lines delivered for $uni events — a delivered batch was retried (one-recv status read)"
+ok "status line across two recvs accepted: $tot events delivered, each exactly once"
 
 dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "$dups duplicate seqs across the suite"
