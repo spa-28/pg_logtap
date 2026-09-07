@@ -71,9 +71,9 @@ test "parse https and tcps" {
     const dest_v = parseUrl("https://logs.example.com:443/insert/jsonline").?;
     try std.testing.expectEqual(true, dest_v.http.tls);
     try std.testing.expectEqualStrings("logs.example.com", dest_v.http.host);
-    const t = parseUrl("tcps://fluent:24224").?;
-    try std.testing.expectEqual(true, t.tcp.tls);
-    try std.testing.expectEqual(@as(u16, 24224), t.tcp.port);
+    const tcp_v = parseUrl("tcps://fluent:24224").?;
+    try std.testing.expectEqual(true, tcp_v.tcp.tls);
+    try std.testing.expectEqual(@as(u16, 24224), tcp_v.tcp.port);
     try std.testing.expectEqual(false, parseUrl("tcp://fluent:24224").?.tcp.tls);
 }
 

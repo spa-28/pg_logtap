@@ -15,7 +15,7 @@ const jsonl = @import("jsonl.zig");
 const capture = @import("capture.zig");
 const dest_mod = @import("export.zig");
 const tls_mod = @import("tls.zig");
-const fb = @import("fb.zig");
+const fbq = @import("fb.zig");
 const gzip = @import("gzip.zig");
 const metrics = @import("metrics.zig");
 
@@ -111,7 +111,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_http_header", "Extra header line(s) appended verbatim to every http(s):// request after the fixed headers — e.g. E'Authorization: Bearer <token>\r\n' for VictoriaLogs. Multi-line values must carry their own CRLFs (write them as E'' strings). Empty = none.", null, &guc_export_http_header, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
-    fb.defineGucs();
+    fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -155,7 +155,7 @@ pub fn workerMain() void {
     refreshSourceId();
     // Compaction-litter cleanup + backlog credit for a queue that outlived
     // the counters (src/fb.zig).
-    fb.boot(alloc);
+    fbq.boot(alloc);
 
     while (!got_sigterm.isSet()) {
         pg.ResetLatch(pg.MyLatch);
@@ -173,7 +173,7 @@ pub fn workerMain() void {
         // Return a storm-swollen backlog buffer: parking keeps the ArrayList
         // capacity, so a one-off million-event storm would otherwise pin GiB
         // of RSS for the worker's whole life (measured: 6.6GiB retained).
-        if (pending.len() == 0 and pending.buf.capacity >= 2 * fb.body_cap) {
+        if (pending.len() == 0 and pending.buf.capacity >= 2 * fbq.body_cap) {
             pending.deinit(alloc);
             pending = .{};
         }
@@ -251,13 +251,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         drained_total += drainInto(alloc, pending);
         lost += trimBacklog(pending); // bounded RAM even when inflow outruns sending
 
-        if (fb.queued()) {
+        if (fbq.queued()) {
             // Queued events are older than anything live, so pending joins the
             // queue first — global seq order holds — and the file drains to the
             // receiver one member per iteration (the ring keeps draining through
             // a long catch-up). Parking live events on disk rather than RAM is
             // what makes catch-up lossless when the live rate exceeds the drain
-            // rate; fb.logDivert(true) fires only on a failed send, never on
+            // rate; fbq.logDivert(true) fires only on a failed send, never on
             // these appends — a transition line per append would feed itself
             // back through the hook into the queue, forever.
             var appended = false;
@@ -274,7 +274,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
                 const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-                if (fb.append(alloc, chunk.body, false) != .appended) { // disk full → RAM-backlog semantics for the rest (sync=false cannot be not_durable)
+                if (fbq.append(alloc, chunk.body, false) != .appended) { // disk full → RAM-backlog semantics for the rest (sync=false cannot be not_durable)
                     failed += 1;
                     break;
                 }
@@ -282,7 +282,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 queued += chunk.consumed;
                 appended = true;
             }
-            if (appended) fb.fsync();
+            if (appended) fbq.fsync();
             // Capture outranks replay: a member send to a slow receiver blocks
             // this loop for hundreds of milliseconds, and at high inflow the
             // ring fills and drops events at capture before the next drain.
@@ -290,14 +290,14 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // park-only: fsync and hand the loop back to drainInto; members
             // resume once inflow quiets or it recovers.
             if (receiver_slow and drained_total > 0) continue;
-            const member = fb.nextMember(alloc) orelse {
-                lost += fb.lost;
-                fb.lost = 0;
+            const member = fbq.nextMember(alloc) orelse {
+                lost += fbq.lost;
+                fbq.lost = 0;
                 failed += @intFromBool(pending.len() > 0); // append failed above
                 break;
             };
-            lost += fb.lost;
-            fb.lost = 0;
+            lost += fbq.lost;
+            fbq.lost = 0;
             const gzipped = gzipPayload(alloc, dest, member.body, &gzip_buf);
             const m_sent_at = pg.GetCurrentTimestamp();
             if (send(dest, url, gzipped.payload, gzipped.enabled)) {
@@ -306,23 +306,23 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 // it — this also arms it after a restart into a slow receiver
                 // where the live-send probe never ran.
                 if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
-                fb.logDivert(false);
+                fbq.logDivert(false);
                 // counted queued at append time; this is its delivery
                 replayed += std.mem.countScalar(u8, member.body, '\n');
-                fb.offset += member.advance;
-                if (fb.offset >= member.size) fb.truncate(); // fully delivered → back to direct sends
+                fbq.offset += member.advance;
+                if (fbq.offset >= member.size) fbq.truncate(); // fully delivered → back to direct sends
                 members += 1;
                 if (members < 64) continue;
                 break; // hand the loop back: counters, metrics, latch
             }
-            fb.logDivert(true); // receiver down: divert starts (transition-guarded)
+            fbq.logDivert(true); // receiver down: divert starts (transition-guarded)
             failed += 1;
             break; // retry the queue next cycle
         }
 
         if (pending.len() == 0) break;
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0 and fb.append(alloc, chunk.body, true) != .failed) {
+        if (receiver_slow and guc_export_slow_ms > 0 and fbq.append(alloc, chunk.body, true) != .failed) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
@@ -331,7 +331,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // through to the live send below: that send is also the only
             // probe that clears receiver_slow — parking into nowhere while
             // the flag is set livelocks delivery forever.
-            fb.logDivert(true);
+            fbq.logDivert(true);
             pending.dropFront(chunk.consumed);
             queued += chunk.consumed;
             continue;
@@ -339,7 +339,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         const gzipped = gzipPayload(alloc, dest, chunk.body, &gzip_buf);
         const sent_at = pg.GetCurrentTimestamp();
         if (send(dest, url, gzipped.payload, gzipped.enabled)) {
-            fb.logDivert(false);
+            fbq.logDivert(false);
             pending.dropFront(chunk.consumed);
             sent += chunk.consumed;
             // Liveness probe, both ways: an answer this slow cannot keep up
@@ -355,10 +355,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             failed += 1;
             parkAll(alloc, pending, names, &queued, &lost);
             break;
-        } else if (fb.append(alloc, chunk.body, true) != .failed) {
-            fb.logDivert(true);
+        } else if (fbq.append(alloc, chunk.body, true) != .failed) {
+            fbq.logDivert(true);
             pending.dropFront(chunk.consumed);
-            queued += chunk.consumed; // parked in the file (a failed fdatasync keeps the member — fb.append); counted replayed on delivery
+            queued += chunk.consumed; // parked in the file (a failed fdatasync keeps the member — fbq.append); counted replayed on delivery
             failed += 1; // the send DID fail — without this a diverting storm
             // reports send_cycles_failed=0 (the receiver-down signal) while
             // actively losing events
@@ -376,7 +376,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
-    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fb.broken), fb.sync_failures);
+    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fbq.broken), fbq.sync_failures);
     logTransitions(sent + replayed, failed, lost);
 }
 
@@ -389,12 +389,12 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
     var appended = false;
     while (pending.len() > 0) {
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (fb.append(alloc, chunk.body, false) != .appended) break;
+        if (fbq.append(alloc, chunk.body, false) != .appended) break;
         pending.dropFront(chunk.consumed);
         queued.* += chunk.consumed;
         appended = true;
     }
-    if (appended) fb.fsync();
+    if (appended) fbq.fsync();
     lost.* += pending.len();
     pending.dropFront(pending.len());
 }
@@ -403,7 +403,7 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
 /// buffer: a fresh ~100KB chunk body sits above glibc's mmap threshold, and
 /// the per-chunk mmap/munmap + TLB shootdowns stall every core — measured as
 /// ring drops under a 16-client storm. The slice is valid until the next call.
-/// Stops at fb.chunk_max events or fb.body_cap bytes, whichever comes first, and
+/// Stops at fbq.chunk_max events or fbq.body_cap bytes, whichever comes first, and
 /// reports how many events it consumed — the caller drops exactly those.
 /// null = nothing built (empty or formatting failed); the caller retries
 /// next cycle.
@@ -423,13 +423,13 @@ fn buildBody(w: *std.Io.Writer.Allocating, pending: *Backlog, names: *NameCache)
     w.writer.end = 0; // reset, keep capacity
     var consumed: usize = 0;
     var off = pending.head;
-    while (consumed < @min(pending.len(), fb.chunk_max)) {
+    while (consumed < @min(pending.len(), fbq.chunk_max)) {
         const ent: *const ring.ShmLogEntry = @ptrCast(@alignCast(pending.buf.items.ptr + off));
         const msg = pending.buf.items[off + @sizeOf(ring.ShmLogEntry) ..][0..ent.message_len];
         jsonl.writeEntry(&w.writer, ent, msg, names.lookup(ent)) catch return null;
         w.writer.writeByte('\n') catch return null;
         consumed += 1;
-        if (w.writer.end >= fb.body_cap) break;
+        if (w.writer.end >= fbq.body_cap) break;
         off = pending.nextOff(off);
     }
     if (consumed == 0) return null;
@@ -640,7 +640,7 @@ fn tlsOpts() tls_mod.Options {
         elog.Warning(@src(), "pg_logtap export_tls_verify=off: https/tcps certificate verification is DISABLED — a man in the middle can read the logs", .{});
     }
     return .{
-        .ca = gucSpan(guc_export_tls_ca),
+        .ca_pem = gucSpan(guc_export_tls_ca),
         .server_name = gucSpan(guc_export_tls_server_name),
         .verify = guc_export_tls_verify,
     };
@@ -655,13 +655,13 @@ fn tlsFail() bool {
 /// Abort-aware body write over TLS: one tls chunk may drain several socket
 /// writes (each bounded by SO_SNDTIMEO), so the shutdown/cycle budget is
 /// checked between chunks instead of between syscalls.
-fn tlsWriteBody(tc: *tls_mod.Conn, head: []const u8, body: []const u8) bool {
-    if (!tc.write(head)) return tlsFail();
+fn tlsWriteBody(tls_conn: *tls_mod.Conn, head: []const u8, body: []const u8) bool {
+    if (!tls_conn.write(head)) return tlsFail();
     var off: usize = 0;
     while (off < body.len) {
         if (sendAborted()) return failSend("tls abort", 0);
         const want = @min(body.len - off, 64 * 1024);
-        if (!tc.write(body[off..][0..want])) return tlsFail();
+        if (!tls_conn.write(body[off..][0..want])) return tlsFail();
         off += want;
     }
     return true;
@@ -712,20 +712,20 @@ fn status2xx(status: []const u8) bool {
 }
 
 fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) bool {
-    const tc = tls_mod.connect(conn_fd, h.host, tlsOpts()) orelse return tlsFail();
-    if (!tlsWriteBody(tc, head, body)) return false;
+    const tls_conn = tls_mod.connect(conn_fd, h.host, tlsOpts()) orelse return tlsFail();
+    if (!tlsWriteBody(tls_conn, head, body)) return false;
     // sendAborted between reads here: the plain path checks it inside
     // recvSome, but the TLS read goes through tls_mod's connection.
     var status_buf: [32]u8 = undefined;
     var got: usize = 0;
     while (got < 12) {
         if (sendAborted()) return failSend("tls abort", 0);
-        const nread = tc.readSome(status_buf[got..]);
+        const nread = tls_conn.readSome(status_buf[got..]);
         if (nread == 0) return failSend("status read", 0); // detail, if any, sits in tls_mod.last_error
         got += nread;
     }
     if (!status2xx(status_buf[0..got])) return false;
-    tc.end();
+    tls_conn.end();
     return true;
 }
 
@@ -735,9 +735,9 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, host: []const u8, use_tls: bool) bo
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
     if (use_tls) {
-        const tc = tls_mod.connect(conn_fd, host, tlsOpts()) orelse return tlsFail();
-        if (!tlsWriteBody(tc, "", body)) return false;
-        tc.end();
+        const tls_conn = tls_mod.connect(conn_fd, host, tlsOpts()) orelse return tlsFail();
+        if (!tlsWriteBody(tls_conn, "", body)) return false;
+        tls_conn.end();
         return true;
     }
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
@@ -966,7 +966,7 @@ fn failSend(stage: []const u8, err: c_int) bool {
 var fail_reason_buf: [160]u8 = undefined; // wide enough for a tls.zig reason with its hint verbatim
 var fail_reason: []const u8 = "";
 
-/// Blocking full write over a socket or regular-file fd; fb.zig's appends
+/// Blocking full write over a socket or regular-file fd; fbq.zig's appends
 /// and compaction go through here too.
 pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool) bool {
     var off: usize = 0;

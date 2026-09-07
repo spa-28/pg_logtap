@@ -32,7 +32,7 @@ pub const Options = struct {
     /// PEM file with the receiver's CA (the receiver's own certificate for a
     /// self-signed one). Empty = system CA roots. A custom file REPLACES the
     /// system roots — the receiver's chain is known, that is the point.
-    ca: []const u8 = "",
+    ca_pem: []const u8 = "",
     /// Certificate name to verify and SNI to send when it differs from the
     /// URL host (IP-literal URLs, TLS-terminating load balancers).
     /// Empty = the URL host.
@@ -79,11 +79,11 @@ pub const Conn = struct {
     /// Decrypted bytes into buf — as many as available, at least 1 on
     /// success (0 = failure or clean EOF; reason in last_error on failure).
     pub fn readSome(c: *Conn, buf: []u8) usize {
-        const n = c.client.reader.readSliceShort(buf) catch |e| {
+        const nread = c.client.reader.readSliceShort(buf) catch |e| {
             fail("tls read: {s}", .{@errorName(e)});
             return 0;
         };
-        return n;
+        return nread;
     }
 
     /// Best-effort close_notify so the receiver can tell a finished session
@@ -152,14 +152,14 @@ fn bundleReady(ca_path: []const u8) bool {
 /// it punches a plain one).
 pub fn connect(fd: c_int, url_host: []const u8, opts: Options) ?*Conn {
     const c = &conn_storage;
-    const i = io();
+    const io_ref = io();
     // The address field is unused by the read/write paths (dialTcp already
     // connected the fd); it just needs a valid value.
     const stream = std.Io.net.Stream{ .socket = .{ .handle = fd, .address = .{ .ip4 = .unspecified(0) } } };
-    c.stream_reader = stream.reader(i, &c.socket_read_buf);
-    c.stream_writer = stream.writer(i, &c.socket_write_buf);
-    i.random(&c.entropy);
-    var o: tls.Client.Options = .{
+    c.stream_reader = stream.reader(io_ref, &c.socket_read_buf);
+    c.stream_writer = stream.writer(io_ref, &c.socket_write_buf);
+    io_ref.random(&c.entropy);
+    var client_opts: tls.Client.Options = .{
         .host = .no_verification,
         .ca = .no_verification,
         .read_buffer = &c.app_read_buf,
@@ -171,12 +171,12 @@ pub fn connect(fd: c_int, url_host: []const u8, opts: Options) ?*Conn {
         .allow_truncation_attacks = true,
     };
     if (opts.verify) {
-        if (!bundleReady(opts.ca)) return null;
+        if (!bundleReady(opts.ca_pem)) return null;
         const host = if (opts.server_name.len > 0) opts.server_name else url_host;
-        o.host = .{ .explicit = host };
-        o.ca = .{ .bundle = .{ .gpa = alloc, .io = i, .lock = &ca_lock, .bundle = &ca_bundle } };
+        client_opts.host = .{ .explicit = host };
+        client_opts.ca = .{ .bundle = .{ .gpa = alloc, .io = io_ref, .lock = &ca_lock, .bundle = &ca_bundle } };
     }
-    c.client = tls.Client.init(&c.stream_reader.interface, &c.stream_writer.interface, o) catch |e| {
+    c.client = tls.Client.init(&c.stream_reader.interface, &c.stream_writer.interface, client_opts) catch |e| {
         // The error name alone is a riddle for the three misconfigurations
         // that dominate real setups; append the GUC that fixes each. String
         // compares (not a switch) so an error outside this set still formats.
