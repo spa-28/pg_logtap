@@ -8,7 +8,7 @@ set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init hookchain "${1:-}"
 e2e_gate
-OUT=/tmp/logtap-hookchain
+OUT=${E2E_OUT:-/tmp/logtap-e2e}/hookchain # per container in a parallel matrix
 
 psql_ct() { docker exec "$PG_CT" psql -U postgres "$@"; }
 
@@ -24,10 +24,10 @@ if command -v pg_config >/dev/null 2>&1; then # CI: server-dev for this major
     tests/e2e/hookchain.c -o "$OUT/hookchain.so"
 else # local: the pgzx-build container has server-dev 15-18
   INC=$(docker exec pgzx-build "/usr/lib/postgresql/$MAJ/bin/pg_config" --includedir-server)
-  docker cp tests/e2e/hookchain.c pgzx-build:/tmp/hookchain.c
+  docker cp tests/e2e/hookchain.c "pgzx-build:/tmp/hookchain-$PG_CT.c"
   docker exec pgzx-build /opt/zig016/files/zig cc -shared -fPIC -Wno-ignored-attributes -I"$INC" \
-    /tmp/hookchain.c -o /tmp/hookchain.so
-  docker cp pgzx-build:/tmp/hookchain.so "$OUT/hookchain.so"
+    /tmp/hookchain-"$PG_CT".c -o /tmp/hookchain-"$PG_CT".so
+  docker cp "pgzx-build:/tmp/hookchain-$PG_CT.so" "$OUT/hookchain.so"
 fi
 docker cp "$OUT/hookchain.so" "$PG_CT:$LIBDIR/"
 

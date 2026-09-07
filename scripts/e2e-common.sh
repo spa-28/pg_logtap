@@ -24,8 +24,15 @@ e2e_init() { # e2e_init <tag> [container]
   E2E_TAG=$1
   PG_CT=${2:-$(e2e_default_ct)}
   E2E_CT=$PG_CT
-  OUT=/tmp/logtap-e2e
-  VEC=pglogtap-vector
+  # E2E_OUT: a parallel matrix (test-matrix.sh JOBS>1) gives every major its
+  # own dir — suite-private files (tls certs/sinks, hookchain.so) would
+  # otherwise be rm'd/regenerated under each other. The shared vector sink
+  # is symlinked in by the matrix.
+  OUT=${E2E_OUT:-/tmp/logtap-e2e}
+  # E2E_VECTOR: a parallel matrix gives every major its own vector — the
+  # kill/robust suites stop THEIR receiver mid-scenario, which on a shared
+  # one serialized the whole matrix. Sequential runs keep the stand's.
+  VEC=${E2E_VECTOR:-pglogtap-vector}
   # shellcheck disable=SC2034 # suite bodies use it (kill's silent receiver)
   SILENT=pglogtap-silent
   NET=pglogtap-e2e_default
@@ -44,6 +51,7 @@ e2e_lock() { # one suite per container: a deploy or a second suite restarts
     exit 1
   }
 }
+
 
 e2e_gate() { # the compose stand must be up, freshly deployed, reachable
   [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \

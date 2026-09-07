@@ -8,7 +8,7 @@ set -u
 e2e_init vector "${1:-}"
 EVENTS="${2:-20}"
 e2e_gate
-OUT=/tmp/logtap-e2e/vector-out.jsonl
+OUT=${E2E_OUT:-/tmp/logtap-e2e}/vector-out.jsonl # file path, unlike e2e_init's dir
 
 # Point pg_logtap at Vector (URL is re-read every flush cycle, no restart
 # needed) and reset the counters' baseline.

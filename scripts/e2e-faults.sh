@@ -18,11 +18,11 @@ set -u
 . "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
-CT=pglogtap-faults
+CT=pglogtap-faults-$V # per major: parallel matrix runs
 E2E_TAG=fault
 E2E_CT=$CT
 E2E_SUF= # throwaway container: fresh sinks each run, no per-run suffix needed
-OUT=/tmp/logtap-faults
+OUT=/tmp/logtap-faults-$V
 SO=dist/pg$V/lib/pg_logtap.so
 [ -f "$SO" ] || { echo "e2e-faults: $SO missing — run the stand phase first" >&2; exit 2; }
 

@@ -82,7 +82,25 @@ stats fields); the four new GUCs are all SIGHUP.
   default): every PG major gets the verified/impostor/server_name/
   intermediate/tcps/verify=off acceptance, not just the dev stand's
   major. The receivers run host-side, so the phase needs `openssl` and
-  `python` on the host.
+  `python` on the host. `set_gucs` applies a reload barrier instead of
+  timed sleeps — SHOW polled in a fresh session until the new config
+  generation is visible, plus one `export_timeout_ms` for the worker's
+  worst in-flight send — so markers generated after a url switch cannot
+  ride the old destination; the suite also clears any fallback file
+  inherited from earlier matrix phases, whose failure-phase parking
+  belonged to those suites' scenarios, not this one's.
+- `JOBS=N test-matrix.sh` runs the PG majors in parallel (~1.7× on four):
+  each major gets its own output dir, its own vector receiver (the
+  kill/robust suites stop THEIR receiver mid-scenario — with one shared
+  vector those phases serialized the whole matrix behind a lock, measured
+  slower than sequential; vlogs and the mute silent receiver stay shared,
+  nothing stops them and the vlogs asserts are marker-filtered), its own
+  TLS receiver ports and per-container names for the ephemeral receivers
+  (slow/faults/metrics/frag/hookchain). The tested pg containers are plain
+  `docker run` on the stand's network — compose offers one container per
+  project+service, and the cross-major recreate/label-rm dance existed
+  only to fake per-major service slots. Builds and stand bring-ups
+  serialize on one lock (shared zig-out and the pgzx-build cache).
 - The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
   the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
   chunk bounds shared with buildBody, and its boot path (compaction-litter

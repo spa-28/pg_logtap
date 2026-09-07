@@ -6,13 +6,13 @@ set -u
 e2e_init metrics "${1:-}"
 PORT="${2:-9187}"
 e2e_gate
-OUT=/tmp/logtap-metrics/vector-metrics.jsonl
-docker rm -f pglogtap-vector-metrics >/dev/null 2>&1
-mkdir -p /tmp/logtap-metrics
+OUT=/tmp/logtap-metrics/$PG_CT/vector-metrics.jsonl # per container: parallel majors truncate it
+docker rm -f "$PG_CT-vector-metrics" >/dev/null 2>&1
+mkdir -p "/tmp/logtap-metrics/$PG_CT"
 : > "$OUT" # fresh scrape log for this run's count
 # Scrape target follows $PG_CT (no hardcoded container); the listener is
 # loopback-only by default, so the script opens metrics_addr for Vector.
-cat > /tmp/logtap-metrics/vector.yaml <<EOF
+cat > "/tmp/logtap-metrics/$PG_CT/vector.yaml" <<EOF
 sources:
   prom:
     type: prometheus_scrape
@@ -27,9 +27,9 @@ sinks:
     path: /var/log/vector-metrics.jsonl
     encoding: { codec: json }
 EOF
-docker run -d --name pglogtap-vector-metrics --network "$NET" \
-  -v /tmp/logtap-metrics/vector.yaml:/etc/vector/vector.yaml:ro \
-  -v /tmp/logtap-metrics:/var/log \
+docker run -d --name "$PG_CT-vector-metrics" --network "$NET" \
+  -v "/tmp/logtap-metrics/$PG_CT/vector.yaml:/etc/vector/vector.yaml:ro" \
+  -v "/tmp/logtap-metrics/$PG_CT:/var/log" \
   timberio/vector:0.57.0-alpine --config /etc/vector/vector.yaml >/dev/null
 sleep 3
 
@@ -72,8 +72,8 @@ assert b'pg_logtap_' in data, 'metrics body missing'
 print('frag-get ok:', data.split(b'\r\n', 1)[0].decode())
 " || {
   echo "e2e-metrics: FAILED: fragmented GET not answered with the metrics body" >&2
-  docker rm -f pglogtap-vector-metrics >/dev/null
+  docker rm -f "$PG_CT-vector-metrics" >/dev/null
   exit 1
 }
-docker rm -f pglogtap-vector-metrics >/dev/null
+docker rm -f "$PG_CT-vector-metrics" >/dev/null
 [ "$got" -ge 1 ]

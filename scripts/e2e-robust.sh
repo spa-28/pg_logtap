@@ -496,7 +496,7 @@ echo "== fragmented HTTP status: the line straddles recvs =="
 # long-lived worker can wedge in glibc/docker DNS (the outage the worker's
 # dns_good cache exists for — but that cache cannot bootstrap a first-ever
 # name), and this scenario tests the status read, not the resolver.
-FRAG=pglogtap-frag-sink
+FRAG=pglogtap-frag-sink-$PG_CT # per container: parallel majors each rm -f it
 docker rm -f "$FRAG" >/dev/null 2>&1
 docker run -d --rm --name "$FRAG" --network "$NET" python:3-alpine python -u -c '
 import socket, time

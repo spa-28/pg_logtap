@@ -13,7 +13,7 @@ set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init slow "${1:-}"
 PORT="${2:-9498}"
-SINK=pglogtap-slow
+SINK=pglogtap-slow-${PG_CT#pglogtap-} # per container: rm -f'd at every up_sink
 e2e_gate
 
 # socat forks per connection; the background (sleep N; printf) answers with a
