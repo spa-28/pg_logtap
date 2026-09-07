@@ -74,16 +74,17 @@ stats fields); the four new GUCs are all SIGHUP.
 
 ### Internal
 
-- From the sixth external review: SIGHUP no longer leaks the source-identity
-  strings (hostname/cluster/pgdata were duped on every reload and never
-  freed; the copies are owned now, and a reload with unchanged values keeps
-  the allocation), and the oid→name cache is bounded (4096 entries per map —
-  a database/role create-drop storm grew it forever; past the bound the maps
-  reset and re-fill lazily from the catalog). Rejected with reasons: the
-  not_durable/deferred-fsync handling the review wanted reworked is the
-  settled 0.4.2 contract (member kept, counted queued, surfaced through
-  `fb_sync_failures` — including the deferred per-cycle fsync), and the
-  per-handshake CA re-read is the documented rotation mechanism.
+- SIGHUP no longer leaks the source-identity strings (hostname/cluster/
+  pgdata were duped on every reload and never freed; the copies are owned
+  now, and a reload with unchanged values keeps the allocation), and the
+  oid→name cache is bounded (4096 entries per map — a database/role
+  create-drop storm grew it forever; past the bound the maps reset and
+  re-fill lazily from the catalog).
+- `fb_sync_failures` non-zero is history, not current state, everywhere the
+  counter appears (README, delivery.md, the /metrics HELP): the next
+  successful sync — or a compaction, whose rewrite is fdatasynced before
+  the rename — makes the queue durable again while the counter stays;
+  alert on its growth, not its level.
 - e2e-tls phase 8, the ambiguous close: a receiver whose TLS layer takes
   the whole request body and then ends the session before any status line.
   The send fails on the status read (with tls.zig's stage detail folded
@@ -140,9 +141,8 @@ stats fields); the four new GUCs are all SIGHUP.
 
 ## 0.4.5 (2026-09-04)
 
-Boot-safety and delivery-contract documentation round from the fifth
-external review. No schema, GUC or counter changes; upgrade is binary
-replace + restart.
+Boot-safety and delivery-contract documentation round. No schema, GUC or
+counter changes; upgrade is binary replace + restart.
 
 ### Fixed
 
@@ -169,7 +169,7 @@ replace + restart.
 
 ## 0.4.4 (2026-09-04)
 
-TCP-stream parsing and accounting round from the fourth external review.
+TCP-stream parsing and accounting round.
 Upgrade is the 0.4.3 → 0.4.4 script (schema unchanged — the script only
 provides the update path) + binary replace + restart; no new GUCs or
 counters.
@@ -213,7 +213,7 @@ counters.
 
 ## 0.4.3 (2026-09-03)
 
-Filesystem-hardening round from the third external review. Upgrade is the
+Filesystem-hardening round. Upgrade is the
 0.4.2 → 0.4.3 script (schema unchanged — the script only provides the
 update path) + binary replace + restart; no new GUCs or counters.
 
@@ -255,7 +255,7 @@ update path) + binary replace + restart; no new GUCs or counters.
 
 ## 0.4.2 (2026-09-02)
 
-Delivery-hardening round from the second external review. Upgrade is the
+Delivery-hardening round. Upgrade is the
 0.4.1 → 0.4.2 script (one new counter attribute) + binary replace +
 restart.
 
@@ -292,7 +292,7 @@ restart.
 
 ## 0.4.1 (2026-09-01)
 
-Hardening round from the 0.4.0 external review. No schema or shmem
+Hardening round. No schema or shmem
 changes; upgrade is a binary replace + restart as usual.
 
 ### Fixed

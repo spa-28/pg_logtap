@@ -65,6 +65,10 @@ pub var offset: u64 = 0;
 pub var broken = false;
 /// Cumulative failed fdatasync calls on the fallback queue — the counter
 /// behind the shmem gauge (the WARNING below is edge-triggered on purpose).
+/// Cumulative means historical, not a current-state claim: a non-zero value
+/// does not say the queue NOW holds undurable data — the next successful
+/// sync (or a landing compaction, fdatasynced before its rename) makes it
+/// durable while the counter stays. Alert on growth, not level.
 pub var sync_failures: u64 = 0;
 /// Warned-once latch for a failing fdatasync: a dying disk fails every cycle
 /// and a per-cycle WARNING would bury the server log, but one silent failure
