@@ -4,7 +4,7 @@
 
 TLS export and HTTP auth-header round. Upgrade is binary replace + restart
 (the 0.4.x view keeps working — `jsonb_populate_record` ignores the new
-stats fields); no new GUCs.
+stats fields); the four new GUCs are all SIGHUP.
 
 ### Added
 

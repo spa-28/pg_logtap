@@ -33,6 +33,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **Capture-time redaction** — the `password` token in statement text is cut and bind-parameter values in `DETAIL` are masked before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~45k events/s sustained for 5 minutes (OLTP overhead and latency percentiles, measured before/after the extension: [docs/bench.md](docs/bench.md)), and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
+- **TLS export** — `https://` and `tcps://` schemes: the same transports over TLS 1.2/1.3, CA pinning, name/SNI override for IP-literal URLs and TLS-terminating load balancers, auth headers for http(s) ([details](docs/delivery.md#tls-https-tcps)).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
 
@@ -112,6 +113,10 @@ GUCs and restart again.
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
 | `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
 | `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
+| `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. |
+| `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
+| `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
+| `pg_logtap.export_http_header` | `''` | SIGHUP | Extra header line(s) appended verbatim to every http(s) request after the fixed headers, e.g. `E'Authorization: Bearer <token>\r\n'` (plain `http://` included). |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed `http://`/`tcp://` batches go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
@@ -176,6 +181,19 @@ SELECT pg_reload_conf();
 -- verify: emit a warning, watch it arrive, then check the counters
 DO $$ BEGIN RAISE WARNING 'hello from pg_logtap'; END $$;
 SELECT pg_logtap_stats();
+```
+
+The same over TLS — an internal CA and a bearer token, no restart:
+
+```sql
+ALTER SYSTEM SET pg_logtap.export_url = 'https://vlogs.internal:9428/insert/jsonline?_stream_fields=host,level&_msg_field=message&_time_field=timestamp';
+ALTER SYSTEM SET pg_logtap.export_tls_ca = '/etc/pg_logtap/vlogs-ca.pem';
+ALTER SYSTEM SET pg_logtap.export_http_header = E'Authorization: Bearer <token>\r\n';
+SELECT pg_reload_conf();
+-- a self-signed receiver: the CA file IS the receiver's own certificate.
+-- An IP-literal URL (https://10.0.0.5:9428) or a TLS-terminating LB in
+-- front of the receiver also needs:
+--   ALTER SYSTEM SET pg_logtap.export_tls_server_name = 'vlogs.internal';
 ```
 
 ### Sizing the ring buffer
@@ -294,10 +312,12 @@ On top of that, the operational knobs:
 - scrub at the collector — Vector's `redact` transform (built-in filters for
   emails/SSNs/custom regex) still applies to whatever else slips through.
 
-`export_url` schemes (gzip applies to the `http://` scheme only):
+`export_url` schemes (gzip applies to the `http(s)://` schemes):
 
 - `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it;
+- `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_header` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
+- `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
 - `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
@@ -323,10 +343,12 @@ TCP or file — so Vector is convenient but not required:
 | your own | any HTTP/TCP endpoint that reads lines |
 
 Not direct (put a collector in between): **Kafka** (binary protocol);
-**Loki / Elasticsearch / OpenSearch** (different body format); cloud endpoints
-(Datadog, Elastic Cloud) — HTTPS and auth headers, which plaintext export
-doesn't do by design. Principle: pg_logtap is a dumb reliable transporter of a
-trivial format; transformation, TLS, auth and fan-out are the collector's job.
+**Loki / Elasticsearch / OpenSearch** (different body format); endpoints that
+need mTLS client certificates or a vendor-specific body (Datadog, Elastic
+Cloud). A plain `https://` NDJSON endpoint with a bearer token is direct:
+`export_tls_ca` + `export_http_header` cover it. Principle: pg_logtap is a
+dumb reliable transporter of a trivial format; transformation and fan-out
+are the collector's job.
 
 Size limits to check before raising `message_max`: **VictoriaLogs** skips
 any ingest line longer than `-insert.maxLineSizeBytes` (default 256 KB)
