@@ -27,7 +27,7 @@ set -u
 e2e_init tls "${1:-}"
 N="${2:-10}"
 e2e_gate
-DIR=/tmp/logtap-e2e/tls
+DIR=$OUT/tls # per-major under E2E_OUT: certs and sinks are rm'd/regenerated per run
 OUT=$DIR/https-out.jsonl
 TCPS_OUT=$DIR/tcps-out.jsonl
 EVIL_OUT=$DIR/evil-out.jsonl
@@ -35,10 +35,14 @@ CHAIN_OUT=$DIR/chain-out.jsonl
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
-PORT_HTTPS=18443
-PORT_TCPS=18444
-PORT_EVIL=18445
-PORT_CHAIN=18446
+# E2E_TLS_BASE: the four host-side listeners move per PG major in a parallel
+# matrix (JOBS>1) — one base per major, 8 apart so the +1..+3 ranges cannot
+# touch; sequentially the default keeps the historical ports.
+TLS_BASE=${E2E_TLS_BASE:-18443}
+PORT_HTTPS=$TLS_BASE
+PORT_TCPS=$((TLS_BASE + 1))
+PORT_EVIL=$((TLS_BASE + 2))
+PORT_CHAIN=$((TLS_BASE + 3))
 
 # The receiver's address as seen from the pg container: the docker network
 # gateway (the host). The certificate's SAN carries that IP — verification
@@ -79,7 +83,12 @@ docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
 DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" python3 - <<'PYEOF' &
-import gzip, os, ssl, socket, threading
+import gzip
+import os
+import socket
+import ssl
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 d = os.environ["DIR"]
@@ -91,11 +100,12 @@ ctx_chain = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx_chain.load_cert_chain(os.path.join(d, "chain.pem"), os.path.join(d, "leaf.key"))
 
 class H(BaseHTTPRequestHandler):
+    sink = "https-out.jsonl"
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.headers.get("Content-Encoding") == "gzip":
             body = gzip.decompress(body)
-        with open(os.path.join(d, "https-out.jsonl"), "ab") as f:
+        with open(os.path.join(d, type(self).sink), "ab") as f:
             f.write(body)
         self.send_response(200)
         self.send_header("Content-Length", "2")
@@ -111,23 +121,44 @@ def dump_tls(port, ctx, out):
     raw.listen(8)
     while True:
         conn, _ = raw.accept()
+        data = b""
         try:
             tls = ctx.wrap_socket(conn, server_side=True)
-            data = b""
             while True:
                 chunk = tls.recv(65536)
                 if not chunk:
                     break
                 data += chunk
+            tls.close()
+        except OSError as exc:
+            # A probe or a client aborting mid-handshake; the dumper survives.
+            # Zero bytes is that routine case. Bytes in hand are the news: a
+            # discard here once ate a batch the asserts were counting (peer
+            # closed with RST after a full batch — recv raises instead of
+            # returning EOF, and the accumulated data went with it).
+            if data:
+                print(f"dump_tls {out}: {exc!r} after {len(data)} bytes", file=sys.stderr, flush=True)
+        if data:
             with open(os.path.join(d, out), "ab") as f:
                 f.write(data)
-            tls.close()
-        except Exception:
-            conn.close() # e.g. the readiness probe: connects, sends nothing, closes
+        try:
+            conn.close()
+        except OSError:
+            pass
 
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_TCPS"]), ctx, "tcps-out.jsonl"), daemon=True).start()
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"]), ctx_evil, "evil-out.jsonl"), daemon=True).start()
-threading.Thread(target=dump_tls, args=(int(os.environ["PORT_CHAIN"]), ctx_chain, "chain-out.jsonl"), daemon=True).start()
+# The chain receiver ANSWERS an HTTP status (like the main one): phase 7
+# exports to it over https://, and a raw dumper that never replies leaves
+# every send dying at the status-read timeout — the batch still reaches the
+# socket, so the suite once passed on the retry dump, 5 s per batch, and
+# went dead once an inherited fallback file parked the retries.
+class HChain(H):
+    sink = "chain-out.jsonl"
+
+httpd_chain = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_CHAIN"])), HChain)
+httpd_chain.socket = ctx_chain.wrap_socket(httpd_chain.socket, server_side=True)
+threading.Thread(target=httpd_chain.serve_forever, daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -145,7 +176,29 @@ set_gucs() { # each ALTER SYSTEM its own -c: a multi-statement -c silently fails
     docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $g" >/dev/null
   done
   docker exec "$PG_CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null
+  # Reload barrier, not a timed guess: SHOW runs in a fresh session, which
+  # parses the current config generation — poll it until every value
+  # landed (pg_reload_conf returns before the postmaster re-reads the
+  # files). Then one export_timeout_ms of margin: the worker applies
+  # config between cycles, and one in-flight send is bounded by that
+  # timeout. Without the barrier, markers generated right after a url
+  # switch could ride the OLD url — seen once on a cold stand, 6 of 10.
+  for g in "$@"; do
+    name=${g%% =*}; val=${g#* = }; val=${val#\'}; val=${val%\'}
+    n=0
+    while [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW $name")" != "$val" ] && [ "$n" -lt 20 ]; do
+      n=$((n + 1)); sleep 1
+    done
+    [ "$n" -lt 20 ] || fail "set_gucs: $name never became '$val'"
+  done
+  sleep 5
 }
+
+# Matrix predecessors (kill/silent/slow) leave a fallback file configured;
+# this suite's deliberate failure phases would park to it, and the tiny
+# inherited cap compacts the parked batches away — disk noise the TLS
+# asserts do not want. RAM backlog only.
+set_gucs "pg_logtap.export_fallback_file = ''"
 
 # --- phase 1: verified https. server_name exercises the GUC AND the std
 # limitation it exists for: verifyHostName matches dNSName SANs only, an
@@ -160,10 +213,6 @@ echo "phase 1 ok: verified https delivered $N/$N"
 
 # --- phase 2: no CA → handshake must fail, then recover with replay
 set_gucs "pg_logtap.export_tls_ca = ''"
-# Let the reload land BEFORE generating: the worker applies GUCs on its own
-# SIGHUP; events raced into the old cycle would deliver verified and make
-# the "leaked" check below lie.
-sleep 3
 gen p2fail "$N"
 sleep 3 # a couple of flush cycles of guaranteed failures
 FAILED=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
@@ -180,7 +229,6 @@ echo "phase 2 ok: $FAILED failed cycles, nothing delivered unverified, $N buffer
 # — not silently fall back to any verification path
 docker exec "$PG_CT" touch "$CA_IN_CT.empty"
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT.empty'"
-sleep 3
 gen p2bfail "$N"
 sleep 3
 FAILED2=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
@@ -216,12 +264,11 @@ done
 [ -n "${newpid:-}" ] && [ "$newpid" != "$old_wpid" ] || fail "e2e-tls: worker did not respawn after TERM"
 warns0=$(statf warn_tls_no_verify)
 set_gucs "pg_logtap.export_tls_verify = 'off'"
-sleep 3
 gen p4 "$N"
-# The only wait that runs right after a worker TERM/respawn: on a cold box
-# (a CI runner) respawn + registration + the first flush cycle can eat most
-# of the default 15s — observed once on a fresh pg16 stand, not
-# reproducible warm. Success still returns early; only the timeout widens.
+# Belt over the set_gucs reload barrier: this wait follows a worker
+# TERM/respawn, and a freshly booted worker on a cold box (a CI runner)
+# can still be settling when the first events flow. Success returns
+# early; only the timeout widens.
 wait_for p4 "$N" "$TCPS_OUT" 30
 WARNS=$(( $(statf warn_tls_no_verify) - warns0 ))
 [ "$WARNS" -eq 1 ] || { echo "e2e-tls: phase 4 expected exactly one verify=off WARNING, got $WARNS"; exit 1; }
@@ -234,7 +281,6 @@ echo "phase 4 ok: verify=off delivered, warned once"
 # receiver, verified.
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_EVIL/insert/jsonline'" \
   "pg_logtap.export_tls_server_name = 'localhost'"
-sleep 3 # let the reload land before generating
 gen p5fail "$N"
 sleep 3 # a couple of flush cycles of guaranteed rejections
 FAILED3=$(statf send_cycles_failed)
@@ -250,7 +296,6 @@ echo "phase 5 ok: impostor chain rejected ($((FAILED3 - FAILED2)) failed cycles)
 # the name to verify is absent from the SANs. The handshake must fail on the
 # name alone; recovery is one SIGHUP away.
 set_gucs "pg_logtap.export_tls_server_name = 'mitm.example'"
-sleep 3
 gen p6fail "$N"
 sleep 3
 FAILED4=$(statf send_cycles_failed)
