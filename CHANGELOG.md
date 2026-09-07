@@ -76,6 +76,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
 
 ### Internal
 
+- The Makefile is the single entry point now: `make check` (fmt + lint +
+  unit tests + the .so compile), `make container` (the same battery in the
+  pgzx-build container), `make e2e` (the docker matrix), `make deploy` —
+  thin aliases over the scripts, plus the conventional
+  `make && make install`. CI runs the make targets itself, so the interface
+  cannot drift from the real build.
 - The extension's update chain is continuous again: the
   0.4.4 → 0.4.5 hop was missing (0.4.5 changed no SQL, but every version
   ships one — without it `ALTER EXTENSION UPDATE` could not leave 0.4.4).

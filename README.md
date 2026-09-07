@@ -512,6 +512,14 @@ container (zig 0.16 + PGDG server-dev 15–18 + libpq); on a machine with a
 local `pg_config` plain `zig build` / `make` works too. CI installs
 `postgresql-server-dev-$major` per matrix job instead.
 
+The Makefile is the front door for all of it: `make check` (fmt + lint +
+unit tests + the .so compile), `make container V=17` (the same battery in
+the pgzx-build container), `make e2e PGS=18` (the matrix above; `JOBS=4`
+runs the majors in parallel), `make deploy`, and the conventional
+`make && make install` against a local `pg_config`. CI runs
+`make check` / `make test` / `make e2e` itself, so the targets cannot drift
+from the real build.
+
 Unit tests deliberately differ from pgzx's `SELECT run_tests()` suites (which
 run inside a live PostgreSQL): all PostgreSQL interop in pg_logtap is
 concentrated in `capture.zig` / `worker.zig`, the rest (`ring`, `filter`,
