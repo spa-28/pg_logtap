@@ -98,15 +98,12 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\pg_logtap_warn_fallback_unbounded {d}
         \\
     , .{
-        snap.captured,         snap.dropped,               snap.sent,
-        snap.queued,           snap.replayed,              snap.compacted,
-        snap.send_failed,      snap.export_lost,           snap.count,
-        snap.capacity,         snap.dns_fail_streak,       snap.fallback_broken,
-        snap.fb_sync_failures, snap.redact_pattern_failed,
-        snap.warn_tls_no_verify,
-        snap.warn_fallback_open,
-        snap.warn_fallback_skipped,
-        snap.warn_fallback_unbounded,
+        snap.captured,           snap.dropped,               snap.sent,
+        snap.queued,             snap.replayed,              snap.compacted,
+        snap.send_failed,        snap.export_lost,           snap.count,
+        snap.capacity,           snap.dns_fail_streak,       snap.fallback_broken,
+        snap.fb_sync_failures,   snap.redact_pattern_failed, snap.warn_tls_no_verify,
+        snap.warn_fallback_open, snap.warn_fallback_skipped, snap.warn_fallback_unbounded,
     });
 }
 
