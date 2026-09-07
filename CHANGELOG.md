@@ -2,9 +2,9 @@
 
 ## 0.5.0 (2026-09-07)
 
-TLS export and HTTP auth-header round. Upgrade is binary replace + restart
-(the 0.4.x view keeps working — `jsonb_populate_record` ignores the new
-stats fields); the four new GUCs are all SIGHUP.
+TLS export and HTTP auth-header round. Upgrade is the
+0.4.5 → 0.5.0 script (the four warn-counter attributes and the re-created
+view) + binary replace + restart; the four new GUCs are all SIGHUP.
 
 ### Added
 
@@ -41,8 +41,10 @@ stats fields); the four new GUCs are all SIGHUP.
   unopenable, unreadable member skipped, divert into an unbounded queue).
   The log lines stay edge-triggered; the counters are for alerts and the
   e2e suites — in the Prometheus exposition too (named like their SQL
-  fields, no `_total`). In `pg_logtap_delivery` only on fresh installs
-  (the view type gained the columns there).
+  fields, no `_total`). In `pg_logtap_delivery` after the update script
+  (a stored view does not follow type changes, so the script re-creates
+  it); until the hop runs, the 0.4.x view keeps working —
+  `jsonb_populate_record` ignores the new fields.
 
 ### Hardening
 
@@ -74,6 +76,11 @@ stats fields); the four new GUCs are all SIGHUP.
 
 ### Internal
 
+- The extension's update chain is continuous again: the
+  0.4.4 → 0.4.5 hop was missing (0.4.5 changed no SQL, but every version
+  ships one — without it `ALTER EXTENSION UPDATE` could not leave 0.4.4).
+  It ships now, comment-only, alongside this version's 0.4.5 → 0.5.0
+  script.
 - SIGHUP no longer leaks the source-identity strings (hostname/cluster/
   pgdata were duped on every reload and never freed; the copies are owned
   now, and a reload with unchanged values keeps the allocation), and the
