@@ -108,11 +108,7 @@ var net_deadline_us: i64 = 0;
 fn netArmDeadline(fd: c_int) bool {
     const remain_us = net_deadline_us - pg.GetCurrentTimestamp();
     if (remain_us < 1000) return failSend("send deadline", 0);
-    const remain_ms: i64 = @divTrunc(remain_us, 1000);
-    const timeval = Timeval{
-        .sec = @intCast(@divTrunc(remain_ms, 1000)),
-        .usec = @intCast(@mod(remain_ms, 1000) * 1000),
-    };
+    const timeval = timevalMs(@divTrunc(remain_us, 1000));
     if (net.setsockopt(fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
     or net.setsockopt(fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
         return failSend("setsockopt", std.c._errno().*);
@@ -603,13 +599,12 @@ fn refreshSourceId() void {
         setOwned(&owned_host, &jsonl.source_host, std.mem.sliceTo(&buf, 0));
     }
     // The override wins; otherwise reuse the server's cluster_name (which is
-    // POSTMASTER — restart-to-change, hence this SIGHUP GUC). Collect all the
-    // borrowed GUC spans first: setOwned dupes before the next GetConfigOption
-    // call can churn the same buffers.
+    // POSTMASTER — restart-to-change, hence this SIGHUP GUC). gucStrRaw borrows;
+    // setOwned dupes each span before the next GetConfigOption call.
     var cluster = gucStrRaw("pg_logtap.cluster_name");
     if (cluster.len == 0) cluster = gucStrRaw("cluster_name");
-    const pgdata = gucStrRaw("data_directory");
     setOwned(&owned_cluster, &jsonl.source_cluster, cluster);
+    const pgdata = gucStrRaw("data_directory");
     setOwned(&owned_pgdata, &jsonl.source_pgdata, pgdata);
 }
 
@@ -698,7 +693,7 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) b
     net_deadline_us = pg.GetCurrentTimestamp() + @as(i64, guc_export_timeout_ms) * 1000;
     return switch (dest) {
         .http => |h| sendHttp(h, body, gzipped),
-        .tcp => |t| sendRaw(dialTcp(t.host, t.port), body, t.host, t.tls),
+        .tcp => |t| sendRaw(dialTcp(t.host, t.port), body, t),
         .file => |path| sendFile(path, body),
     };
 }
@@ -822,14 +817,14 @@ fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) b
     return true;
 }
 
-fn sendRaw(fd_opt: ?c_int, body: []const u8, host: []const u8, use_tls: bool) bool {
+fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
     // As sendHttp: the dial path already recorded why it failed.
     const conn_fd = fd_opt orelse return false;
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
     if (!netArmDeadline(conn_fd)) return false;
-    if (use_tls) {
-        const tls_conn = tls_mod.connect(conn_fd, host, tlsOpts()) orelse return tlsFail();
+    if (ep.tls) {
+        const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts()) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;
         tls_conn.end();
         return true;
@@ -1019,10 +1014,7 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
     // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
     // return EAGAIN, which flows into the ordinary failSend →
     // retry/fallback path like any dead receiver.
-    const timeval = Timeval{
-        .sec = @intCast(@divTrunc(guc_export_timeout_ms, 1000)),
-        .usec = @intCast(@mod(guc_export_timeout_ms, 1000) * 1000),
-    };
+    const timeval = timevalMs(guc_export_timeout_ms);
     if (net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
     or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
         // A socket the timeouts did not land on would block the single
@@ -1043,6 +1035,11 @@ fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
 
 /// timeval(3type) for setsockopt: both fields c_long on linux x86-64/arm64.
 const Timeval = extern struct { sec: i64, usec: i64 };
+
+/// One timeval from whole milliseconds — the two socket-timeout sites.
+fn timevalMs(ms: i64) Timeval {
+    return .{ .sec = @divTrunc(ms, 1000), .usec = @mod(ms, 1000) * 1000 };
+}
 comptime {
     // Timeval above, the raw open(2) flag numbers and the page-size math all
     // assume LP64. The project ships amd64/arm64; rather than a silent

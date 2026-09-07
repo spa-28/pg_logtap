@@ -21,15 +21,9 @@ pub const Dest = union(enum) {
 /// meant) malforms every request into an eternal retry loop — rejected at
 /// SET time instead. CRLF pairs are the documented multi-line form and pass.
 pub fn headerValid(val: []const u8) bool {
-    var idx: usize = 0;
-    while (idx < val.len) : (idx += 1) {
-        if (val[idx] == '\n') return false;
-        if (val[idx] == '\r') {
-            if (idx + 1 == val.len or val[idx + 1] != '\n') return false;
-            idx += 1; // the \n of the pair
-        }
-    }
-    return true;
+    var rest = val;
+    while (std.mem.indexOf(u8, rest, "\r\n")) |i| rest = rest[i + 2 ..]; // legal pairs
+    return std.mem.indexOfAny(u8, rest, "\r\n") == null;
 }
 
 pub fn parseUrl(url: []const u8) ?Dest {
