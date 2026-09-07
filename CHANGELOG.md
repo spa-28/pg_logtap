@@ -30,7 +30,10 @@ stats fields); the four new GUCs are all SIGHUP.
   exactly one WARNING. Two substitution negatives: an impostor certificate
   carrying the right name but its own key is rejected on the chain alone
   (nothing reaches the impostor), and a `server_name` absent from the SANs
-  fails the handshake on the name alone — both recovering by SIGHUP.
+  fails the handshake on the name alone — both recovering by SIGHUP. An
+  intermediate-CA chain: pinning only the root verifies through the
+  server-sent intermediate, and the intermediate itself works as the trust
+  anchor.
 - Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
   `warn_tls_no_verify`, `warn_fallback_open`, `warn_fallback_skipped`,
   `warn_fallback_unbounded` — the cumulative, queryable copy of the

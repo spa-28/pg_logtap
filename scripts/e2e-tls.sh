@@ -15,6 +15,10 @@
 #            nothing may reach the impostor; recovery delivers verified
 #   phase 6  the real receiver and the right CA, but server_name is not in
 #            the certificate's SANs → the handshake fails on the name alone
+#   phase 7  intermediate CA, the real-world PKI shape: the server presents
+#            leaf+intermediate; pinning only the ROOT must build the path
+#            through the server-sent intermediate, and pinning the
+#            intermediate itself (anchor below the root) must work too
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -27,12 +31,14 @@ DIR=/tmp/logtap-e2e/tls
 OUT=$DIR/https-out.jsonl
 TCPS_OUT=$DIR/tcps-out.jsonl
 EVIL_OUT=$DIR/evil-out.jsonl
+CHAIN_OUT=$DIR/chain-out.jsonl
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
 PORT_HTTPS=18443
 PORT_TCPS=18444
 PORT_EVIL=18445
+PORT_CHAIN=18446
 
 # The receiver's address as seen from the pg container: the docker network
 # gateway (the host). The certificate's SAN carries that IP — verification
@@ -41,7 +47,7 @@ NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 mkdir -p "$DIR"
-rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT"
+rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT"
 # The impostor's certificate: identical CN and SANs, its own key — only the
 # pinned CA can tell it from the real one. That is the phase 5 point.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -52,9 +58,27 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
   -subj "/CN=logtap-e2e-tls" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$GW" \
   -keyout "$DIR/key-evil.pem" -out "$DIR/cert-evil.pem" 2>/dev/null
+# A mini PKI for phase 7: root -> intermediate -> leaf. The server presents
+# leaf+intermediate (chain.pem); the client pins only the root.
+printf 'basicConstraints=critical,CA:TRUE\n' > "$DIR/inter.ext"
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:%s\n' "$GW" > "$DIR/leaf.ext"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=logtap-e2e-root" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -keyout "$DIR/root.key" -out "$DIR/root.pem" 2>/dev/null
+openssl req -new -newkey rsa:2048 -nodes -subj "/CN=logtap-e2e-inter" \
+  -keyout "$DIR/inter.key" -out "$DIR/inter.csr" 2>/dev/null
+openssl x509 -req -in "$DIR/inter.csr" -CA "$DIR/root.pem" -CAkey "$DIR/root.key" \
+  -CAcreateserial -days 2 -extfile "$DIR/inter.ext" -out "$DIR/inter.pem" 2>/dev/null
+openssl req -new -newkey rsa:2048 -nodes -subj "/CN=logtap-e2e-tls" \
+  -keyout "$DIR/leaf.key" -out "$DIR/leaf.csr" 2>/dev/null
+openssl x509 -req -in "$DIR/leaf.csr" -CA "$DIR/inter.pem" -CAkey "$DIR/inter.key" \
+  -CAcreateserial -days 2 -extfile "$DIR/leaf.ext" -out "$DIR/leaf.pem" 2>/dev/null
+cat "$DIR/leaf.pem" "$DIR/inter.pem" > "$DIR/chain.pem"
 docker cp "$CERT" "$PG_CT:$CA_IN_CT"
+docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
+docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" python3 - <<'PYEOF' &
 import gzip, os, ssl, socket, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -63,6 +87,8 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(os.path.join(d, "cert.pem"), os.path.join(d, "key.pem"))
 ctx_evil = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx_evil.load_cert_chain(os.path.join(d, "cert-evil.pem"), os.path.join(d, "key-evil.pem"))
+ctx_chain = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx_chain.load_cert_chain(os.path.join(d, "chain.pem"), os.path.join(d, "leaf.key"))
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -100,7 +126,8 @@ def dump_tls(port, ctx, out):
             conn.close() # e.g. the readiness probe: connects, sends nothing, closes
 
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_TCPS"]), ctx, "tcps-out.jsonl"), daemon=True).start()
-threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"], ), ctx_evil, "evil-out.jsonl"), daemon=True).start()
+threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"]), ctx_evil, "evil-out.jsonl"), daemon=True).start()
+threading.Thread(target=dump_tls, args=(int(os.environ["PORT_CHAIN"]), ctx_chain, "chain-out.jsonl"), daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -108,7 +135,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -231,5 +258,20 @@ wait_for p6fail "$N" "$OUT"
 wait_for p6re "$N" "$OUT"
 echo "phase 6 ok: name mismatch rejected ($((FAILED4 - FAILED3)) failed cycles), recovered by SIGHUP alone"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT")"
+# --- phase 7: intermediate CA, the real-world PKI shape. The chain receiver
+# presents leaf+intermediate; the client pins only the root — the handshake
+# must build the path through the server-sent intermediate. Then the
+# intermediate pinned directly (a trust anchor below the root) must work too.
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_CHAIN/insert/jsonline'" \
+  "pg_logtap.export_tls_ca = '$CA_IN_CT.root'" \
+  "pg_logtap.export_tls_server_name = 'localhost'"
+gen p7root "$N"
+wait_for p7root "$N" "$CHAIN_OUT"
+echo "phase 7 ok: root-pinned verification through the server-sent intermediate, $N/$N"
+set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT.inter'"
+gen p7inter "$N"
+wait_for p7inter "$N" "$CHAIN_OUT"
+echo "phase 7b ok: intermediate pinned as the trust anchor, $N/$N"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

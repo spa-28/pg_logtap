@@ -56,7 +56,11 @@ handshake is an ordinary failed send — the batch parks on the fallback file
 - `export_tls_ca` — PEM file with the CA to verify the receiver against
   (for a self-signed receiver, the receiver's own certificate). Empty = the
   system CA roots; a set file **replaces** them. The file is re-read before
-  every handshake, so certificate rotation needs no restart.
+  every handshake, so certificate rotation needs no restart. Intermediate
+  chains are the normal PKI shape: the receiver presents leaf+intermediate
+  and you pin the **root** — the path is built through the server-sent
+  intermediate; pinning the intermediate itself works too, and the file may
+  hold several certificates.
 - `export_tls_verify` — `off` disables chain and name verification.
   Development only: with it off, a man in the middle can read the logs.
   The first TLS send with it off logs one WARNING per worker life, and
