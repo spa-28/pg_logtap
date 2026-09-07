@@ -9,6 +9,12 @@
 #            same way (send_cycles_failed grows, nothing delivered)
 #   phase 3  tcps:// → raw NDJSON over TLS, no HTTP framing
 #   phase 4  verify=off → delivery continues, exactly one WARNING in the log
+#   phase 5  an impostor receiver presents a certificate carrying the RIGHT
+#            name (same CN/SANs) but its own key; ca still = the real
+#            certificate → the handshake must fail on the chain alone and
+#            nothing may reach the impostor; recovery delivers verified
+#   phase 6  the real receiver and the right CA, but server_name is not in
+#            the certificate's SANs → the handshake fails on the name alone
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -20,11 +26,13 @@ e2e_gate
 DIR=/tmp/logtap-e2e/tls
 OUT=$DIR/https-out.jsonl
 TCPS_OUT=$DIR/tcps-out.jsonl
+EVIL_OUT=$DIR/evil-out.jsonl
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
 PORT_HTTPS=18443
 PORT_TCPS=18444
+PORT_EVIL=18445
 
 # The receiver's address as seen from the pg container: the docker network
 # gateway (the host). The certificate's SAN carries that IP — verification
@@ -33,20 +41,28 @@ NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 mkdir -p "$DIR"
-rm -f "$OUT" "$TCPS_OUT"
+rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT"
+# The impostor's certificate: identical CN and SANs, its own key — only the
+# pinned CA can tell it from the real one. That is the phase 5 point.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
   -subj "/CN=logtap-e2e-tls" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$GW" \
   -keyout "$KEY" -out "$CERT" 2>/dev/null
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+  -subj "/CN=logtap-e2e-tls" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:$GW" \
+  -keyout "$DIR/key-evil.pem" -out "$DIR/cert-evil.pem" 2>/dev/null
 docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" python3 - <<'PYEOF' &
 import gzip, os, ssl, socket, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 d = os.environ["DIR"]
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(os.path.join(d, "cert.pem"), os.path.join(d, "key.pem"))
+ctx_evil = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx_evil.load_cert_chain(os.path.join(d, "cert-evil.pem"), os.path.join(d, "key-evil.pem"))
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -62,10 +78,10 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-def tcps():
+def dump_tls(port, ctx, out):
     raw = socket.socket()
     raw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    raw.bind(("0.0.0.0", int(os.environ["PORT_TCPS"])))
+    raw.bind(("0.0.0.0", port))
     raw.listen(8)
     while True:
         conn, _ = raw.accept()
@@ -77,13 +93,14 @@ def tcps():
                 if not chunk:
                     break
                 data += chunk
-            with open(os.path.join(d, "tcps-out.jsonl"), "ab") as f:
+            with open(os.path.join(d, out), "ab") as f:
                 f.write(data)
             tls.close()
         except Exception:
             conn.close() # e.g. the readiness probe: connects, sends nothing, closes
 
-threading.Thread(target=tcps, daemon=True).start()
+threading.Thread(target=dump_tls, args=(int(os.environ["PORT_TCPS"]), ctx, "tcps-out.jsonl"), daemon=True).start()
+threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"], ), ctx_evil, "evil-out.jsonl"), daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -91,7 +108,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -180,5 +197,39 @@ WARNS=$(( $(statf warn_tls_no_verify) - warns0 ))
 set_gucs "pg_logtap.export_tls_verify = 'on'"
 echo "phase 4 ok: verify=off delivered, warned once"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT")"
+# --- phase 5: substituted chain. The impostor's certificate carries the right
+# name, so only the pinned CA can reject it — a passing handshake here would
+# mean verification is off. Buffered events must later arrive at the real
+# receiver, verified.
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_EVIL/insert/jsonline'" \
+  "pg_logtap.export_tls_server_name = 'localhost'"
+sleep 3 # let the reload land before generating
+gen p5fail "$N"
+sleep 3 # a couple of flush cycles of guaranteed rejections
+FAILED3=$(statf send_cycles_failed)
+[ "$FAILED3" -gt "$FAILED2" ] 2>/dev/null || { echo "e2e-tls: phase 5 expected failed cycles against the impostor, got $FAILED3 (was $FAILED2)"; exit 1; }
+[ "$(received p5fail "$EVIL_OUT")" = 0 ] || { echo "e2e-tls: phase 5 leaked $(received p5fail "$EVIL_OUT") events to the impostor"; exit 1; }
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
+gen p5re "$N"
+wait_for p5fail "$N" "$OUT"
+wait_for p5re "$N" "$OUT"
+echo "phase 5 ok: impostor chain rejected ($((FAILED3 - FAILED2)) failed cycles), zero leaks, $N buffered + $N live verified at the real receiver"
+
+# --- phase 6: server_name mismatch. The real receiver, the right CA — only
+# the name to verify is absent from the SANs. The handshake must fail on the
+# name alone; recovery is one SIGHUP away.
+set_gucs "pg_logtap.export_tls_server_name = 'mitm.example'"
+sleep 3
+gen p6fail "$N"
+sleep 3
+FAILED4=$(statf send_cycles_failed)
+[ "$FAILED4" -gt "$FAILED3" ] 2>/dev/null || { echo "e2e-tls: phase 6 expected failed cycles on the name mismatch, got $FAILED4 (was $FAILED3)"; exit 1; }
+[ "$(received p6fail "$OUT")" = 0 ] || { echo "e2e-tls: phase 6 leaked $(received p6fail "$OUT") events past the name mismatch"; exit 1; }
+set_gucs "pg_logtap.export_tls_server_name = 'localhost'"
+gen p6re "$N"
+wait_for p6fail "$N" "$OUT"
+wait_for p6re "$N" "$OUT"
+echo "phase 6 ok: name mismatch rejected ($((FAILED4 - FAILED3)) failed cycles), recovered by SIGHUP alone"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

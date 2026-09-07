@@ -27,7 +27,10 @@ stats fields); no new GUCs.
 - `scripts/e2e-tls.sh` — acceptance against a self-signed receiver: verified
   https delivery, handshake must fail (and later replay) with the CA cleared
   and with an empty CA file, tcps delivery, verify=off delivering with
-  exactly one WARNING.
+  exactly one WARNING. Two substitution negatives: an impostor certificate
+  carrying the right name but its own key is rejected on the chain alone
+  (nothing reaches the impostor), and a `server_name` absent from the SANs
+  fails the handshake on the name alone — both recovering by SIGHUP.
 - Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
   `warn_tls_no_verify`, `warn_fallback_open`, `warn_fallback_skipped`,
   `warn_fallback_unbounded` — the cumulative, queryable copy of the
