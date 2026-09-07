@@ -376,7 +376,7 @@ itself queued. Persisting the offset in the file header is on the roadmap.
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life): https/tcps is shipping unauthenticated. The server-log line is edge-triggered; this is its cumulative copy |
-| `warn_fb_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
-| `warn_fb_skipped` | **lines** | an unreadable queue member was skipped (twice per member by design: the boot walk that credits the backlog, then the drain's own read); its events are counted in `events_lost` |
-| `warn_fb_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
+| `warn_fallback_skipped` | **lines** | an unreadable queue member was skipped (twice per member by design: the boot walk that credits the backlog, then the drain's own read); its events are counted in `events_lost` |
+| `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

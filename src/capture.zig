@@ -378,14 +378,14 @@ pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8, fb_sync_fails: u64) void {
 
 /// Cumulative copy of an operator-facing log line (see ShmState.warn_*).
 /// The lines themselves are edge-triggered; tests and alerts read these.
-pub fn noteWarn(kind: enum { tls_no_verify, fb_open, fb_skipped, fb_unbounded }) void {
+pub fn noteWarn(kind: enum { tls_no_verify, fallback_open, fallback_skipped, fallback_unbounded }) void {
     if (!ready) return;
     lockRing();
     switch (kind) {
         .tls_no_verify => state.warn_tls_no_verify += 1,
-        .fb_open => state.warn_fb_open += 1,
-        .fb_skipped => state.warn_fb_skipped += 1,
-        .fb_unbounded => state.warn_fb_unbounded += 1,
+        .fallback_open => state.warn_fallback_open += 1,
+        .fallback_skipped => state.warn_fallback_skipped += 1,
+        .fallback_unbounded => state.warn_fallback_unbounded += 1,
     }
     unlockRing();
 }
@@ -469,8 +469,8 @@ pub fn statsText(buf: []u8) ?[]const u8 {
     if (!ready) return "shmem not initialized (shared_preload_libraries?)";
     const snap = snapshot();
     // Same names and order as the pg_logtap_delivery view columns.
-    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} events_compacted={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} fb_sync_failures={d} redact_pattern_failed={d} warn_tls_no_verify={d} warn_fb_open={d} warn_fb_skipped={d} warn_fb_unbounded={d}", .{
-        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.compacted, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.fb_sync_failures, snap.redact_pattern_failed, snap.warn_tls_no_verify, snap.warn_fb_open, snap.warn_fb_skipped, snap.warn_fb_unbounded,
+    return std.fmt.bufPrint(buf, "events_captured={d} events_dropped={d} events_sent={d} events_queued={d} events_replayed={d} events_compacted={d} send_cycles_failed={d} events_lost={d} ring_events={d} ring_capacity={d} dns_fail_streak={d} fallback_broken={d} fb_sync_failures={d} redact_pattern_failed={d} warn_tls_no_verify={d} warn_fallback_open={d} warn_fallback_skipped={d} warn_fallback_unbounded={d}", .{
+        snap.captured, snap.dropped, snap.sent, snap.queued, snap.replayed, snap.compacted, snap.send_failed, snap.export_lost, snap.count, snap.capacity, snap.dns_fail_streak, snap.fallback_broken, snap.fb_sync_failures, snap.redact_pattern_failed, snap.warn_tls_no_verify, snap.warn_fallback_open, snap.warn_fallback_skipped, snap.warn_fallback_unbounded,
     }) catch "stats overflow";
 }
 
@@ -479,7 +479,7 @@ pub fn statsText(buf: []u8) ?[]const u8 {
 pub fn statsJson(buf: []u8) ?[]const u8 {
     if (!ready) return "{\"events_captured\":0}"; // shmem not up: zero row
     const snap = snapshot();
-    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"events_compacted\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"fb_sync_failures\":{d},\"redact_pattern_failed\":{d},\"warn_tls_no_verify\":{d},\"warn_fb_open\":{d},\"warn_fb_skipped\":{d},\"warn_fb_unbounded\":{d}}}", .{
+    return std.fmt.bufPrint(buf, "{{\"events_captured\":{d},\"events_dropped\":{d},\"events_sent\":{d},\"events_queued\":{d},\"events_replayed\":{d},\"events_compacted\":{d},\"queue_backlog\":{d},\"delivered\":{d},\"events_lost\":{d},\"send_cycles_failed\":{d},\"ring_events\":{d},\"ring_capacity\":{d},\"dns_fail_streak\":{d},\"fallback_broken\":{d},\"fb_sync_failures\":{d},\"redact_pattern_failed\":{d},\"warn_tls_no_verify\":{d},\"warn_fallback_open\":{d},\"warn_fallback_skipped\":{d},\"warn_fallback_unbounded\":{d}}}", .{
         snap.captured,
         snap.dropped,
         snap.sent,
@@ -497,9 +497,9 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.fb_sync_failures,
         snap.redact_pattern_failed,
         snap.warn_tls_no_verify,
-        snap.warn_fb_open,
-        snap.warn_fb_skipped,
-        snap.warn_fb_unbounded,
+        snap.warn_fallback_open,
+        snap.warn_fallback_skipped,
+        snap.warn_fallback_unbounded,
     }) catch "{\"events_captured\":0}";
 }
 

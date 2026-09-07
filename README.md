@@ -411,9 +411,9 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life) — https/tcps is shipping unauthenticated |
-| `warn_fb_open` | **lines** | the fallback queue could not be opened (`fallback_broken` also goes 1) |
-| `warn_fb_skipped` | **lines** | an unreadable queue member was skipped and counted in `events_lost` |
-| `warn_fb_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) queue |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` also goes 1) |
+| `warn_fallback_skipped` | **lines** | an unreadable queue member was skipped and counted in `events_lost` |
+| `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) queue |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
 The view adds two derived columns: `queue_backlog` (`events_queued −
@@ -424,8 +424,9 @@ receiver).
 With `metrics_port` set: `pg_logtap_{events_captured,events_dropped,
 events_sent,events_queued,events_replayed,events_compacted,
 send_cycles_failed,events_lost}_total` (counters) +
-`pg_logtap_fb_sync_failures` (counter, named like its SQL/stats field,
-no `_total`) + `pg_logtap_ring_{events,capacity}` and
+`pg_logtap_{fb_sync_failures,warn_tls_no_verify,warn_fallback_open,
+warn_fallback_skipped,warn_fallback_unbounded}` (counters, named like their SQL/stats
+fields, no `_total`) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring

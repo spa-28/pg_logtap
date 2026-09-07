@@ -29,13 +29,14 @@ stats fields); no new GUCs.
   and with an empty CA file, tcps delivery, verify=off delivering with
   exactly one WARNING.
 - Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
-  `warn_tls_no_verify`, `warn_fb_open`, `warn_fb_skipped`,
-  `warn_fb_unbounded` — the cumulative, queryable copy of the
+  `warn_tls_no_verify`, `warn_fallback_open`, `warn_fallback_skipped`,
+  `warn_fallback_unbounded` — the cumulative, queryable copy of the
   operator-facing WARNING lines (verify=off seen, fallback queue
   unopenable, unreadable member skipped, divert into an unbounded queue).
   The log lines stay edge-triggered; the counters are for alerts and the
-  e2e suites. In `pg_logtap_delivery` only on fresh installs (the view
-  type gained the columns there); `/metrics` does not export them.
+  e2e suites — in the Prometheus exposition too (named like their SQL
+  fields, no `_total`). In `pg_logtap_delivery` only on fresh installs
+  (the view type gained the columns there).
 
 ### Hardening
 

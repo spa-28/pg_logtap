@@ -116,16 +116,16 @@ docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 # R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so —
-# exactly one WARNING per divert, not one per append. The warn_fb_unbounded
+# exactly one WARNING per divert, not one per append. The warn_fallback_unbounded
 # counter (in pg_logtap_stats) is the queryable copy of that log line.
-warns0=$(statf warn_fb_unbounded)
+warns0=$(statf warn_fallback_unbounded)
 setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-warns=$(( $(statf warn_fb_unbounded) - warns0 ))
+warns=$(( $(statf warn_fallback_unbounded) - warns0 ))
 [ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
 ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
@@ -218,7 +218,7 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 # lost — one per damaged member (the member, not its events, is the loss
 # unit)
 [ "$(statf events_lost)" = "$nhits" ] || fail "corrupt member: events_lost=$(statf events_lost), want $nhits"
-skip=$(statf warn_fb_skipped)
+skip=$(statf warn_fallback_skipped)
 # twice per member by design: the boot walk that credits the backlog counts
 # it, then the drain's own read of the damaged member counts it again
 [ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
@@ -238,13 +238,13 @@ echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # repointing the GUC or a restart re-checks — the foreign-file recovery).
 docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
-warn0=$(statf warn_fb_open)
+warn0=$(statf warn_fallback_open)
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 gen sl1 20; sleep 3
 canary=$(docker exec "$PG_CT" cat "$FB_DIR/pg_logtap-canary" 2>/dev/null || echo GONE)
 [ "$canary" = "CANARY-INTACT" ] || fail "symlink queue: canary written through the symlink ('$canary')"
 [ "$(statf fallback_broken)" = 1 ] || fail "symlink queue: fallback_broken=$(statf fallback_broken), want 1 — a refused open must show on the gauge"
-warn=$(( $(statf warn_fb_open) - warn0 ))
+warn=$(( $(statf warn_fallback_open) - warn0 ))
 [ "$warn" = 1 ] || fail "symlink queue: 'cannot be opened' warned $warn time(s), want 1 (once — fb_broken stops the re-opens)"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for sl1 20

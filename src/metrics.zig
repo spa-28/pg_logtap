@@ -8,7 +8,7 @@ const ring = @import("ring.zig");
 /// widest (20 digits) — the "metrics body fits" test below pins that, and a
 /// new metric that breaks it must raise this. Callers serving the response
 /// need body_cap + 512 for the status line and headers on top.
-pub const body_cap = 4096;
+pub const body_cap = 8192;
 
 /// Full HTTP/1.1 response for one scraped request line ("GET /metrics HTTP/1.1").
 pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Stats) !void {
@@ -84,6 +84,18 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern did not compile and that redaction layer is OFF (fail-open). The compile error text is in the server log.
         \\# TYPE pg_logtap_redact_pattern_failed gauge
         \\pg_logtap_redact_pattern_failed {d}
+        \\# HELP pg_logtap_warn_tls_no_verify The verify=off WARNING fired (once per worker life): https/tcps export is shipping unauthenticated.
+        \\# TYPE pg_logtap_warn_tls_no_verify counter
+        \\pg_logtap_warn_tls_no_verify {d}
+        \\# HELP pg_logtap_warn_fallback_open The fallback queue could not be opened; fallback_broken also goes 1.
+        \\# TYPE pg_logtap_warn_fallback_open counter
+        \\pg_logtap_warn_fallback_open {d}
+        \\# HELP pg_logtap_warn_fallback_skipped Unreadable fallback members skipped (twice per member by design: boot walk + drain read); their events are in events_lost.
+        \\# TYPE pg_logtap_warn_fallback_skipped counter
+        \\pg_logtap_warn_fallback_skipped {d}
+        \\# HELP pg_logtap_warn_fallback_unbounded Diverts into an unbounded (fallback_max_mb=0) fallback queue — once per divert, not per append.
+        \\# TYPE pg_logtap_warn_fallback_unbounded counter
+        \\pg_logtap_warn_fallback_unbounded {d}
         \\
     , .{
         snap.captured,         snap.dropped,               snap.sent,
@@ -91,6 +103,10 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         snap.send_failed,      snap.export_lost,           snap.count,
         snap.capacity,         snap.dns_fail_streak,       snap.fallback_broken,
         snap.fb_sync_failures, snap.redact_pattern_failed,
+        snap.warn_tls_no_verify,
+        snap.warn_fallback_open,
+        snap.warn_fallback_skipped,
+        snap.warn_fallback_unbounded,
     });
 }
 
@@ -102,7 +118,9 @@ test "metrics response" {
     snap.fallback_broken = 1;
     snap.fb_sync_failures = 3;
     snap.redact_pattern_failed = 1;
-    var wbuf: [4096]u8 = undefined;
+    snap.warn_tls_no_verify = 1;
+    snap.warn_fallback_skipped = 4;
+    var wbuf: [body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&wbuf);
     try writeResponse(&resp_w, "GET /metrics HTTP/1.1", snap);
     const got = resp_w.buffered();
@@ -114,6 +132,8 @@ test "metrics response" {
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fb_sync_failures 3\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_tls_no_verify 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_skipped 4\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;
@@ -138,6 +158,10 @@ test "metrics body fits with every counter at u64 width" {
     snap.dns_fail_streak = 4294967295;
     snap.fallback_broken = 255;
     snap.redact_pattern_failed = 255;
+    snap.warn_tls_no_verify = 12345678901234567890;
+    snap.warn_fallback_open = 12345678901234567890;
+    snap.warn_fallback_skipped = 12345678901234567890;
+    snap.warn_fallback_unbounded = 12345678901234567890;
     snap.count = 4294967295;
     snap.capacity = 4294967295;
     var wbuf: [body_cap + 512]u8 = undefined;
@@ -148,7 +172,7 @@ test "metrics body fits with every counter at u64 width" {
     // — and today fails the write outright): first, middle and last.
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_captured_total 12345678901234567890\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_compacted_total 12345678901234567890\n") != null);
-    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 255\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_unbounded 12345678901234567890\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;

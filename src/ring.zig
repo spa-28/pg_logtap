@@ -109,9 +109,9 @@ pub const ShmState = extern struct {
     /// seen, fallback queue unopenable, unreadable member skipped, divert
     /// into an unbounded (fallback_max_mb=0) queue.
     warn_tls_no_verify: u64 = 0,
-    warn_fb_open: u64 = 0,
-    warn_fb_skipped: u64 = 0,
-    warn_fb_unbounded: u64 = 0,
+    warn_fallback_open: u64 = 0,
+    warn_fallback_skipped: u64 = 0,
+    warn_fallback_unbounded: u64 = 0,
 };
 
 /// Byte stride of one slot: head + message region, rounded up so every slot
@@ -155,9 +155,9 @@ pub const Stats = struct {
     fb_sync_failures: u64,
     redact_pattern_failed: u8,
     warn_tls_no_verify: u64,
-    warn_fb_open: u64,
-    warn_fb_skipped: u64,
-    warn_fb_unbounded: u64,
+    warn_fallback_open: u64,
+    warn_fallback_skipped: u64,
+    warn_fallback_unbounded: u64,
     count: u32,
     capacity: u32,
     seq_next: u64,
@@ -230,9 +230,9 @@ pub fn snapshot(r: Ring) Stats {
         .fb_sync_failures = r.state.fb_sync_failures,
         .redact_pattern_failed = r.state.redact_pattern_failed,
         .warn_tls_no_verify = r.state.warn_tls_no_verify,
-        .warn_fb_open = r.state.warn_fb_open,
-        .warn_fb_skipped = r.state.warn_fb_skipped,
-        .warn_fb_unbounded = r.state.warn_fb_unbounded,
+        .warn_fallback_open = r.state.warn_fallback_open,
+        .warn_fallback_skipped = r.state.warn_fallback_skipped,
+        .warn_fallback_unbounded = r.state.warn_fallback_unbounded,
         .count = r.state.count,
         .capacity = r.state.capacity,
         .seq_next = r.state.seq_next,
