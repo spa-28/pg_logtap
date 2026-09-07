@@ -494,6 +494,8 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: 
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
+scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off
+scripts/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
 scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
 PHASES=stand,bench scripts/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
@@ -546,7 +548,10 @@ src/capture.zig    emit_log_hook → ring (all PG glue: hooks, GUCs, LWLock)
 src/ring.zig       shmem ring: layout + pure ops + UTF-8 truncation (tested)
 src/filter.zig     filters: level_min + POSIX regex via libc regcomp (tested)
 src/jsonl.zig      event → JSON line: RFC3339, level names, escaping (tested)
-src/export.zig     export_url parsing: http/tcp/file (tested)
+src/export.zig     export_url parsing: http(s)/tcp(s)/file (tested)
+src/gzip.zig       transport gzip for the HTTP body (Content-Encoding: gzip)
+src/tls.zig        TLS transport for https/tcps: std.crypto.tls handshake + IO
+src/fb.zig         fallback queue: append/replay/compact, owns its GUCs
 src/worker.zig     bgworker exporter: drain, batches, retry backlog, libc IO
 src/metrics.zig    /metrics + /healthz: Prometheus text, HTTP reply (tested)
 scripts/           build, dev-deploy, e2e-*, test-matrix

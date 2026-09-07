@@ -78,6 +78,11 @@ stats fields); the four new GUCs are all SIGHUP.
   escalations via the `fallback_broken` gauge), and robust's
   pattern_exclude control event is actually awaited now — the old marker
   never matched.
+- The TLS suite is a `test-matrix.sh` phase (`PHASES=…,tls,…`, on by
+  default): every PG major gets the verified/impostor/server_name/
+  intermediate/tcps/verify=off acceptance, not just the dev stand's
+  major. The receivers run host-side, so the phase needs `openssl` and
+  `python` on the host.
 - The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
   the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
   chunk bounds shared with buildBody, and its boot path (compaction-litter

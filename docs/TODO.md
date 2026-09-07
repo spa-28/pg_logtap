@@ -23,13 +23,14 @@ from scratch when the need becomes real.
   scan to matter is seen in the wild (642 MB scanned in ~1 s today).
 - **IPv6 literal addresses** in `export_url` (bracket parsing in
   export.zig); hostnames with AAAA records already work.
-- **TLS / authentication on the export hop**: deliberately not in the
-  worker. The design is delegation — point `export_url` at a local sidecar
-  (Vector, Fluent Bit, stunnel, an nginx TLS terminator) on the same host
-  or network namespace, and terminate TLS there. That keeps the worker on
-  plain blocking sockets (its crash-safety budget), gives the full client-
-  cert/mTLS toolbox of a dedicated proxy, and matches how the rest of the
-  stack already ships logs. Revisit only if a deployment cannot run a
+- **mTLS / client certificates on the export hop**: server verification
+  (`https://`/`tcps://` + `export_tls_ca`) and header auth
+  (`export_http_header`) shipped in 0.5.0; what is still delegated is the
+  client side — point `export_url` at a local sidecar (Vector, stunnel, an
+  nginx TLS terminator) on the same host or network namespace when the
+  receiver demands a client certificate. That keeps the worker on plain
+  blocking sockets (its crash-safety budget) and gives the full client-cert
+  toolbox of a dedicated proxy. Revisit only if a deployment cannot run a
   sidecar.
 - **Retry backoff**: exponential + jitter on send retries; the fixed
   `flush_interval` cadence is fine until a receiver rate-limits on connect

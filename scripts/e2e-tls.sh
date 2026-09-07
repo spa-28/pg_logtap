@@ -218,7 +218,11 @@ warns0=$(statf warn_tls_no_verify)
 set_gucs "pg_logtap.export_tls_verify = 'off'"
 sleep 3
 gen p4 "$N"
-wait_for p4 "$N" "$TCPS_OUT"
+# The only wait that runs right after a worker TERM/respawn: on a cold box
+# (a CI runner) respawn + registration + the first flush cycle can eat most
+# of the default 15s — observed once on a fresh pg16 stand, not
+# reproducible warm. Success still returns early; only the timeout widens.
+wait_for p4 "$N" "$TCPS_OUT" 30
 WARNS=$(( $(statf warn_tls_no_verify) - warns0 ))
 [ "$WARNS" -eq 1 ] || { echo "e2e-tls: phase 4 expected exactly one verify=off WARNING, got $WARNS"; exit 1; }
 set_gucs "pg_logtap.export_tls_verify = 'on'"

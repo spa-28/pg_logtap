@@ -11,7 +11,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,faults,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e
 mkdir -p "$OUT"
@@ -201,6 +201,13 @@ phase_slow() { # <v>: slow-but-answering receiver: export_slow_ms parks live
   scripts/e2e-slow-receiver.sh "pglogtap-mx$1"
 }
 
+phase_tls() { # <v>: TLS export acceptance — verified https, ca-cleared and
+  # empty-ca handshake failures with replay, impostor chain, server_name
+  # mismatch, intermediate-CA path, tcps, verify=off warn-once. Needs openssl
+  # on the host; the receivers run host-side (python).
+  scripts/e2e-tls.sh "pglogtap-mx$1"
+}
+
 phase_faults() { # <v>: fault injection — a throwaway postgres under an
   # LD_PRELOAD shim that fails fdatasync for one named file: rollback-and-
   # retry on a file:// sink, keep-but-count on the fallback queue, and
@@ -263,6 +270,9 @@ for v in $VERSIONS; do
   fi
   if [ "$ok" = 1 ] && has_phase slow; then
     phase_slow "$v" || { echo "pg$v: slow-receiver FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase tls; then
+    phase_tls "$v" || { echo "pg$v: tls FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase faults; then
     phase_faults "$v" || { echo "pg$v: faults FAILED"; STATUS=1; ok=0; }
