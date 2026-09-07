@@ -16,6 +16,22 @@ pub const Dest = union(enum) {
     file: []const u8,
 };
 
+/// CR/LF discipline for export_http_header, which is appended verbatim to
+/// the request head: a bare \n or \r (an admin typo where an E'...\r\n' was
+/// meant) malforms every request into an eternal retry loop — rejected at
+/// SET time instead. CRLF pairs are the documented multi-line form and pass.
+pub fn headerValid(val: []const u8) bool {
+    var idx: usize = 0;
+    while (idx < val.len) : (idx += 1) {
+        if (val[idx] == '\n') return false;
+        if (val[idx] == '\r') {
+            if (idx + 1 == val.len or val[idx + 1] != '\n') return false;
+            idx += 1; // the \n of the pair
+        }
+    }
+    return true;
+}
+
 pub fn parseUrl(url: []const u8) ?Dest {
     if (std.mem.startsWith(u8, url, "http://")) return parseHttp(url["http://".len..], false);
     if (std.mem.startsWith(u8, url, "https://")) return parseHttp(url["https://".len..], true);
@@ -89,4 +105,13 @@ test "reject garbage" {
     try std.testing.expect(parseUrl("file://relative") == null);
     try std.testing.expect(parseUrl("http://:80/x") == null);
     try std.testing.expect(parseUrl("") == null);
+}
+
+test "export_http_header CR/LF discipline" {
+    try std.testing.expect(headerValid("")); // boot default
+    try std.testing.expect(headerValid("Authorization: Bearer t"));
+    try std.testing.expect(headerValid("Authorization: Bearer t\r\nX-Extra: 1\r\n")); // pairs
+    try std.testing.expect(!headerValid("A: 1\nB: 2")); // bare LF
+    try std.testing.expect(!headerValid("A: 1\rB: 2")); // bare CR
+    try std.testing.expect(!headerValid("A: 1\r\nB: 2\r")); // trailing CR without LF
 }

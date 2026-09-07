@@ -91,6 +91,35 @@ var send_deadline_us: i64 = 0;
 /// runs under sendAborted, as before).
 var compact_deadline_us: i64 = 0;
 
+/// Absolute budget of ONE send attempt: set at send() entry to
+/// now + export_timeout_ms. export_timeout_ms alone bounds each socket
+/// syscall, not the attempt — DNS stall + connect + write + a dribbling
+/// status read could each take the full timeout. Armed at the stage
+/// boundaries and loop iterations of the network senders: past it the send
+/// fails (ordinary retry/fallback path), and the in-flight syscall the
+/// arm happens to miss is bounded by the SO timeouts it just set to the
+/// remaining budget. DNS itself stays outside (getaddrinfo has no timeout
+/// knob; documented in the GUC table).
+var net_deadline_us: i64 = 0;
+
+/// Arm net_deadline_us on the send socket: false (with failSend reason)
+/// when the budget is spent or the socket refuses the timeouts — callers
+/// treat it exactly like the stage failing.
+fn netArmDeadline(fd: c_int) bool {
+    const remain_us = net_deadline_us - pg.GetCurrentTimestamp();
+    if (remain_us < 1000) return failSend("send deadline", 0);
+    const remain_ms: i64 = @divTrunc(remain_us, 1000);
+    const timeval = Timeval{
+        .sec = @intCast(@divTrunc(remain_ms, 1000)),
+        .usec = @intCast(@mod(remain_ms, 1000) * 1000),
+    };
+    if (net.setsockopt(fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
+    or net.setsockopt(fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
+        return failSend("setsockopt", std.c._errno().*);
+    }
+    return true;
+}
+
 fn sendAborted() bool {
     if (got_sigterm.read() >= 2) return true;
     return send_deadline_us != 0 and pg.GetCurrentTimestamp() > send_deadline_us;
@@ -109,7 +138,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_header", "Extra header line(s) appended verbatim to every http(s):// request after the fixed headers — e.g. E'Authorization: Bearer <token>\r\n' for VictoriaLogs. Multi-line values must carry their own CRLFs (write them as E'' strings). Empty = none.", null, &guc_export_http_header, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_header", "Extra header line(s) appended verbatim to every http(s):// request after the fixed headers — e.g. E'Authorization: Bearer <token>\r\n' for VictoriaLogs. Multi-line values must carry their own CRLFs (write them as E'' strings); a bare CR or LF is rejected at SET (it would malform every request). Empty = none.", null, &guc_export_http_header, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -542,26 +571,65 @@ fn warnUrlOnce(url: []const u8) void {
 
 // --- source identity (multi-host → one Vector): stamped into every event ------
 
+// Owned copies behind jsonl.source_*: refreshSourceId re-runs on every
+// SIGHUP, and a bare dupe leaked the previous allocation each reload.
+var owned_host: ?[]u8 = null;
+var owned_cluster: ?[]u8 = null;
+var owned_pgdata: ?[]u8 = null;
+
+fn setOwned(owned: *?[]u8, target: *[]const u8, val: []const u8) void {
+    if (owned.*) |old| {
+        if (std.mem.eql(u8, old, val)) {
+            target.* = old; // unchanged value: keep the allocation
+            return;
+        }
+        std.heap.c_allocator.free(old);
+        owned.* = null;
+    }
+    const dup = std.heap.c_allocator.dupe(u8, val) catch {
+        target.* = "";
+        return;
+    };
+    owned.* = dup;
+    target.* = dup;
+}
+
 /// hostname and pgdata never change; pg_logtap.cluster_name is SIGHUP-able,
-/// hence the refresh on reload. ponytail: leaks ~50 bytes per reload — reloads
-/// are rare.
+/// hence the refresh on reload.
 fn refreshSourceId() void {
     var buf: [128]u8 = undefined;
     @memset(&buf, 0);
     if (c.gethostname(&buf, buf.len - 1) == 0) {
-        jsonl.source_host = std.heap.c_allocator.dupe(u8, std.mem.sliceTo(&buf, 0)) catch "";
+        setOwned(&owned_host, &jsonl.source_host, std.mem.sliceTo(&buf, 0));
     }
     // The override wins; otherwise reuse the server's cluster_name (which is
-    // POSTMASTER — restart-to-change, hence this SIGHUP GUC).
-    jsonl.source_cluster = gucStr("pg_logtap.cluster_name");
-    if (jsonl.source_cluster.len == 0) jsonl.source_cluster = gucStr("cluster_name");
-    jsonl.source_pgdata = gucStr("data_directory");
+    // POSTMASTER — restart-to-change, hence this SIGHUP GUC). Collect all the
+    // borrowed GUC spans first: setOwned dupes before the next GetConfigOption
+    // call can churn the same buffers.
+    var cluster = gucStrRaw("pg_logtap.cluster_name");
+    if (cluster.len == 0) cluster = gucStrRaw("cluster_name");
+    const pgdata = gucStrRaw("data_directory");
+    setOwned(&owned_cluster, &jsonl.source_cluster, cluster);
+    setOwned(&owned_pgdata, &jsonl.source_pgdata, pgdata);
 }
 
-fn gucStr(name: [:0]const u8) []const u8 {
+/// A GUC's current value as a borrowed slice — valid until the next
+/// GetConfigOption call; keepers dupe (setOwned does).
+fn gucStrRaw(name: [:0]const u8) []const u8 {
     const val = pg.GetConfigOption(name.ptr, true, false);
     if (val == null) return "";
-    return std.heap.c_allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(val)))) catch "";
+    return std.mem.span(@as([*:0]const u8, @ptrCast(val)));
+}
+
+/// SET-time CR/LF check for export_http_header (discipline in export.zig,
+/// unit-tested there): guc.c runs this for SET and ALTER SYSTEM, and boot
+/// runs the default '' through here too (always accepted).
+fn checkHeader(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    return dest_mod.headerValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
 }
 
 // --- oid → name cache (catalog lookups under one short transaction) -----------
@@ -569,8 +637,10 @@ fn gucStr(name: [:0]const u8) []const u8 {
 const NameCache = struct {
     dbs: std.AutoHashMapUnmanaged(u32, ?[]const u8) = .{},
     users: std.AutoHashMapUnmanaged(u32, ?[]const u8) = .{},
-    // Entries are never evicted: a cluster has a handful of oids. ponytail:
-    // unbounded on oid churn (db create/drop storm) — add eviction if that bites.
+    // A cluster has a handful of oids; a create/drop storm would grow the
+    // maps forever, so past this bound they reset and re-fill lazily from
+    // the catalog — the same path a fresh worker takes.
+    const max_entries = 4096;
 
     fn lookup(self: *NameCache, e: *const ring.ShmLogEntry) jsonl.Names {
         if (!self.dbs.contains(e.db_oid) or !self.users.contains(e.role_oid)) self.fill(e);
@@ -582,6 +652,15 @@ const NameCache = struct {
 
     fn fill(self: *NameCache, e: *const ring.ShmLogEntry) void {
         const alloc = std.heap.c_allocator;
+        if (self.dbs.count() >= max_entries or self.users.count() >= max_entries) {
+            inline for (.{ &self.dbs, &self.users }) |map| {
+                var it = map.iterator();
+                while (it.next()) |ent| {
+                    if (ent.value_ptr.*) |name| alloc.free(name);
+                }
+                map.clearRetainingCapacity();
+            }
+        }
         pg.SetCurrentStatementStartTimestamp();
         pg.StartTransactionCommand();
         defer pg.CommitTransactionCommand();
@@ -616,6 +695,7 @@ fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, 
 
 fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) bool {
     _ = url;
+    net_deadline_us = pg.GetCurrentTimestamp() + @as(i64, guc_export_timeout_ms) * 1000;
     return switch (dest) {
         .http => |h| sendHttp(h, body, gzipped),
         .tcp => |t| sendRaw(dialTcp(t.host, t.port), body, t.host, t.tls),
@@ -660,6 +740,7 @@ fn tlsWriteBody(tls_conn: *tls_mod.Conn, head: []const u8, body: []const u8) boo
     var off: usize = 0;
     while (off < body.len) {
         if (sendAborted()) return failSend("tls abort", 0);
+        if (!netArmDeadline(send_conn_fd)) return false; // send_conn_fd: only socket sends come here
         const want = @min(body.len - off, 64 * 1024);
         if (!tls_conn.write(body[off..][0..want])) return tlsFail();
         off += want;
@@ -674,6 +755,11 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     const conn_fd = dialTcp(h.host, h.port) orelse return false;
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
+    // Arm the send budget post-dial: a wedged resolver can have spent most
+    // of it before the socket existed (handshake/writes/status read then
+    // run on what is left; dialAddr's own setsockopt gave connect the full
+    // timeout — one in-flight syscall, as documented on netArmDeadline).
+    if (!netArmDeadline(conn_fd)) return false;
     // Fixed headers (method line, Host, content type/encoding/length) run
     // ~110 bytes; 2048 leaves room for any realistic path, host and auth
     // header, and one that still does not fit fails the send with the
@@ -697,6 +783,7 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     var status_buf: [32]u8 = undefined;
     var got: usize = 0;
     while (got < 12) {
+        if (!netArmDeadline(conn_fd)) return false;
         const nread = recvSome(conn_fd, status_buf[got..]);
         if (nread == 0) return failSend("status read", std.c._errno().*);
         got += nread;
@@ -720,8 +807,14 @@ fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) b
     var got: usize = 0;
     while (got < 12) {
         if (sendAborted()) return failSend("tls abort", 0);
+        if (!netArmDeadline(conn_fd)) return false;
         const nread = tls_conn.readSome(status_buf[got..]);
-        if (nread == 0) return failSend("status read", 0); // detail, if any, sits in tls_mod.last_error
+        if (nread == 0) {
+            // Fold tls.zig's stage detail in — a bare "status read" hides
+            // whether the peer reset, EOFed or the read timed out.
+            fail_reason = std.fmt.bufPrint(&fail_reason_buf, "status read: {s}", .{tls_mod.last_error}) catch "status read";
+            return false;
+        }
         got += nread;
     }
     if (!status2xx(status_buf[0..got])) return false;
@@ -734,6 +827,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, host: []const u8, use_tls: bool) bo
     const conn_fd = fd_opt orelse return false;
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
+    if (!netArmDeadline(conn_fd)) return false;
     if (use_tls) {
         const tls_conn = tls_mod.connect(conn_fd, host, tlsOpts()) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;

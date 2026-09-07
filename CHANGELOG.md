@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (2026-09-04)
+## 0.5.0 (2026-09-07)
 
 TLS export and HTTP auth-header round. Upgrade is binary replace + restart
 (the 0.4.x view keeps working — `jsonb_populate_record` ignores the new
@@ -46,6 +46,20 @@ stats fields); the four new GUCs are all SIGHUP.
 
 ### Hardening
 
+- A send attempt runs on one absolute budget. Each socket syscall was
+  already bounded by `export_timeout_ms`, but the stages were not: a
+  stalled resolver could spend seconds before a connect that bought its
+  own full timeout, then a write, then a status read — several budgets in
+  one attempt. The timeout is armed as a deadline at send start and
+  re-armed on the socket at every stage boundary and loop iteration
+  (post-dial, TLS handshake, body chunks, status reads); an attempt past
+  its budget fails as an ordinary send and the batch takes the usual
+  retry/fallback path. DNS stays outside the budget, as before and as the
+  GUC table documents (getaddrinfo has no timeout knob).
+- `export_http_header` is validated at SET time: a bare CR or LF is
+  rejected, CRLF pairs (the documented multi-line form) pass — a plain
+  `'\n'` where an `E'...\r\n'` was meant would malform every request into
+  an eternal retry loop. Unit-tested in export.zig.
 - TLS failures name their fix instead of an error name: a certificate name
   mismatch appends the `export_tls_server_name` hint (IP-literal URLs always
   need it), an unknown CA appends the `export_tls_ca` hint, decode-class
@@ -60,6 +74,22 @@ stats fields); the four new GUCs are all SIGHUP.
 
 ### Internal
 
+- From the sixth external review: SIGHUP no longer leaks the source-identity
+  strings (hostname/cluster/pgdata were duped on every reload and never
+  freed; the copies are owned now, and a reload with unchanged values keeps
+  the allocation), and the oid→name cache is bounded (4096 entries per map —
+  a database/role create-drop storm grew it forever; past the bound the maps
+  reset and re-fill lazily from the catalog). Rejected with reasons: the
+  not_durable/deferred-fsync handling the review wanted reworked is the
+  settled 0.4.2 contract (member kept, counted queued, surfaced through
+  `fb_sync_failures` — including the deferred per-cycle fsync), and the
+  per-handshake CA re-read is the documented rotation mechanism.
+- e2e-tls phase 8, the ambiguous close: a receiver whose TLS layer takes
+  the whole request body and then ends the session before any status line.
+  The send fails on the status read (with tls.zig's stage detail folded
+  into the reason now), the events survive in RAM and replay whole to the
+  next url, and the body the closer did accept is asserted present — the
+  duplicate window the contract allows for exactly this shape.
 - The eleven e2e scripts share `scripts/e2e-common.sh` instead of a
   copy-pasted prologue: container/GUC/marker helpers, the ready gate and a
   per-container `flock` so two suites cannot race one stand. The container

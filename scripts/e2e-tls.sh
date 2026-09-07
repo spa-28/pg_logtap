@@ -19,6 +19,11 @@
 #            leaf+intermediate; pinning only the ROOT must build the path
 #            through the server-sent intermediate, and pinning the
 #            intermediate itself (anchor below the root) must work too
+#   phase 8  the ambiguous close: the receiver's TLS layer takes the whole
+#            request body, then the connection dies before any status — the
+#            send must fail (status read), the events survive in RAM and are
+#            replayed whole to the next url; the body the closer did accept
+#            is the duplicate window this scenario is contractually allowed
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -32,17 +37,19 @@ OUT=$DIR/https-out.jsonl
 TCPS_OUT=$DIR/tcps-out.jsonl
 EVIL_OUT=$DIR/evil-out.jsonl
 CHAIN_OUT=$DIR/chain-out.jsonl
+AMBIG_OUT=$DIR/ambig-out.jsonl
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
-# E2E_TLS_BASE: the four host-side listeners move per PG major in a parallel
-# matrix (JOBS>1) — one base per major, 8 apart so the +1..+3 ranges cannot
+# E2E_TLS_BASE: the five host-side listeners move per PG major in a parallel
+# matrix (JOBS>1) — one base per major, 8 apart so the +1..+4 ranges cannot
 # touch; sequentially the default keeps the historical ports.
 TLS_BASE=${E2E_TLS_BASE:-18443}
 PORT_HTTPS=$TLS_BASE
 PORT_TCPS=$((TLS_BASE + 1))
 PORT_EVIL=$((TLS_BASE + 2))
 PORT_CHAIN=$((TLS_BASE + 3))
+PORT_AMBIG=$((TLS_BASE + 4))
 
 # The receiver's address as seen from the pg container: the docker network
 # gateway (the host). The certificate's SAN carries that IP — verification
@@ -51,7 +58,7 @@ NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 mkdir -p "$DIR"
-rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT"
+rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT"
 # The impostor's certificate: identical CN and SANs, its own key — only the
 # pinned CA can tell it from the real one. That is the phase 5 point.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -82,7 +89,7 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" python3 - <<'PYEOF' &
 import gzip
 import os
 import socket
@@ -159,6 +166,22 @@ class HChain(H):
 httpd_chain = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_CHAIN"])), HChain)
 httpd_chain.socket = ctx_chain.wrap_socket(httpd_chain.socket, server_side=True)
 threading.Thread(target=httpd_chain.serve_forever, daemon=True).start()
+# Phase 8's closer: takes the whole request body, then the session ends
+# without any status line — never send_response; the client's status read
+# sees clean EOF, the exact ambiguous close.
+class HAmbig(H):
+    sink = "ambig-out.jsonl"
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        with open(os.path.join(d, type(self).sink), "ab") as f:
+            f.write(body)
+        self.close_connection = True
+
+httpd_ambig = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_AMBIG"])), HAmbig)
+httpd_ambig.socket = ctx.wrap_socket(httpd_ambig.socket, server_side=True)
+threading.Thread(target=httpd_ambig.serve_forever, daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -166,7 +189,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -322,5 +345,23 @@ gen p7inter "$N"
 wait_for p7inter "$N" "$CHAIN_OUT"
 echo "phase 7b ok: intermediate pinned as the trust anchor, $N/$N"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT")"
+# --- phase 8: the ambiguous close — the worst at-least-once case. The
+# receiver's TLS layer takes the whole request body, then the connection dies
+# before any status line: no 2xx means NOT delivered (the events must survive
+# and replay whole to the next url), while the body it did accept is the
+# duplicate window the contract allows for exactly this shape.
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_AMBIG/insert/jsonline'" \
+  "pg_logtap.export_tls_ca = '$CA_IN_CT'" \
+  "pg_logtap.export_tls_server_name = 'localhost'"
+gen p8amb "$N"
+sleep 3 # a couple of flush cycles of guaranteed ambiguous closes
+FAILED5=$(statf send_cycles_failed)
+[ "$FAILED5" -gt "$FAILED4" ] 2>/dev/null || { echo "e2e-tls: phase 8 expected failed cycles on the pre-status close, got $FAILED5 (was $FAILED4)"; exit 1; }
+AMBIG_GOT=$(received p8amb "$AMBIG_OUT")
+[ "$AMBIG_GOT" -ge 1 ] 2>/dev/null || { echo "e2e-tls: phase 8 the closer never saw a body — the scenario did not happen"; exit 1; }
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
+wait_for p8amb "$N" "$OUT"
+echo "phase 8 ok: pre-status close failed the send, body reached the closer ($AMBIG_GOT distinct, the allowed window), all $N replayed whole"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
