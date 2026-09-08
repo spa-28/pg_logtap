@@ -29,6 +29,7 @@ const c = struct {
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
+    extern "c" fn stat(path: [*:0]const u8, buf: *worker.FileStat) c_int;
 };
 
 /// Events per request body / queue member. 1024 measured 40% SLOWER under a
@@ -173,6 +174,16 @@ pub fn boot(alloc: std.mem.Allocator) void {
     creditBacklog(alloc);
 }
 
+/// True when the given inode is the file the queue path names (through
+/// symlinks — the file:// sink follows them when it opens, so that shared
+/// inode is exactly the alias worker.sendFile catches with this).
+pub fn aliasesQueueInode(st: worker.FileStat) bool {
+    if (path() == null) return false;
+    var qst: worker.FileStat = undefined;
+    if (c.stat(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), &qst) != 0) return false;
+    return st.dev == qst.dev and st.ino == qst.ino;
+}
+
 fn fbOpen() ?c_int {
     if (path() == null) return null;
     // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
@@ -202,6 +213,16 @@ fn fbOpen() ?c_int {
         broken = true;
         capture.noteWarn(.fallback_open);
         elog.Warning(@src(), "pg_logtap fallback queue cannot be opened (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, path() orelse "" });
+        return null;
+    }
+    // A hardlink at the queue path (O_NOFOLLOW passes those) can name the
+    // same inode the file:// sink writes — the queue's side of the inode
+    // alias check; same latch and warning shape as the unopenable queue.
+    if (worker.queueFdAliasesFileUrl(file_fd)) {
+        _ = c.close(file_fd);
+        broken = true;
+        capture.noteWarn(.fallback_open);
+        elog.Warning(@src(), "pg_logtap fallback queue and the file:// export_url name one file (symlink/hardlink alias): fallback disabled: {s}", .{path() orelse ""});
         return null;
     }
     return file_fd;

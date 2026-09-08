@@ -119,7 +119,7 @@ GUCs and restart again.
 | `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
-| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One absolute deadline per send attempt at the worker's stage boundaries; the TLS handshake/close runs several socket waits inside the TLS library, so a dribbling TLS peer can stretch that stage to a small multiple of this. |
+| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One absolute deadline per send attempt: enforced at the worker's stage boundaries, and re-armed before every socket read inside a TLS handshake or session — a peer dribbling TLS fragments cannot stretch a read stage past it. A stage with several TLS writes (body chunks, `close_notify`) can still stretch to a small multiple when the peer stops reading, each write bounded by this. |
 | `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
@@ -314,7 +314,7 @@ On top of that, the operational knobs:
 
 `export_url` schemes (gzip applies to the `http(s)://` schemes):
 
-- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it;
+- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it. When resolution fails in-process, the last address a dial actually reached is retried for up to 60 s (same host only; a later successful dial refreshes it) — emergency delivery through a wedged resolver, not a cache: with `https://`/`tcps://` a stale address that no longer serves the host fails certificate verification, with `http://`/`tcp://` a reassigned IP can receive logs for at most that 60 s window;
 - `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_extra_headers` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
 - `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
@@ -450,7 +450,11 @@ send_cycles_failed,events_lost}_total` (counters) +
 warn_fallback_skipped,warn_fallback_unbounded}` (counters, named like their SQL/stats
 fields, no `_total`) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
-plus `/healthz`. No TLS/auth — closed networks only. Ready alert rules:
+plus `/healthz`. Served from the export worker's loop: scraping is capped at
+250 ms per flush cycle, and a client that connects but dribbles its request
+line gets at most 25 ms before its connection is dropped — export work keeps
+the vast majority of every cycle. No TLS/auth — closed networks only. Ready
+alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring
 dropped, export failing, fallback file broken, DNS failing, queue sync
 failing, redact pattern failed).

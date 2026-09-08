@@ -23,6 +23,11 @@
 #   symlink-queue      : a symlink at the fallback path is refused — the file
 #                        it names stays intact, fallback_broken=1 + one
 #                        WARNING, events ride the RAM backlog
+#   inode-aliasing     : symlink/hardlink aliases the SET-time string check
+#                        cannot see are refused at OPEN time on both sides —
+#                        the sink refuses to send (queue framing stays
+#                        intact), the queue latches broken (the live sink
+#                        keeps delivering pure NDJSON)
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -371,6 +376,77 @@ wait_for sl1 20
 docker exec "$PG_CT" sh -c "rm -f '$FB' '$FB_DIR/pg_logtap-canary'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "symlink refused: canary intact, fallback_broken=1 warned once, 20/20 via the RAM backlog"
+
+echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
+# The SET-time check compares PATH STRINGS; a symlink names the same inode
+# under a different string, so the pair loads. The open-time inode check is
+# what catches it — and it is symmetric (each side stats the other's file),
+# so BOTH refuse: no send lands raw NDJSON in the queue's framing, the queue
+# never appends PGLTFB01 into the sink, and the RAM backlog carries the
+# events until the GUC is repointed. A FRESH queue name on purpose: the
+# symlink phase left the old string broken-latched, and path() re-checks
+# only on a string change — fbOpen must actually run to create the file
+# the sink-side stat compares against.
+FB2_REL=pg_logtap-fallback2.bin
+FB2="$FB_DIR/$FB2_REL"
+docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'; ln -s '$FB2_REL' '$FB_DIR/logtap-sink-alias.bin'"
+# fallback FIRST, while the url is still http: fbOpen creates the (empty)
+# queue file; with the url not yet file:// neither check fires and nothing
+# writes through the symlink. Only then does the url land, and the first
+# send meets both refusals — so "file stayed empty" is deterministic.
+setguc pg_logtap.export_fallback_file "$FB2_REL"; reload; sleep 2
+setguc pg_logtap.export_url "file://$FB_DIR/logtap-sink-alias.bin"; reload; sleep 2
+failA0=$(statf send_cycles_failed)
+gen salias 20; sleep 3
+[ "$(statf send_cycles_failed)" -gt "$failA0" ] \
+  || fail "sink alias: send cycles not failing against the symlinked sink"
+[ "$(statf fallback_broken)" = 1 ] || fail "sink alias: fallback_broken=$(statf fallback_broken), want 1 — the queue-side inode check must fire too"
+asize=$(docker exec "$PG_CT" stat -c %s "$FB2" 2>/dev/null || echo 0)
+[ "$asize" = 0 ] \
+  || fail "sink alias: $asize bytes at the queue path — one of the two writers landed in the other's file"
+[ "$(docker exec "$PG_CT" grep -c "logtap $E2E_TAG" "$FB2" 2>/dev/null)" = 0 ] \
+  || fail "sink alias: raw NDJSON marker lines landed in the queue file"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for salias 20
+docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "symlinked sink refused at the inode: file stayed empty, 20/20 carried by the RAM backlog"
+
+echo "== fallback path hardlinked to the file:// sink: refused at the inode =="
+# The mirror case through a HARDLINK (O_NOFOLLOW passes those; the SET
+# strings differ): the file:// url names the real path, the fallback GUC
+# names its hardlink. Yet another FRESH queue name — path() re-checks only
+# on a string change, and the symlink scenario left fallback2 latched
+# broken. Same symmetric outcome: the queue latches broken, the sink
+# refuses, the shared file stays empty, recovery is one repoint. Both
+# files live in PGDATA: a hardlink cannot cross filesystems.
+FB3_REL=pg_logtap-fallback3.bin
+FB3="$FB_DIR/$FB3_REL"
+# -u postgres: docker exec defaults to root, and a root-owned file is EACCES
+# to the worker — the scenario would test permissions, not inodes.
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'; : > '$FB_DIR/logtap-real2.bin'; ln '$FB_DIR/logtap-real2.bin' '$FB3'"
+# Same order as the symlink scenario: the fallback loads while the url is
+# still http (fbOpen sees the hardlink, no file:// side to alias yet), then
+# the url lands and both refusals fire before the first write.
+warnB0=$(statf warn_fallback_open)
+setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
+setguc pg_logtap.export_url "file://$FB_DIR/logtap-real2.bin"; reload; sleep 2
+failB0=$(statf send_cycles_failed)
+gen halias 20; sleep 3
+[ "$(statf fallback_broken)" = 1 ] || fail "hardlink queue: fallback_broken=$(statf fallback_broken), want 1"
+[ "$(( $(statf warn_fallback_open) - warnB0 ))" -ge 1 ] || fail "hardlink queue: no WARNING for the refused queue open"
+[ "$(statf send_cycles_failed)" -gt "$failB0" ] \
+  || fail "hardlink queue: send cycles not failing against the aliased sink"
+bsize=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/logtap-real2.bin" 2>/dev/null || echo 0)
+[ "$bsize" = 0 ] || fail "hardlink queue: $bsize bytes in the shared file — one of the two writers landed in the other's file"
+# Reload before the rm: a file:// worker whose sink path vanishes re-creates
+# it (O_CREAT) and "delivers" the backlog there — the url must point at the
+# vector first, the files go after the drain.
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+wait_for halias 20
+docker exec "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'"
+ok "hardlinked queue refused at the inode: fallback_broken=1 warned, file stayed empty, 20/20 via the RAM backlog"
 
 echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log

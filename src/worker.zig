@@ -30,6 +30,31 @@ const c = struct {
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
     extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
+    extern "c" fn fstat(fd: c_int, buf: *FileStat) c_int;
+    extern "c" fn stat(path: [*:0]const u8, buf: *FileStat) c_int;
+};
+
+/// struct stat as glibc/musl build it on LP64 (kernel asm-generic layout,
+/// 144 bytes on amd64/arm64): the full size so libc writes stay in bounds;
+/// only dev/ino are read (the alias checks below). std dropped its linux
+/// Stat wrapper in 0.16 (only statx remains — syscall plumbing for two
+/// numbers).
+pub const FileStat = extern struct {
+    dev: i64,
+    ino: u64,
+    nlink: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    pad0: u32 = 0,
+    rdev: i64,
+    size: i64,
+    blksize: i64,
+    blocks: i64,
+    atim: [16]u8 = @splat(0),
+    mtim: [16]u8 = @splat(0),
+    ctim: [16]u8 = @splat(0),
+    unused: [24]u8 = @splat(0),
 };
 const net = std.c;
 
@@ -138,7 +163,7 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path. Enforced as one absolute deadline per send attempt at the worker's stage boundaries; the one exception is the TLS handshake/close, which runs several socket waits inside the TLS library — a peer dribbling handshake fragments can stretch that stage to a small multiple of this before the send fails.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path. Enforced as one absolute deadline per send attempt at the worker's stage boundaries, and every socket read inside a TLS handshake or session is re-armed to that deadline — a peer dribbling TLS fragments cannot stretch a stage past it. The residual multiple is on the write side only: a stage with several TLS writes can stretch to a small multiple when the peer stops reading, each write bounded by this.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
@@ -603,6 +628,44 @@ fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv
     return !fileUrlAliasesFallback(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))), fbq.fileGucRaw());
 }
 
+/// Inode of an open fd (null when fstat fails).
+fn fdStat(fd: c_int) ?FileStat {
+    var sbuf: FileStat = undefined;
+    if (c.fstat(fd, &sbuf) != 0) return null;
+    return sbuf;
+}
+
+/// The SET-time rules above compare PATH STRINGS; the same file can be named
+/// by different strings — a symlink or hardlink alias. The inode checks
+/// below compare the filesystem object itself, at open time on both sides of
+/// the pair: the file:// sink refuses the send (events ride the RAM backlog,
+/// warned once), the queue latches broken exactly like any unusable queue.
+/// Residual, by design: a path swapped between its check and the other
+/// side's open (an active racing writer inside the data directory) can still
+/// land both writers on one inode — same shape as the same-reload double-flip
+/// residual; the foreign-content latch keeps it from silent corruption.
+/// True when an open file:// sink fd is the same inode as the fallback queue
+/// (the queue's own path stat'ed through symlinks — the sink follows them,
+/// that shared inode is exactly the alias being caught).
+fn fdAliasesFallback(fd: c_int) bool {
+    const sink_st = fdStat(fd) orelse return false;
+    return fbq.aliasesQueueInode(sink_st);
+}
+
+/// True when a just-opened queue fd is the same inode as the file the
+/// file:// export_url names — fbOpen's mirror of fdAliasesFallback.
+pub fn queueFdAliasesFileUrl(fd: c_int) bool {
+    const dest_v = dest_mod.parseUrl(gucExportUrl()) orelse return false;
+    if (dest_v != .file) return false;
+    const qst = fdStat(fd) orelse return false;
+    if (dest_v.file.len >= 4096) return false;
+    var zbuf: [4096]u8 = undefined;
+    const zpath = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{dest_v.file}, 0) catch return false;
+    var ust: FileStat = undefined;
+    if (c.stat(zpath, &ust) != 0) return false;
+    return qst.dev == ust.dev and qst.ino == ust.ino;
+}
+
 // --- source identity (multi-host → one Vector): stamped into every event ------
 
 // Owned copies behind jsonl.source_*: refreshSourceId re-runs on every
@@ -832,7 +895,7 @@ fn status2xx(status: []const u8) bool {
 }
 
 fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) bool {
-    const tls_conn = tls_mod.connect(conn_fd, h.host, tlsOpts()) orelse return tlsFail();
+    const tls_conn = tls_mod.connect(conn_fd, h.host, tlsOpts(), net_deadline_us - pg.GetCurrentTimestamp()) orelse return tlsFail();
     if (!tlsWriteBody(tls_conn, head, body)) return false;
     // sendAborted between reads here: the plain path checks it inside
     // recvSome, but the TLS read goes through tls_mod's connection.
@@ -865,7 +928,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
     defer closeSendFd(conn_fd);
     if (!netArmDeadline(conn_fd)) return false;
     if (ep.tls) {
-        const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts()) orelse return tlsFail();
+        const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts(), net_deadline_us - pg.GetCurrentTimestamp()) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;
         if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end(); // best-effort close_notify, skipped when the budget is spent
         return true;
@@ -880,6 +943,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
 /// shape as fb_sync_warned: a dying disk would otherwise bury the log.
 var file_sync_warned = false;
 var file_rollback_warned = false; // same shape: a torn write whose rollback failed
+var sink_alias_warned = false; // same shape: a sink fd sharing the queue's inode
 
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
@@ -893,6 +957,15 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     defer _ = c.close(conn_fd);
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
+    // Inode-level alias with the fallback queue (see fdAliasesFallback):
+    // refuse before the first NDJSON byte lands in the queue's file.
+    if (fdAliasesFallback(conn_fd)) {
+        if (!sink_alias_warned) {
+            sink_alias_warned = true;
+            elog.Warning(@src(), "pg_logtap file:// sink and the fallback queue name one file (symlink/hardlink alias): sends to {s} refused, events stay in the RAM backlog", .{path});
+        }
+        return false;
+    }
     if (!writeAll(conn_fd, body, false)) {
         // A partial write (ENOSPC mid-batch) leaves a torn line in the
         // sink's NDJSON stream forever; with O_APPEND a plain retry would
@@ -932,10 +1005,11 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         }
         return true;
     }
-    // A clean batch clears both warned-once latches so the NEXT independent
+    // A clean batch clears the warned-once latches so the NEXT independent
     // failure is visible again (edge-triggered, re-armed by success).
     file_sync_warned = false;
     file_rollback_warned = false;
+    sink_alias_warned = false;
     return true;
 }
 
@@ -1223,10 +1297,13 @@ fn serveOne(conn_fd: c_int) void {
     // TCP does not preserve the sender's write boundaries: a GET straddling
     // recvs parses as a wrong path and answers 404, so read to the end of the
     // request line (writeResponse parses only that first line). The socket is
-    // nonblocking (accept4 SOCK_NONBLOCK) — poll between recvs, the whole
-    // read bounded by the same ~100ms the single-poll version waited.
+    // nonblocking (accept4 SOCK_NONBLOCK) — poll between recvs. 25ms: a
+    // loopback scraper's line lands in the first poll, and a client that
+    // connects and dribbles the request burns at most 25ms of the cycle's
+    // 250ms scrape budget before its connection is dropped (the budget, not
+    // this deadline, is the per-cycle cap on scraper overhead).
     var poll_fds = [1]net.pollfd{.{ .fd = conn_fd, .events = 1, .revents = 0 }}; // POLLIN
-    const deadline = pg.GetCurrentTimestamp() + 100_000; // µs
+    const deadline = pg.GetCurrentTimestamp() + 25_000; // µs
     var req_buf: [512]u8 = undefined;
     var got: usize = 0;
     while (got < req_buf.len) {

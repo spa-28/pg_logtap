@@ -32,6 +32,14 @@
 #            cycles, nothing accepted) and delivers with the plain
 #            multi-line bearer form (bare \n between lines — normalized on
 #            the wire) and with Basic credentials
+#   phase 10 the dribbling peer: one handshake-record byte every 2s — each
+#            read succeeds inside its SO_RCVTIMEO, so only the absolute
+#            per-attempt deadline ends the handshake (failed cycles grow,
+#            nothing delivered, worker alive after repointing)
+#   phase 11 rapid trust rotation through SIGHUP: ca/name/url alternated
+#            across reloads, two rounds of verified → cleared-ca fail →
+#            root-pinned chain → name-mismatch fail — the per-handshake
+#            bundle rebuild must land the right decision every time
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -60,6 +68,7 @@ PORT_EVIL=$((TLS_BASE + 2))
 PORT_CHAIN=$((TLS_BASE + 3))
 PORT_AMBIG=$((TLS_BASE + 4))
 PORT_AUTH=$((TLS_BASE + 5))
+PORT_DRIB=$((TLS_BASE + 6))
 B64=$(printf %s 'pglogtap:s3cret' | base64 | tr -d '\n') # phase 9's Basic credentials
 
 # The receiver's address as seen from the pg container: the docker network
@@ -100,7 +109,7 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" python3 - <<'PYEOF' &
 import base64
 import gzip
 import os
@@ -108,6 +117,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 d = os.environ["DIR"]
@@ -167,6 +177,30 @@ def dump_tls(port, ctx, out):
 
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_TCPS"]), ctx, "tcps-out.jsonl"), daemon=True).start()
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"]), ctx_evil, "evil-out.jsonl"), daemon=True).start()
+# Phase 10's dribbler: accept, then feed ONE handshake-record byte every 2s —
+# each client read succeeds (per-read SO_RCVTIMEO never fires), only the
+# absolute per-attempt deadline can end the handshake. It never completes,
+# so verification settings are irrelevant; the bytes are discarded.
+def dribble(port):
+    raw = socket.socket()
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    raw.bind(("0.0.0.0", port))
+    raw.listen(8)
+    while True:
+        conn, _ = raw.accept()
+        conn.settimeout(30)
+        try:
+            while True:
+                conn.send(b"\x16")
+                time.sleep(2)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+threading.Thread(target=dribble, args=(int(os.environ["PORT_DRIB"]),), daemon=True).start()
 # The chain receiver ANSWERS an HTTP status (like the main one): phase 7
 # exports to it over https://, and a raw dumper that never replies leaves
 # every send dying at the status-read timeout — the batch still reaches the
@@ -230,7 +264,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -454,5 +488,65 @@ wait_for p9basic "$N" "$AUTH_OUT"
 echo "phase 9b ok: Basic credentials delivered $N/$N"
 set_gucs "pg_logtap.export_http_extra_headers = ''"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT")"
+# --- phase 10: the dribbling peer — the handshake timeout's worst case. One
+# record byte every 2s, forever: every individual read succeeds inside its
+# SO_RCVTIMEO, so only the ABSOLUTE per-attempt deadline can end the
+# handshake. Without it the worker wedges inside the TLS handshake loop
+# while the ring backs up (zero failed cycles, no liveness) — the
+# discriminating assert is failed cycles GROWING against the dribbler.
+TMOUT0=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_timeout_ms")
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_DRIB/insert/jsonline'" \
+  "pg_logtap.export_timeout_ms = '3000'"
+DRIB0=$(statf send_cycles_failed)
+gen p10drib "$N"
+n=0
+while [ "$n" -lt 15 ]; do
+  DRIB1=$(statf send_cycles_failed)
+  [ "$DRIB1" -ge $((DRIB0 + 2)) ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "${DRIB1:-0}" -ge $((DRIB0 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 10 expected failed cycles against the dribbler, got ${DRIB1:-none} (was $DRIB0) — the handshake outlived the absolute deadline"; exit 1; }
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
+  "pg_logtap.export_timeout_ms = '$TMOUT0'"
+wait_for p10drib "$N" "$OUT"
+echo "phase 10 ok: dribbled handshake ended by the absolute deadline ($((DRIB1 - DRIB0)) failed cycles), all $N replayed once repointed"
+
+# --- phase 11: rapid trust rotation through SIGHUP. The CA bundle is
+# rebuilt per handshake; alternating ca/name/url across reloads must land
+# the right trust decision EVERY time (no stale bundle, no stale name) with
+# the worker alive through the churn. Two full rounds of four decisions
+# each: verified → cleared-ca fail → root-pinned chain url → name mismatch.
+ROTF=$DRIB1
+r=1
+while [ "$r" -le 2 ]; do
+  set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
+    "pg_logtap.export_tls_ca = '$CA_IN_CT'" \
+    "pg_logtap.export_tls_server_name = 'localhost'"
+  gen rot$r-ok "$N"
+  wait_for rot$r-ok "$N" "$OUT"
+  set_gucs "pg_logtap.export_tls_ca = ''"
+  gen rot$r-bad "$N"
+  sleep 3 # a couple of flush cycles of guaranteed failures
+  ROTF1=$(statf send_cycles_failed)
+  [ "$ROTF1" -gt "$ROTF" ] 2>/dev/null || { echo "e2e-tls: phase 11 round $r: expected failed cycles with the ca cleared, got $ROTF1 (was $ROTF)"; exit 1; }
+  [ "$(received rot$r-bad "$OUT")" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $(received rot$r-bad "$OUT") events past a cleared ca"; exit 1; }
+  set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_CHAIN/insert/jsonline'" \
+    "pg_logtap.export_tls_ca = '$CA_IN_CT.root'"
+  gen rot$r-chain "$N"
+  wait_for rot$r-chain "$N" "$CHAIN_OUT"
+  set_gucs "pg_logtap.export_tls_server_name = 'mitm.example'"
+  gen rot$r-name "$N"
+  sleep 3
+  ROTF2=$(statf send_cycles_failed)
+  [ "$ROTF2" -gt "$ROTF1" ] 2>/dev/null || { echo "e2e-tls: phase 11 round $r: expected failed cycles on the rotated name mismatch, got $ROTF2 (was $ROTF1)"; exit 1; }
+  [ "$(received rot$r-name "$CHAIN_OUT")" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $(received rot$r-name "$CHAIN_OUT") events past the name mismatch"; exit 1; }
+  ROTF=$ROTF2
+  r=$((r + 1))
+done
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
+  "pg_logtap.export_tls_ca = '$CA_IN_CT'" \
+  "pg_logtap.export_tls_server_name = 'localhost'"
+echo "phase 11 ok: 2 rounds of verified → cleared-ca fail → root-pinned chain → name-mismatch through SIGHUP churn, no stale trust, no leaks"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") ))"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

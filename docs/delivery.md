@@ -51,16 +51,18 @@ duplicate windows, encrypted with TLS 1.2/1.3 (std.crypto.tls; client
 certificates / mTLS are not supported). One handshake per batch, inside the
 existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
 handshake is an ordinary failed send — the batch parks on the fallback file
-/ RAM backlog and retries. One timeout caveat, inherited from the TLS
-library: the handshake (and the best-effort `close_notify` after a send)
-runs several socket waits internally, each bounded by `export_timeout_ms`,
-while the absolute per-attempt deadline is enforced at the worker's stage
-boundaries around it — a peer dribbling handshake fragments can stretch the
-TLS stage to a small multiple of `export_timeout_ms` before the send fails.
-When a send has already consumed the budget, the worker skips its
-`close_notify` (the fd close is the backstop) rather than pay further
-socket waits on an already-successful send. Three SIGHUP GUCs control
-verification:
+/ RAM backlog and retries. The timeout is a strict per-attempt budget: the
+absolute deadline is re-armed before **every** socket read inside the
+handshake and the session after it, so a peer dribbling one TLS fragment
+per just-under-timeout interval cannot stretch the stage — each fragment
+costs only what is left of the budget, and once it is spent the send fails.
+The residual multiple is on the **write** side only: a stage with several
+TLS writes (the body chunks, and the best-effort `close_notify`) can
+stretch to a small multiple when the peer stops reading, each write bounded
+by `export_timeout_ms`. When a send has already consumed the budget, the
+worker skips its `close_notify` (the fd close is the backstop) rather than
+pay further socket waits on an already-successful send. Three SIGHUP GUCs
+control verification:
 
 - `export_tls_ca` — PEM file with the CA to verify the receiver against
   (for a self-signed receiver, the receiver's own certificate). Empty = the
@@ -145,10 +147,10 @@ already delivered.
 ### Worker pinned in one send
 
 While the worker sits in a single blocked send — up to `export_timeout_ms`
-against a receiver that accepted the connection but never answers (the TLS
-handshake/close can stretch this to a small multiple — TLS section) —
-backends keep capturing, and only the ring absorbs it. Capture drops start
-when
+against a receiver that accepted the connection but never answers (a stage
+with several TLS writes can stretch this to a small multiple — TLS
+section) — backends keep capturing, and only the ring absorbs it. Capture
+drops start when
 
 ```
 r × export_timeout_ms > ring_capacity        (events/s × s > events)

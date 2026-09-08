@@ -106,14 +106,37 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   now state the fallback queue's scope for what it already was — every
   transport parks there, `file://` included — and the same-reload
   double-flip residual (the foreign-content latch handles that pair loudly).
-- The TLS handshake/close timeout multiple is a documented property, not a
-  silent one: `export_timeout_ms` is one absolute deadline per send attempt
-  enforced at the worker's stage boundaries, and the TLS library's internal
-  socket waits are bounded each, not as a whole — a dribbling TLS peer can
-  stretch the TLS stage to a small multiple of the timeout before the send
-  fails. After a successful send that consumed the budget, the best-effort
-  `close_notify` is skipped (the fd close is the backstop). GUC table,
-  delivery.md TLS section and the pinned-send math all say it now.
+- The alias rule above is enforced on the filesystem object, not just the
+  path string: a symlink or hardlink names the same inode under a different
+  string, which the SET-time check cannot see. At open time, on both sides,
+  the actual `(st_dev, st_ino)` decides — the `file://` sink refuses the
+  send (warned once; events ride the RAM backlog) when its fd is the
+  queue's file, and the queue latches `fallback_broken` exactly like any
+  unusable queue when its fd is the sink's file. The check is symmetric, so
+  an alias disables both writers and the shared file never holds mixed
+  formats; recovery is one GUC repoint. Residual, by design: a path swapped
+  between its check and the other side's open (a racing writer inside the
+  data directory) can still land both on one inode — the foreign-content
+  latch keeps that from silent corruption. e2e-kill drives both shapes
+  (symlinked sink, hardlinked queue) and asserts the file stays empty.
+- Every socket read inside a TLS handshake or session is re-armed to the
+  send attempt's absolute deadline: the TLS library's handshake loop has no
+  bound on the number of reads it will do, so a peer dribbling one record
+  fragment per just-under-timeout interval could pin the worker inside the
+  handshake forever — each individual recv succeeded, the per-read
+  `SO_RCVTIMEO` never fired. The TLS socket reader wraps the deadline now
+  (`remaining = deadline − now` before every read), so the handshake and
+  the status reads after it are strictly inside `export_timeout_ms`; the
+  residual multiple is on the write side only (a stage with several TLS
+  writes can stretch when the peer stops reading, each write bounded).
+  After a successful send that consumed the budget, the best-effort
+  `close_notify` is skipped (the fd close is the backstop). e2e-tls phase
+  10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
+- A metrics client that connects but dribbles its request line gets 25 ms
+  (was 100 ms) before its connection is dropped — a loopback scraper's
+  line lands in the first poll, so the tightening costs nothing real and
+  quarters the per-cycle tax a broken scraper can levy; the 250 ms
+  per-cycle scrape budget still caps the total.
 
 ### Internal
 
@@ -152,6 +175,18 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   successful sync — or a compaction, whose rewrite is fdatasynced before
   the rename — makes the queue durable again while the counter stays;
   alert on its growth, not its level.
+- e2e-tls phase 11, rapid trust rotation through SIGHUP: ca / server_name /
+  url alternated across reloads, two rounds of verified → cleared-CA fail →
+  root-pinned chain → name-mismatch fail — the per-handshake bundle rebuild
+  must land the right trust decision every time (no stale bundle, no stale
+  name), with failed-cycle and zero-leak asserts at every step.
+- The DNS last-known-good address has explicit semantics, documented with
+  the `export_url` schemes: it is used only while in-process resolution
+  fails, only for the host that produced it, and only within 60 s of the
+  last successful dial (a successful dial refreshes it). On
+  `https://`/`tcps://` a stale address that no longer serves the host fails
+  certificate verification; on plain `http://`/`tcp://` a reassigned IP can
+  receive logs for at most that window.
 - e2e-tls phase 8, the ambiguous close: a receiver whose TLS layer takes
   the whole request body and then ends the session before any status line.
   The send fails on the status read (with tls.zig's stage detail folded
