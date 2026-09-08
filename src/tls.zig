@@ -77,12 +77,15 @@ pub const Conn = struct {
     }
 
     /// Decrypted bytes into buf — as many as available, at least 1 on
-    /// success (0 = failure or clean EOF; reason in last_error on failure).
+    /// success (0 = failure or clean EOF; reason in last_error for both).
     pub fn readSome(c: *Conn, buf: []u8) usize {
         const nread = c.client.reader.readSliceShort(buf) catch |e| {
             fail("tls read: {s}", .{@errorName(e)});
             return 0;
         };
+        // Name the clean EOF, or the caller reports whatever failure the
+        // PREVIOUS attempt left in last_error ("stable until the next one").
+        if (nread == 0) fail("tls eof: the receiver closed the session", .{});
         return nread;
     }
 
@@ -104,7 +107,8 @@ var conn_storage: Conn = undefined;
 var ca_bundle: std.crypto.Certificate.Bundle = .empty;
 var ca_lock: std.Io.RwLock = .init;
 
-/// Last failure, set by connect/write/read. Stable until the next one.
+/// Last failure (or clean-eof note), set by connect/write/read. Stable
+/// until the next one.
 /// 160: fits an error name plus the misconfiguration hint below verbatim.
 pub var last_error_buf: [160]u8 = undefined;
 pub var last_error: []const u8 = "";

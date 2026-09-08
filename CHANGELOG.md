@@ -22,8 +22,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   to verify and the SNI to send when it differs from the URL host:
   IP-literal URLs (name verification matches dNSName SANs only) and
   TLS-terminating load balancers.
-- `export_http_header` — extra header line(s) appended verbatim to every
-  http(s) request, e.g. `E'Authorization: Bearer <token>\r\n'`.
+- `export_http_extra_headers` — extra header line(s) on every http(s)
+  request, e.g. `'Authorization: Bearer <token>'`. Multiple lines are
+  separated by the two-character `\n` sequence — a GUC value cannot carry
+  a real newline (ALTER SYSTEM rejects one outright), so the escape is the
+  only multi-line form; each line is CRLF-terminated on send, and the
+  plain quoted form just works.
 - `scripts/e2e-tls.sh` — acceptance against a self-signed receiver: verified
   https delivery, handshake must fail (and later replay) with the CA cleared
   and with an empty CA file, tcps delivery, verify=off delivering with
@@ -33,7 +37,10 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   fails the handshake on the name alone — both recovering by SIGHUP. An
   intermediate-CA chain: pinning only the root verifies through the
   server-sent intermediate, and the intermediate itself works as the trust
-  anchor.
+  anchor. The auth gate: a receiver demanding a tenant header plus
+  Authorization answers 401 to every send without them (failed cycles,
+  nothing accepted) and delivers with the `\n`-separated bearer form and
+  with Basic credentials.
 - Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
   `warn_tls_no_verify`, `warn_fallback_open`, `warn_fallback_skipped`,
   `warn_fallback_unbounded` — the cumulative, queryable copy of the
@@ -48,6 +55,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
 
 ### Hardening
 
+- A `file://` rollback after a failed `fdatasync` is synced too: the failed
+  sync may already have pushed the batch's pages and size out, and an
+  unsynced `ftruncate` could resurrect them after an OS crash — where the
+  retried batch, parked on the fallback queue, would replay a second copy
+  after the resurrected one. A rollback sync that fails as well keeps the
+  retry (at-least-once), the same trade the rollback-failed path documents.
 - A send attempt runs on one absolute budget. Each socket syscall was
   already bounded by `export_timeout_ms`, but the stages were not: a
   stalled resolver could spend seconds before a connect that bought its
@@ -58,10 +71,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   its budget fails as an ordinary send and the batch takes the usual
   retry/fallback path. DNS stays outside the budget, as before and as the
   GUC table documents (getaddrinfo has no timeout knob).
-- `export_http_header` is validated at SET time: a bare CR or LF is
-  rejected, CRLF pairs (the documented multi-line form) pass — a plain
-  `'\n'` where an `E'...\r\n'` was meant would malform every request into
-  an eternal retry loop. Unit-tested in export.zig.
+- `export_http_extra_headers` cannot malform a request: a raw CR/LF byte and
+  an embedded empty line are rejected at SET (each would end the header
+  section early), and everything else about line endings is normalized on
+  send — each configured line gets its CRLF and the value is always
+  terminated, so the fixed headers after it always start on a fresh line.
+  Unit-tested in export.zig, gate-tested by e2e-tls phase 9.
 - TLS failures name their fix instead of an error name: a certificate name
   mismatch appends the `export_tls_server_name` hint (IP-literal URLs always
   need it), an unknown CA appends the `export_tls_ca` hint, decode-class
@@ -76,6 +91,19 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
 
 ### Internal
 
+- SIGHUP resets the receiver-slow flag (a stale flag from the previous
+  receiver — or from a threshold since disabled — parked the new
+  destination's batches until a quiet cycle re-probed it), and the
+  unparseable-URL warning re-arms when a URL parses again (bad → fixed →
+  bad warns twice, like the file:// latches). A TLS receiver closing the
+  session cleanly before any status line is reported as `tls eof`, not as
+  the previous attempt's leftover error text.
+- The `events_queued` Prometheus HELP and the fallback section of
+  delivery.md call it a lifecycle stage like the counters glossary already
+  did, and delivery.md's `events_captured ≈ …` invariant subtracts
+  `events_compacted` from the backlog term — compacted events sit in both
+  `queued − replayed` and `events_lost`, so the formula double-counted
+  them.
 - The Makefile is the single entry point now: `make check` (fmt + lint +
   unit tests + the .so compile), `make container` (the same battery in the
   pgzx-build container), `make e2e` (the docker matrix), `make deploy` —

@@ -24,6 +24,11 @@
 #            send must fail (status read), the events survive in RAM and are
 #            replayed whole to the next url; the body the closer did accept
 #            is the duplicate window this scenario is contractually allowed
+#   phase 9  authenticated https: a receiver demanding a tenant header plus
+#            Authorization answers 401 to every send without them (failed
+#            cycles, nothing accepted) and delivers with the plain
+#            multi-line bearer form (bare \n between lines — normalized on
+#            the wire) and with Basic credentials
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -38,11 +43,12 @@ TCPS_OUT=$DIR/tcps-out.jsonl
 EVIL_OUT=$DIR/evil-out.jsonl
 CHAIN_OUT=$DIR/chain-out.jsonl
 AMBIG_OUT=$DIR/ambig-out.jsonl
+AUTH_OUT=$DIR/auth-out.jsonl
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
-# E2E_TLS_BASE: the five host-side listeners move per PG major in a parallel
-# matrix (JOBS>1) — one base per major, 8 apart so the +1..+4 ranges cannot
+# E2E_TLS_BASE: the six host-side listeners move per PG major in a parallel
+# matrix (JOBS>1) — one base per major, 8 apart so the +1..+5 ranges cannot
 # touch; sequentially the default keeps the historical ports.
 TLS_BASE=${E2E_TLS_BASE:-18443}
 PORT_HTTPS=$TLS_BASE
@@ -50,6 +56,8 @@ PORT_TCPS=$((TLS_BASE + 1))
 PORT_EVIL=$((TLS_BASE + 2))
 PORT_CHAIN=$((TLS_BASE + 3))
 PORT_AMBIG=$((TLS_BASE + 4))
+PORT_AUTH=$((TLS_BASE + 5))
+B64=$(printf %s 'pglogtap:s3cret' | base64 | tr -d '\n') # phase 9's Basic credentials
 
 # The receiver's address as seen from the pg container: the docker network
 # gateway (the host). The certificate's SAN carries that IP — verification
@@ -58,7 +66,7 @@ NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 mkdir -p "$DIR"
-rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT"
+rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT" "$AUTH_OUT"
 # The impostor's certificate: identical CN and SANs, its own key — only the
 # pinned CA can tell it from the real one. That is the phase 5 point.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -89,7 +97,8 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" python3 - <<'PYEOF' &
+import base64
 import gzip
 import os
 import socket
@@ -182,6 +191,35 @@ class HAmbig(H):
 httpd_ambig = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_AMBIG"])), HAmbig)
 httpd_ambig.socket = ctx.wrap_socket(httpd_ambig.socket, server_side=True)
 threading.Thread(target=httpd_ambig.serve_forever, daemon=True).start()
+# Phase 9's gatekeeper: demands a tenant header AND a bearer token (the
+# plain multi-line form — the sender normalizes the bare \n on the wire),
+# or Basic credentials; anything less gets the 401 the exporter treats as
+# a failed send. A rejected request's body is still read before the answer
+# — an unread body turns the server's close into an RST that can discard
+# the 401 status bytes still in flight.
+BASIC = base64.b64encode(b"pglogtap:s3cret").decode()
+class HAuth(H):
+    sink = "auth-out.jsonl"
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        auth = self.headers.get("Authorization", "")
+        if not ((auth == "Bearer e2e-token" and self.headers.get("X-Logtap-E2E") == "t9") or auth == "Basic " + BASIC):
+            self.send_response(401)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"no")
+            return
+        if self.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        with open(os.path.join(d, "auth-out.jsonl"), "ab") as f:
+            f.write(body)
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+httpd_auth = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_AUTH"])), HAuth)
+httpd_auth.socket = ctx.wrap_socket(httpd_auth.socket, server_side=True)
+threading.Thread(target=httpd_auth.serve_forever, daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -189,7 +227,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -363,5 +401,32 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
 wait_for p8amb "$N" "$OUT"
 echo "phase 8 ok: pre-status close failed the send, body reached the closer ($AMBIG_GOT distinct, the allowed window), all $N replayed whole"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT")"
+# --- phase 9: authenticated https. The gatekeeper demands a tenant header
+# plus a bearer token — two lines, separated by the two-character \n
+# sequence the docs show (ALTER SYSTEM rejects a value with a real newline,
+# so the escape is the only multi-line form) — and then Basic credentials:
+# the same wire path, the two spellings operators actually type. Without
+# the headers every send eats a 401 (failed cycles, nothing accepted);
+# the parked events flush whole once the header lands.
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_AUTH/insert/jsonline'" \
+  "pg_logtap.export_tls_ca = '$CA_IN_CT'" \
+  "pg_logtap.export_tls_server_name = 'localhost'" \
+  "pg_logtap.export_http_extra_headers = ''"
+gen p9fail "$N"
+sleep 3 # a couple of flush cycles of guaranteed 401s
+FAILED6=$(statf send_cycles_failed)
+[ "$FAILED6" -gt "$FAILED5" ] 2>/dev/null || { echo "e2e-tls: phase 9 expected failed cycles on the 401s, got $FAILED6 (was $FAILED5)"; exit 1; }
+[ "$(received p9fail "$AUTH_OUT")" = 0 ] || { echo "e2e-tls: phase 9 leaked $(received p9fail "$AUTH_OUT") events past the 401 gate"; exit 1; }
+set_gucs "pg_logtap.export_http_extra_headers = 'X-Logtap-E2E: t9\nAuthorization: Bearer e2e-token'"
+gen p9ok "$N"
+wait_for p9fail "$N" "$AUTH_OUT"
+wait_for p9ok "$N" "$AUTH_OUT"
+echo "phase 9 ok: 401 gate ($((FAILED6 - FAILED5)) failed cycles, zero accepted), $N buffered + $N live with the backslash-n separated bearer form"
+set_gucs "pg_logtap.export_http_extra_headers = 'Authorization: Basic $B64'"
+gen p9basic "$N"
+wait_for p9basic "$N" "$AUTH_OUT"
+echo "phase 9b ok: Basic credentials delivered $N/$N"
+set_gucs "pg_logtap.export_http_extra_headers = ''"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

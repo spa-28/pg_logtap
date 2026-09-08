@@ -51,7 +51,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
         \\# TYPE pg_logtap_events_sent_total counter
         \\pg_logtap_events_sent_total {d}
-        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed - events_compacted.
+        \\# HELP pg_logtap_events_queued_total Events appended to the fallback file — a lifecycle stage, not a durability claim (fb_sync_failures names the cycles that are not durable). Stuck in the queue right now = events_queued - events_replayed - events_compacted.
         \\# TYPE pg_logtap_events_queued_total counter
         \\pg_logtap_events_queued_total {d}
         \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.

@@ -25,7 +25,7 @@ from scratch when the need becomes real.
   export.zig); hostnames with AAAA records already work.
 - **mTLS / client certificates on the export hop**: server verification
   (`https://`/`tcps://` + `export_tls_ca`) and header auth
-  (`export_http_header`) shipped in 0.5.0; what is still delegated is the
+  (`export_http_extra_headers`) shipped in 0.5.0; what is still delegated is the
   client side — point `export_url` at a local sidecar (Vector, stunnel, an
   nginx TLS terminator) on the same host or network namespace when the
   receiver demands a client certificate. That keeps the worker on plain

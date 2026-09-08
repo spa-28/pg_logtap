@@ -74,10 +74,13 @@ handshake is an ordinary failed send — the batch parks on the fallback file
   matches an IP-literal host) and a TLS-terminating load balancer in front
   of the receiver. Empty = the URL host.
 
-`export_http_header` (plain `http://` included) appends extra header
-line(s) verbatim to every http(s) request after the fixed headers — e.g.
-`E'Authorization: Bearer <token>\r\n'` for VictoriaLogs. Multi-line values
-carry their own CRLFs (write them as `E''` strings).
+`export_http_extra_headers` (plain `http://` included) appends extra header
+line(s) to every http(s) request after the fixed headers — e.g.
+`'Authorization: Bearer <token>'` for VictoriaLogs. Multiple lines are
+separated by the two-character `\n` sequence — a GUC value cannot carry a
+real newline (ALTER SYSTEM rejects one outright), so the escape is the only
+multi-line form; each line is CRLF-terminated on send. SET rejects a raw
+`\r` or an empty line (either would malform every request).
 
 ## Ordering and identity
 
@@ -219,8 +222,9 @@ and must survive reboots and log cleanup.
 When an `http://`/`tcp://` send fails and the path is set, the batch is
 appended to the queue — one **gzip member per batch** behind a length framing
 (`PGLTFB01` magic, 0600, fdatasynced once per flush cycle) — and counted as
-`events_queued`: it left pg_logtap durably, and is counted again as
-`events_replayed` when delivered. The queue is an internal format, not a
+`events_queued` (a lifecycle stage, not a durability claim — `fb_sync_failures`
+names the cycles that are not durable) and again as `events_replayed` when
+delivered. The queue is an internal format, not a
 tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
@@ -355,8 +359,10 @@ natively as long as the Prometheus scrape interval is shorter than the restart.
 
 Each event is counted once per lifecycle stage it actually passes through.
 The delivery invariant is `events_captured ≈ events_sent +
-(events_queued - events_replayed) + events_dropped + events_lost +
-in-flight/ring`. Names are identical in `pg_logtap_stats()` text, the
+(events_queued - events_replayed - events_compacted) + events_dropped +
+events_lost + in-flight/ring` — compacted events sit in both the backlog
+term and `events_lost` (they are never replayed), so leaving them in the
+backlog double-counts them. Names are identical in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition; the view adds
 derived `queue_backlog` and `delivered`.
 

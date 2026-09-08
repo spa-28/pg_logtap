@@ -43,7 +43,7 @@ var guc_export_gzip: bool = false;
 var guc_export_tls_ca: [*c]u8 = null;
 var guc_export_tls_verify: bool = true;
 var guc_export_tls_server_name: [*c]u8 = null;
-var guc_export_http_header: [*c]u8 = null;
+var guc_export_http_extra_headers: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
 var guc_export_slow_ms: c_int = 250;
@@ -134,7 +134,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_header", "Extra header line(s) appended verbatim to every http(s):// request after the fixed headers — e.g. E'Authorization: Bearer <token>\r\n' for VictoriaLogs. Multi-line values must carry their own CRLFs (write them as E'' strings); a bare CR or LF is rejected at SET (it would malform every request). Empty = none.", null, &guc_export_http_header, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after the fixed headers — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return or an empty line is rejected at SET (both would malform every request). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -189,6 +189,11 @@ pub fn workerMain() void {
             pg.ProcessConfigFile(pg.PGC_SIGHUP);
             syncMetricsListener();
             refreshSourceId();
+            // A new URL (or a re-set threshold) must not inherit the
+            // previous receiver's slow state: the stale flag would park the
+            // new destination's batches until a quiet cycle re-probed it.
+            // A still-slow receiver re-arms the flag on its next answer.
+            receiver_slow = false;
         }
         // Absorb procsignal barriers (see handleUsr1). Errors here have no
         // better handler than the next cycle — the barrier itself doesn't
@@ -237,6 +242,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         warnUrlOnce(url);
         return;
     };
+    warned_url = false; // re-arm: bad → fixed → bad warns again, like the file:// latches
     defer send_deadline_us = 0; // zero for normal cycles regardless
     defer compact_deadline_us = 0;
     if (final) send_deadline_us = pg.GetCurrentTimestamp() + 1_000_000 + @as(i64, guc_export_timeout_ms) * 1000;
@@ -616,7 +622,7 @@ fn gucStrRaw(name: [:0]const u8) []const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(val)));
 }
 
-/// SET-time CR/LF check for export_http_header (discipline in export.zig,
+/// SET-time CR/LF check for export_http_extra_headers (discipline in export.zig,
 /// unit-tested there): guc.c runs this for SET and ALTER SYSTEM, and boot
 /// runs the default '' through here too (always accepted).
 fn checkHeader(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
@@ -762,8 +768,8 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     var head_buf: [2048]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
     head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
-    const extra_hdr = gucSpan(guc_export_http_header);
-    if (extra_hdr.len > 0) head.writeAll(extra_hdr) catch return failSend("head build", 0);
+    const extra_hdr = gucSpan(guc_export_http_extra_headers);
+    if (extra_hdr.len > 0) dest_mod.writeHeaderLines(&head, extra_hdr) catch return failSend("head build", 0);
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
     if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
@@ -875,7 +881,16 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     // take a clean retry either, so report delivered with the durability
     // caveat (better one maybe-lost batch than a guaranteed duplicate).
     if (c.fdatasync(conn_fd) != 0) {
-        if (c.ftruncate(conn_fd, @intCast(end_before)) == 0) return false;
+        if (c.ftruncate(conn_fd, @intCast(end_before)) == 0) {
+            // Sync the rollback itself: the failed sync may already have
+            // pushed the batch's pages and size out, and an unsynced
+            // truncate can resurrect them after an OS crash — the retried
+            // batch parks on the fallback queue and would replay a second
+            // copy after the resurrected one. A sync that fails too keeps
+            // the retry (at-least-once), the same trade as below.
+            _ = c.fdatasync(conn_fd);
+            return false;
+        }
         if (!file_sync_warned) {
             file_sync_warned = true;
             elog.Warning(@src(), "pg_logtap file:// fdatasync failed and rollback failed too (errno={d}): batch reported delivered but not durable: {s}", .{ std.c._errno().*, path });

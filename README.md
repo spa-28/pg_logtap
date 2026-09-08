@@ -116,7 +116,7 @@ GUCs and restart again.
 | `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. The receiver may present leaf+intermediate — pin the root (or the intermediate itself); the file may hold several certs. |
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
-| `pg_logtap.export_http_header` | `''` | SIGHUP | Extra header line(s) appended verbatim to every http(s) request after the fixed headers, e.g. `E'Authorization: Bearer <token>\r\n'` (plain `http://` included). |
+| `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed `http://`/`tcp://` batches go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). |
@@ -188,7 +188,7 @@ The same over TLS — an internal CA and a bearer token, no restart:
 ```sql
 ALTER SYSTEM SET pg_logtap.export_url = 'https://vlogs.internal:9428/insert/jsonline?_stream_fields=host,level&_msg_field=message&_time_field=timestamp';
 ALTER SYSTEM SET pg_logtap.export_tls_ca = '/etc/pg_logtap/vlogs-ca.pem';
-ALTER SYSTEM SET pg_logtap.export_http_header = E'Authorization: Bearer <token>\r\n';
+ALTER SYSTEM SET pg_logtap.export_http_extra_headers = 'Authorization: Bearer <token>';
 SELECT pg_reload_conf();
 -- a self-signed receiver: the CA file IS the receiver's own certificate.
 -- An IP-literal URL (https://10.0.0.5:9428) or a TLS-terminating LB in
@@ -315,7 +315,7 @@ On top of that, the operational knobs:
 `export_url` schemes (gzip applies to the `http(s)://` schemes):
 
 - `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it;
-- `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_header` — see the GUC table above;
+- `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_extra_headers` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
 - `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
 - `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
@@ -346,7 +346,7 @@ Not direct (put a collector in between): **Kafka** (binary protocol);
 **Loki / Elasticsearch / OpenSearch** (different body format); endpoints that
 need mTLS client certificates or a vendor-specific body (Datadog, Elastic
 Cloud). A plain `https://` NDJSON endpoint with a bearer token is direct:
-`export_tls_ca` + `export_http_header` cover it. Principle: pg_logtap is a
+`export_tls_ca` + `export_http_extra_headers` cover it. Principle: pg_logtap is a
 dumb reliable transporter of a trivial format; transformation and fan-out
 are the collector's job.
 
@@ -494,7 +494,7 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: 
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off
+scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off, auth gate (401 without headers, bearer/basic with)
 scripts/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
 scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm

@@ -16,14 +16,38 @@ pub const Dest = union(enum) {
     file: []const u8,
 };
 
-/// CR/LF discipline for export_http_header, which is appended verbatim to
-/// the request head: a bare \n or \r (an admin typo where an E'...\r\n' was
-/// meant) malforms every request into an eternal retry loop — rejected at
-/// SET time instead. CRLF pairs are the documented multi-line form and pass.
+/// SET-time discipline for export_http_extra_headers: reject only what the
+/// sender cannot fix — an empty line (it would end the header section before
+/// the fixed headers) and a raw CR/LF byte. Lines are separated by the
+/// two-character "\n" sequence: a config-file GUC value cannot carry a real
+/// newline at all (ALTER SYSTEM rejects one outright), so the escape is the
+/// only multi-line form there is.
 pub fn headerValid(val: []const u8) bool {
     var rest = val;
-    while (std.mem.indexOf(u8, rest, "\r\n")) |i| rest = rest[i + 2 ..]; // legal pairs
-    return std.mem.indexOfAny(u8, rest, "\r\n") == null;
+    while (rest.len > 0) {
+        const eol = std.mem.indexOf(u8, rest, "\\n") orelse rest.len;
+        const line = rest[0..eol];
+        if (std.mem.indexOfAny(u8, line, "\r\n") != null) return false; // raw CR/LF byte
+        if (line.len == 0) return false; // empty line ends the header section early
+        if (eol == rest.len) return true;
+        rest = rest[eol + 2 ..];
+    }
+    return true;
+}
+
+/// Wire form of the configured extra headers: one CRLF-terminated line per
+/// "\n"-separated line of the value, so the fixed headers that follow always
+/// start on a fresh line — a plain 'Authorization: Bearer t' needs no
+/// ceremony, and the missing final CRLF is supplied.
+pub fn writeHeaderLines(w: anytype, val: []const u8) !void {
+    var rest = val;
+    while (rest.len > 0) {
+        const eol = std.mem.indexOf(u8, rest, "\\n") orelse rest.len;
+        try w.writeAll(rest[0..eol]);
+        try w.writeAll("\r\n");
+        if (eol == rest.len) return;
+        rest = rest[eol + 2 ..];
+    }
 }
 
 pub fn parseUrl(url: []const u8) ?Dest {
@@ -101,11 +125,24 @@ test "reject garbage" {
     try std.testing.expect(parseUrl("") == null);
 }
 
-test "export_http_header CR/LF discipline" {
+test "export_http_extra_headers CR/LF discipline" {
     try std.testing.expect(headerValid("")); // boot default
-    try std.testing.expect(headerValid("Authorization: Bearer t"));
-    try std.testing.expect(headerValid("Authorization: Bearer t\r\nX-Extra: 1\r\n")); // pairs
-    try std.testing.expect(!headerValid("A: 1\nB: 2")); // bare LF
-    try std.testing.expect(!headerValid("A: 1\rB: 2")); // bare CR
-    try std.testing.expect(!headerValid("A: 1\r\nB: 2\r")); // trailing CR without LF
+    try std.testing.expect(headerValid("Authorization: Bearer t")); // the plain form
+    try std.testing.expect(headerValid("X-Tenant: a\\nAuthorization: Bearer t")); // two lines, the \n escape
+    try std.testing.expect(headerValid("X-Tenant: a\\nAuthorization: Bearer t\\n")); // trailing separator
+    try std.testing.expect(!headerValid("\\nAuthorization: Bearer t")); // empty first line
+    try std.testing.expect(!headerValid("X-A: 1\\n\\nX-B: 2")); // empty middle line
+    try std.testing.expect(!headerValid("X-A: 1\r\nX-B: 2")); // raw CR/LF bytes — ALTER SYSTEM
+    try std.testing.expect(!headerValid("X-A: 1\nX-B: 2")); // cannot deliver one anyway,
+    try std.testing.expect(!headerValid("X-A: 1\r")); // reject them regardless
+}
+
+test "export_http_extra_headers wire form" {
+    var buf: [128]u8 = undefined;
+    var writer1 = std.Io.Writer.fixed(&buf);
+    try writeHeaderLines(&writer1, "Authorization: Bearer t");
+    try std.testing.expectEqualStrings("Authorization: Bearer t\r\n", writer1.buffered());
+    var writer2 = std.Io.Writer.fixed(&buf);
+    try writeHeaderLines(&writer2, "X-Tenant: a\\nAuthorization: Bearer t");
+    try std.testing.expectEqualStrings("X-Tenant: a\r\nAuthorization: Bearer t\r\n", writer2.buffered());
 }

@@ -1,5 +1,5 @@
 /* 0.4.5 → 0.5.0: TLS export (https:// and tcps:// URLs — the four new
-   export_tls_* / export_http_header GUCs are SIGHUP and have no SQL surface
+   export_tls_* / export_http_extra_headers GUCs are SIGHUP and have no SQL surface
    of their own) and the four warning counters the 0.5.0 stats functions
    now return. Binary replace + restart, then ALTER EXTENSION UPDATE;
    until the hop runs, the 0.4.x view keeps working — jsonb_populate_record
