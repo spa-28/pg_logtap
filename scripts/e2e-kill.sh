@@ -130,7 +130,14 @@ setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 # exactly one WARNING per divert, not one per append. The warn_fallback_unbounded
 # counter (in pg_logtap_stats) is the queryable copy of that log line.
 warns0=$(statf warn_fallback_unbounded)
-setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
+setguc pg_logtap.fallback_max_mb 0; reload
+# SHOW barrier, not a timed sleep: on a slow runner the whole 2600-event
+# burst parks before the worker applies the reload, every divert sees the
+# old cap and the unbounded warning never fires (seen on a CI arm64 box).
+n=0; while [ "$n" -lt 20 ] && [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.fallback_max_mb")" != 0 ]; do
+  n=$((n + 1)); sleep 1
+done
+sleep 1 # one flush cycle for the worker to apply the landed config
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"

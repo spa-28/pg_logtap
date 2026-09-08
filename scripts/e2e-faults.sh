@@ -174,12 +174,16 @@ echo "== /dev/full: write fails mid-batch -> torn line rolled back, held in RAM 
 # trimmed events lost (legitimately — the outage outlasted the cap), and
 # this container's shmem still carries them.
 lost0=$(statf events_lost)
+# dropped deltas too: the compact scenario's compaction walks stall drain
+# past a 1024-ring on a slow disk (seen on a CI runner: 76 dropped carried
+# from there) — this phase generates 20 events, it cannot overflow the ring.
+drp0=$(statf events_dropped)
 docker exec "$CT" sh -c "rm -f /tmp/replay.log"
 setguc pg_logtap.export_fallback_file '' # no queue: the RAM backlog is the only hold
 setguc pg_logtap.export_url 'file:///dev/full'; reload; sleep 2
 gen "full1-$SUF" 20; sleep 3 # ENOSPC on every write; backlog accumulates
 [ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "/dev/full: lost grew without the queue"
-[ "$(statf events_dropped)" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
+[ "$(( $(statf events_dropped) - drp0 ))" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
 setguc pg_logtap.export_url 'file:///tmp/full.log'; reload; sleep 2
 n=0; while [ "$n" -lt 15 ]; do
   [ "$(sink_lines "full1-$SUF" full)" -ge 20 ] && break

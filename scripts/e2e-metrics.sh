@@ -55,15 +55,16 @@ docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
 
 # Fragmented GET: TCP owes the client no write boundaries — a request line
 # straddling recvs must still parse. A one-recv request read sees "GET /met",
-# parses the path as "/met" and answers 404. Send in two pieces (gap well
-# inside the read's ~100ms wait, far above container-network RTT) and demand
-# the real metrics body.
+# parses the path as "/met" and answers 404. Send in two pieces (gap inside
+# the worker's 50ms per-client line wait — 20ms still sits far above
+# container-network RTT, with runner jitter headroom on the other side) and
+# demand the real metrics body.
 echo "== fragmented GET: the request line straddles recvs =="
 docker run --rm --network "$NET" python:3-alpine python -c "
 import socket, time
 s = socket.create_connection(('$PG_CT', $PORT), timeout=8)
 s.sendall(b'GET /met')
-time.sleep(0.03)
+time.sleep(0.02)
 s.sendall(b'rics HTTP/1.1\r\n\r\n')
 time.sleep(0.3)
 data = s.recv(65536)

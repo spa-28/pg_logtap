@@ -452,7 +452,7 @@ fields, no `_total`) + `pg_logtap_ring_{events,capacity}` and
 `pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
 plus `/healthz`. Served from the export worker's loop: scraping is capped at
 250 ms per flush cycle, and a client that connects but dribbles its request
-line gets at most 25 ms before its connection is dropped — export work keeps
+line gets at most 50 ms before its connection is dropped — export work keeps
 the vast majority of every cycle. No TLS/auth — closed networks only. Ready
 alert rules:
 [`alerts/pg_logtap.rules.yml`](alerts/pg_logtap.rules.yml) (events lost, ring

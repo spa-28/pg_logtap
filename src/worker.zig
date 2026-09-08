@@ -1297,13 +1297,14 @@ fn serveOne(conn_fd: c_int) void {
     // TCP does not preserve the sender's write boundaries: a GET straddling
     // recvs parses as a wrong path and answers 404, so read to the end of the
     // request line (writeResponse parses only that first line). The socket is
-    // nonblocking (accept4 SOCK_NONBLOCK) — poll between recvs. 25ms: a
-    // loopback scraper's line lands in the first poll, and a client that
-    // connects and dribbles the request burns at most 25ms of the cycle's
-    // 250ms scrape budget before its connection is dropped (the budget, not
-    // this deadline, is the per-cycle cap on scraper overhead).
+    // nonblocking (accept4 SOCK_NONBLOCK) — poll between recvs. 50ms: a
+    // loopback scraper's line lands in the first poll, a legitimately laggy
+    // client gets its inter-fragment gap covered (e2e-metrics drives a 20ms
+    // one), and a client that connects and dribbles burns at most 50ms of
+    // the cycle's 250ms scrape budget before its connection is dropped (the
+    // budget, not this deadline, is the per-cycle cap on scraper overhead).
     var poll_fds = [1]net.pollfd{.{ .fd = conn_fd, .events = 1, .revents = 0 }}; // POLLIN
-    const deadline = pg.GetCurrentTimestamp() + 25_000; // µs
+    const deadline = pg.GetCurrentTimestamp() + 50_000; // µs
     var req_buf: [512]u8 = undefined;
     var got: usize = 0;
     while (got < req_buf.len) {

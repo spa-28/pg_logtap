@@ -132,11 +132,13 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   After a successful send that consumed the budget, the best-effort
   `close_notify` is skipped (the fd close is the backstop). e2e-tls phase
   10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
-- A metrics client that connects but dribbles its request line gets 25 ms
+- A metrics client that connects but dribbles its request line gets 50 ms
   (was 100 ms) before its connection is dropped — a loopback scraper's
-  line lands in the first poll, so the tightening costs nothing real and
-  quarters the per-cycle tax a broken scraper can levy; the 250 ms
-  per-cycle scrape budget still caps the total.
+  line lands in the first poll and a legitimately laggy client's
+  inter-fragment gap stays covered (e2e-metrics drives a 20 ms one), so
+  the tightening costs nothing real while halving the per-cycle tax a
+  broken scraper can levy; the 250 ms per-cycle scrape budget still caps
+  the total.
 
 ### Internal
 
