@@ -1,7 +1,8 @@
 //! Fallback file: compressed durable on-disk queue, replayed on recovery.
-//! When an http/tcp send fails and export_fallback_file is set, batches are
-//! appended here and drained to the receiver once it answers — the RAM
-//! backlog then only covers what parking cannot take.
+//! When an export send fails (any transport — http(s), tcp(s), file) and
+//! export_fallback_file is set, batches are appended here and drained to the
+//! receiver once it answers — the RAM backlog then only covers what parking
+//! cannot take.
 //! Internal framing, one batch per member: [8-byte magic][u32 LE len][gzip]…
 //! A crash mid-append leaves a torn tail member — detected by the short read,
 //! truncated, appends resume at the member boundary. A crash mid-replay loses
@@ -89,8 +90,15 @@ var guc_max_mb: c_int = 512;
 
 /// The fallback GUC pair, called from worker.init (one registration site).
 pub fn defineGucs() void {
-    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed http/tcp batches are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it. See docs/delivery.md.", null, &guc_file, "", pg.PGC_SIGHUP, 0, checkFile, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed export batches (any transport — http(s), tcp(s), file) are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it; a path equal to a file:// pg_logtap.export_url is rejected too (the NDJSON sink and the queue framing cannot share a file). See docs/delivery.md.", null, &guc_file, "", pg.PGC_SIGHUP, 0, checkFile, null, null);
     pg.DefineCustomIntVariable("pg_logtap.fallback_max_mb", "Size cap for the fallback queue file. When an append pushes the file past the cap it is compacted to the newest half (atomic rewrite), and the undelivered events dropped by that count into events_lost — the EventsLost alert is the signal that the outage outlasted the queue. 0 = unlimited (pre-0.3.0 behavior: an unattended outage fills the disk). A cap smaller than one member (~a hundred KB compressed) can only bound the file at member granularity.", null, &guc_max_mb, 512, 0, 1_048_576, pg.PGC_SIGHUP, 0, null, null, null);
+}
+
+/// Current pg_logtap.export_fallback_file value ("" while unset) — the
+/// export_url SET check reads it for the aliasing rule.
+pub fn fileGucRaw() []const u8 {
+    if (guc_file == null) return "";
+    return std.mem.span(@as([*:0]const u8, @ptrCast(guc_file)));
 }
 
 /// The queue's path buffers are 4096 bytes and compaction rewrites through
@@ -99,7 +107,8 @@ pub fn defineGucs() void {
 /// even name its temp. Reject the value at SET (the call path guc.c uses for
 /// both SET and ALTER SYSTEM; boot runs the default '' through here too, and
 /// empty is always accepted). Relative paths measure against the data
-/// directory, exactly as path() resolves them.
+/// directory, exactly as path() resolves them. A path aliasing a file://
+/// export_url is rejected the same way (rule on worker.fileUrlAliasesFallback).
 fn checkFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
@@ -107,6 +116,7 @@ fn checkFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callcon
     const raw_c = ptr.* orelse return true;
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
     if (raw.len == 0) return true;
+    if (worker.fileUrlAliasesFallback(worker.gucExportUrl(), raw)) return false;
     var resolved: []const u8 = raw;
     var tmp: [4096]u8 = undefined;
     if (raw[0] != '/') {
@@ -293,7 +303,7 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
         return .failed;
     }
     var durable = true;
-    if (sync and !fbDatasync(file_fd)) durable = false;
+    if (sync and !fbDatasync(file_fd, false)) durable = false;
     // Cap enforcement after the append: the member is on disk either way
     // (durability aside), and the compaction rewrite must never race a
     // lost one. A failed fdatasync above does not skip it either:
@@ -310,25 +320,37 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
 
 /// fdatasync with an edge-triggered WARNING: false = the pages are written
 /// but not durable (an OS crash loses them; postmaster death still does not).
-fn fbDatasync(file_fd: c_int) bool {
+/// `compaction` marks the rewrite temp's sync point — a landed compaction is
+/// one of the queue's documented durability points, so its failure belongs in
+/// fb_sync_failures too; only the message differs (the rewrite is abandoned
+/// and the original queue stands).
+fn fbDatasync(file_fd: c_int, compaction: bool) bool {
     if (c.fdatasync(file_fd) == 0) {
         fb_sync_warned = false;
         return true;
     }
     if (!fb_sync_warned) {
         fb_sync_warned = true;
-        elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): the queue's latest change is written but not durable", .{std.c._errno().*});
+        if (compaction) {
+            elog.Warning(@src(), "pg_logtap fallback compaction fdatasync failed (errno={d}): rewrite abandoned, the original queue stands — the disk cannot make the queue durable", .{std.c._errno().*});
+        } else {
+            elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): the queue's latest change is written but not durable", .{std.c._errno().*});
+        }
     }
     sync_failures += 1;
     return false;
 }
 
-/// Durability point for a cycle's deferred appends.
+/// Durability point for a cycle's deferred appends. Liveness ceiling, part of
+/// the contract: a sync that failed (or a deferred one never followed by a
+/// later append) is NOT retried on a timer — the next append, truncate or
+/// landing compaction provides the next sync point; until one does, the
+/// member sits in the documented OS-crash window that fb_sync_failures names.
 pub fn fsync() void {
     if (broken or path() == null) return;
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
-    _ = fbDatasync(file_fd);
+    _ = fbDatasync(file_fd, false);
 }
 
 /// One queued batch: decompressed NDJSON, the byte size at read time, and how
@@ -336,9 +358,14 @@ pub fn fsync() void {
 /// valid until the next nextMember.
 pub const Member = struct { body: []const u8, size: u64, advance: u64 };
 
-// Reused inflate state: the 32K window and the ~100K+ decompressed member
-// sit above glibc's mmap threshold — same story as the gzip pool.
-var fb_dec: ?struct { window: []u8, body: std.Io.Writer.Allocating } = null;
+// Reused inflate state: the 32K window and the ≤ member_max decompressed
+// member sit above glibc's mmap threshold — same story as the gzip pool.
+// The body buffer is FIXED at member_max, not an allocating writer: the
+// framing check bounds only the COMPRESSED length, and a small member can
+// inflate without limit (a decompression bomb) — the buffer itself is the
+// ceiling, and one that crosses it fails the write and is skipped below
+// exactly like a gzip-damaged one. ~5MB, allocated once on first replay.
+var fb_dec: ?struct { window: []u8, body_buf: []u8 } = null;
 
 /// Read the member at offset. null = nothing replayable right now (drained,
 /// torn tail truncated away, unreadable member skipped, or the file is not
@@ -383,36 +410,32 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
     defer alloc.free(comp);
     if (fb_dec == null) fb_dec = .{
         .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return null,
-        .body = .init(alloc),
+        .body_buf = alloc.alloc(u8, member_max) catch return null,
     };
     const dec_state = &fb_dec.?;
     var src: std.Io.Reader = .fixed(comp);
     var dec = std.compress.flate.Decompress.init(&src, .gzip, dec_state.window);
-    dec_state.body.writer.end = 0;
-    _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {
-        const skip_at = offset; // framing is intact: skip past, count as loss
-        offset += 4 + mlen;
-        lost += 1;
-        capture.noteWarn(.fallback_skipped);
-        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable, skipped", .{skip_at});
-        return null;
-    };
-    // buildBody admits the event that crosses body_cap, so a member this
-    // build writes is ≤ body_cap + one serialized event (≤ ring.max_message
-    // + overhead); the +64K on top also admits members from 0.3.x binaries
-    // (≤ ~371KB) read before an upgrade drains the queue. Compile-time max,
-    // not the live GUC: queued members can outlive a restart that lowers
-    // message_max. A byte bound, not a ratio: a wide repetitive body
-    // legitimately inflates past 64:1 and a ratio bound would flag it
-    // corrupt and lose it.
-    if (dec_state.body.writer.end > member_max) { // inflated absurdly: corrupt, skip
+    var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
+    // Overflow past member_max fails the write (WriteFailed) like gzip damage
+    // fails the stream — both mean "this member is not coming back whole";
+    // framing is intact, so skip past it and count the loss.
+    _ = dec.reader.streamRemaining(&body) catch {
         const skip_at = offset;
         offset += 4 + mlen;
         lost += 1;
-        elog.Log(@src(), "pg_logtap fallback member at offset {d} inflated past sanity, skipped", .{skip_at});
+        capture.noteWarn(.fallback_skipped);
+        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable (gzip damaged or inflates past the {d}-byte bound), skipped", .{ skip_at, member_max });
         return null;
-    }
-    return .{ .body = dec_state.body.writer.buffer[0..dec_state.body.writer.end], .size = size, .advance = 4 + @as(u64, mlen) };
+    };
+    // member_max itself: buildBody admits the event that crosses body_cap,
+    // so a member this build writes is ≤ body_cap + one serialized event
+    // (≤ ring.max_message + overhead); the +64K on top also admits members
+    // from 0.3.x binaries (≤ ~371KB) read before an upgrade drains the
+    // queue. Compile-time max, not the live GUC: queued members can outlive
+    // a restart that lowers message_max. A byte bound, not a ratio: a wide
+    // repetitive body legitimately inflates past 64:1 and a ratio bound
+    // would flag it corrupt and lose it.
+    return .{ .body = body.buffered(), .size = size, .advance = 4 + @as(u64, mlen) };
 }
 
 /// Queue fully delivered: zero it (the next append re-creates the magic) and
@@ -435,7 +458,7 @@ pub fn truncate() void {
     if (fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) return;
     if (c.ftruncate(file_fd, 0) == 0) {
         offset = 0;
-        _ = fbDatasync(file_fd);
+        _ = fbDatasync(file_fd, false);
     }
 }
 
@@ -511,20 +534,22 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
             if (fbPread(file_fd, comp, off + 4) != mlen) return;
             if (fb_dec == null) fb_dec = .{
                 .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return,
-                .body = .init(alloc),
+                .body_buf = alloc.alloc(u8, member_max) catch return,
             };
             const dec_state = &fb_dec.?;
             var src_reader: std.Io.Reader = .fixed(comp);
             var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
-            dec_state.body.writer.end = 0;
-            // a member that will not inflate has no countable events; replay
-            // counts it as one loss per member (nextMember's lost += 1)
-            // — match that here or events_lost undercounts the compaction drop
+            var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
+            // a member that will not inflate (or inflates past the fixed
+            // bound, the same bomb case nextMember skips) has no countable
+            // events; replay counts it as one loss per member (nextMember's
+            // lost += 1) — match that here or events_lost undercounts the
+            // compaction drop
             var readable = true;
-            _ = dec.reader.streamRemaining(&dec_state.body.writer) catch {
+            _ = dec.reader.streamRemaining(&body) catch {
                 readable = false;
             };
-            lost_events += if (readable) std.mem.countScalar(u8, dec_state.body.writer.buffer[0..dec_state.body.writer.end], '\n') else 1;
+            lost_events += if (readable) std.mem.countScalar(u8, body.buffered(), '\n') else 1;
         }
         off = end;
     }
@@ -568,7 +593,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
         copied_ok = worker.writeAll(tmp_fd, copy_buf[0..@intCast(got)], true);
         pos += @intCast(got);
     }
-    if (copied_ok) copied_ok = c.fdatasync(tmp_fd) == 0;
+    if (copied_ok) copied_ok = fbDatasync(tmp_fd, true);
     _ = c.close(tmp_fd);
     if (!copied_ok or c.rename(tmp_path, @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
         _ = c.unlink(tmp_path);

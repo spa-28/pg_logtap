@@ -88,6 +88,32 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
 - `export_tls_verify=off` logs one WARNING per worker life at the first
   TLS send — the documented development escape hatch now leaves an
   operator-visible trace in the server log.
+- A fallback member that inflates past the framing bound cannot grow the
+  worker's memory: the `member_max` check bounds only the compressed input,
+  so a small crafted member (a decompression bomb) could inflate into an
+  unbounded buffer before the post-inflate check ran. The inflate buffer is
+  fixed at `member_max` now — a member that crosses it fails the write and
+  is skipped as unreadable exactly like a gzip-damaged one (framing intact,
+  counted in `events_lost`, `fallback_broken` untouched), in replay and in
+  the compaction walk alike. ~5 MB allocated once on first replay.
+- A failed compaction `fdatasync` counts in `fb_sync_failures` and warns
+  like any other sync failure: a landed compaction is one of the queue's
+  documented durability points, so its failed sync belongs in the counter
+  (safety unchanged — the rewrite is abandoned, the original queue stands).
+- A `file://` export_url and `export_fallback_file` cannot resolve to the
+  same file: the NDJSON sink and the `PGLTFB01` framing corrupt each other.
+  Whichever GUC lands second is rejected at SET/`ALTER SYSTEM`. The docs
+  now state the fallback queue's scope for what it already was — every
+  transport parks there, `file://` included — and the same-reload
+  double-flip residual (the foreign-content latch handles that pair loudly).
+- The TLS handshake/close timeout multiple is a documented property, not a
+  silent one: `export_timeout_ms` is one absolute deadline per send attempt
+  enforced at the worker's stage boundaries, and the TLS library's internal
+  socket waits are bounded each, not as a whole — a dribbling TLS peer can
+  stretch the TLS stage to a small multiple of the timeout before the send
+  fails. After a successful send that consumed the budget, the best-effort
+  `close_notify` is skipped (the fd close is the backstop). GUC table,
+  delivery.md TLS section and the pinned-send math all say it now.
 
 ### Internal
 

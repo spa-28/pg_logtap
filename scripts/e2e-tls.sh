@@ -7,6 +7,9 @@
 #            (RAM backlog / fallback replay over TLS)
 #   phase 2b ca file exists but holds no certificates → handshake fails the
 #            same way (send_cycles_failed grows, nothing delivered)
+#   phase 2c the ca-cleared failure with the fallback file on → https parks
+#            on the queue like any transport and replays over TLS once the
+#            ca returns
 #   phase 3  tcps:// → raw NDJSON over TLS, no HTTP framing
 #   phase 4  verify=off → delivery continues, exactly one WARNING in the log
 #   phase 5  an impostor receiver presents a certificate carrying the RIGHT
@@ -300,6 +303,29 @@ gen p2bre "$N"
 wait_for p2bfail "$N" "$OUT"
 wait_for p2bre "$N" "$OUT"
 echo "phase 2b ok: empty-ca file failed $((FAILED2 - FAILED)) cycles, nothing delivered"
+
+# --- phase 2c: the same failure with the fallback file on — https parks on
+# the queue like any transport and replays over TLS once the CA returns
+FB_TLS=pglogtap-tlsfb.bin # PGDATA-relative, this suite's own queue
+PGD=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory")
+docker exec "$PG_CT" sh -c "rm -f '$PGD/$FB_TLS'"
+set_gucs "pg_logtap.export_fallback_file = '$FB_TLS'"
+set_gucs "pg_logtap.export_tls_ca = ''"
+gen p2cfail "$N"
+sleep 3
+FAILED2C=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
+[ "$FAILED2C" -gt "$FAILED2" ] 2>/dev/null || { echo "e2e-tls: phase 2c expected failed cycles with the ca cleared and the queue on, got $FAILED2C (was $FAILED2)"; exit 1; }
+[ "$(received p2cfail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2c leaked $(received p2cfail "$OUT") events through an unverified handshake"; exit 1; }
+qsz=$(docker exec "$PG_CT" stat -c %s "$PGD/$FB_TLS" 2>/dev/null || echo 0)
+[ "$qsz" -gt 8 ] || { echo "e2e-tls: phase 2c nothing parked on the fallback file ($qsz bytes — RAM backlog only?)"; exit 1; }
+set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
+gen p2cre "$N"
+wait_for p2cfail "$N" "$OUT"
+wait_for p2cre "$N" "$OUT"
+qsz=$(docker exec "$PG_CT" stat -c %s "$PGD/$FB_TLS" 2>/dev/null || echo 0)
+[ "$qsz" = 0 ] || { echo "e2e-tls: phase 2c queue not drained after replay ($qsz bytes left)"; exit 1; }
+set_gucs "pg_logtap.export_fallback_file = ''" # later failure phases stay RAM-only
+echo "phase 2c ok: https parked to the fallback file over failed handshakes, replayed $((2 * N))/$((2 * N)) over TLS after the CA returned"
 
 # --- phase 3: tcps, raw NDJSON over TLS
 set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TCPS'"

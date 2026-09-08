@@ -10,6 +10,9 @@
 #   fallback-sync-fail: queue fdatasync fails -> member stays (not durable),
 #                       no duplicate member, fb_sync_failures counts it, replay
 #                       delivers every event once
+#   compact-sync-fail  : the compaction temp's fdatasync fails -> rewrite
+#                       abandoned (queue whole, nothing lost) and counted in
+#                       fb_sync_failures; the cap lands once syncs heal
 #   dev-full          : file:///dev/full write fails mid-batch -> torn line
 #                       rolled back, events held in the RAM backlog, delivered
 #                       whole on the next receiver
@@ -125,12 +128,57 @@ bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logta
 [ "$bl" = 0 ] || fail "fallback sync-fail: queue_backlog=$bl after replay"
 ok "fb_sync_failures=$syncfails, 60/60 replayed once each, queue drained (queued was $q)"
 
+echo "== compaction temp: fdatasync fails -> rewrite abandoned, counted, cap still lands =="
+# A landed compaction is a durability point (its temp is fdatasynced before
+# the rename), so an EIO there must count in fb_sync_failures like any other
+# sync failure — while the safety shape stays: rewrite abandoned, original
+# queue stands, nothing lost, no temp litter; once the syncs heal, the cap
+# rewrite lands.
+docker restart "$CT" >/dev/null; wait_ready # fresh worker: the shim's per-process budget resets
+docker exec "$CT" sh -c "rm -f '$PGDATA_C/$FB_REL' '$PGDATA_C/$FB_REL.compact' /tmp/replay.log"
+set_target "$PGDATA_C/$FB_REL.compact"
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.fallback_max_mb 1; reload; sleep 2
+# ~1MB cap needs incompressible bulk. One md5 repeated is gzip candy (a
+# 4000-event burst parked as 181KB once); 32 INDEPENDENT md5s per event are
+# random hex ≈ 4 bits/char under gzip, so 4000 x ~512B ≈ 2MB really crosses.
+docker exec "$CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
+  WHILE i < 4000 LOOP
+    RAISE WARNING 'logtap fault cmp-$SUF % %', i, (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 32));
+    i := i + 1;
+  END LOOP; END \$\$" >/dev/null 2>&1
+sleep 4 # park, cross the cap, fail the temp syncs, then heal past the budget
+syncfails=$(statf fb_sync_failures)
+[ "$syncfails" -ge 1 ] 2>/dev/null || fail "compact sync-fail: fb_sync_failures=$syncfails — the temp fdatasync EIO was not counted"
+[ "$(statf fallback_broken)" = 0 ] || fail "compact sync-fail: fallback_broken=1 — the abandoned rewrite broke the queue"
+[ "$(docker exec "$CT" stat -c %s "$PGDATA_C/$FB_REL.compact" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "compact sync-fail: abandoned temp left behind"
+[ "$(statf events_compacted)" -ge 1 ] 2>/dev/null \
+  || fail "compact sync-fail: no compaction ever landed (events_compacted=0) — the cap cannot work after an EIO"
+# Replay what survived the cap: every delivered event exactly once.
+setguc pg_logtap.export_url 'file:///tmp/compact.log'; reload
+n=0; while [ "$n" -lt 15 ]; do
+  [ "$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$bl" = 0 ] || fail "compact sync-fail: queue_backlog=$bl after replay"
+got=$(sink_lines "cmp-$SUF" compact)
+[ "$got" -ge 500 ] 2>/dev/null || fail "compact sync-fail: only $got/4000 cmp events survived to replay — backlog=0 is vacuous"
+[ "$(sink_dups compact)" = 0 ] || fail "compact sync-fail: duplicate seqs after the EIO'd rewrites"
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512
+ok "temp fdatasync EIO counted (fb_sync_failures=$syncfails), queue whole, cap landed after healing, replay drained with 0 dups"
+
 echo "== /dev/full: write fails mid-batch -> torn line rolled back, held in RAM =="
+# Delta, not absolute zero: the compact scenario's landed caps counted their
+# trimmed events lost (legitimately — the outage outlasted the cap), and
+# this container's shmem still carries them.
+lost0=$(statf events_lost)
 docker exec "$CT" sh -c "rm -f /tmp/replay.log"
 setguc pg_logtap.export_fallback_file '' # no queue: the RAM backlog is the only hold
 setguc pg_logtap.export_url 'file:///dev/full'; reload; sleep 2
 gen "full1-$SUF" 20; sleep 3 # ENOSPC on every write; backlog accumulates
-[ "$(statf events_lost)" = 0 ] || fail "/dev/full: lost>0 without the queue"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "/dev/full: lost grew without the queue"
 [ "$(statf events_dropped)" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
 setguc pg_logtap.export_url 'file:///tmp/full.log'; reload; sleep 2
 n=0; while [ "$n" -lt 15 ]; do

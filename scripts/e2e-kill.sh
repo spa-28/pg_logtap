@@ -14,6 +14,12 @@
 #                        replay stays on
 #   corrupt-member     : a damaged gzip member mid-queue (framing intact) is
 #                        skipped and counted lost; later members still replay
+#   bomb-member        : a member under the compressed bound that inflates
+#                        far past it (gzip bomb) is skipped like a damaged
+#                        one; the worker's memory stays flat, later members
+#                        still replay
+#   url-fb-aliasing    : a file:// export_url and the fallback path naming
+#                        one file are rejected at SET, in both directions
 #   symlink-queue      : a symlink at the fallback path is refused — the file
 #                        it names stays intact, fallback_broken=1 + one
 #                        WARNING, events ride the RAM backlog
@@ -227,6 +233,119 @@ fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 [ "$fb_sz" = 0 ] || fail "corrupt member: queue not truncated after replay ($fb_sz bytes left)"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "$nhits damaged member(s) skipped (lost=$(statf events_lost)), A/B/C replayed 30/30, framing held"
+
+echo "== decompression-bomb member: inflate bounded, member skipped not inflated =="
+# A member whose COMPRESSED length passes the framing bound but which
+# inflates far past member_max: the fixed inflate buffer is the ceiling —
+# the member is skipped as unreadable exactly like a damaged one, the
+# worker's memory stays flat, and later members replay. An unbounded
+# inflate would have taken 512MB of RSS before a post-hoc size check.
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+gen bombX 10; sleep 1; gen bombA 10; sleep 2
+# The bomb: 512MB of zeros gzip-9s to well under the ~5.2MB framing bound
+# and inflates a hundredfold past it. Built in-container — dd and gzip are
+# the same tools the walk above uses.
+docker exec "$PG_CT" sh -c "dd if=/dev/zero bs=1048576 count=512 2>/dev/null | gzip -9 -c > /tmp/bomb.gz"
+blen=$(docker exec "$PG_CT" stat -c %s /tmp/bomb.gz)
+[ "$blen" -lt 5000000 ] 2>/dev/null || fail "bomb member: compressed $blen not under the framing bound — scenario broken"
+# Replace every bombX member's gzip payload with the bomb (framing [len]
+# rewritten to the bomb's length) — same walk as the corrupt-member phase.
+sz=$(docker exec "$PG_CT" stat -c %s "$FB")
+off=8; segs=""; nb=0
+while [ "$off" -lt "$sz" ]; do
+  len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
+  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "bomb member: framing unreadable at $off (len='$len')"
+  end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "bomb member: torn member at $off (end=$end sz=$sz)"
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
+  case "$body" in
+    *"logtap kill bombX"*) segs="$segs $off:$end"; nb=$((nb + 1)) ;;
+  esac
+  off=$end
+done
+[ "$nb" -ge 1 ] || fail "bomb member: no bombX member found in the queue"
+# Splice in ONE docker exec ending in an atomic mv: a worker cycle landing
+# mid-rebuild sees either the old or the new file, never a torn one.
+b0=$((blen & 255)); b1=$(((blen >> 8) & 255)); b2=$(((blen >> 16) & 255)); b3=$(((blen >> 24) & 255))
+lesc=$(printf '\\%03o\\%03o\\%03o\\%03o' "$b0" "$b1" "$b2" "$b3")
+docker exec "$PG_CT" sh -c "
+  : > /tmp/fb.new
+  prev=0
+  for s in $segs; do
+    o=\${s%:*}; e=\${s#*:}
+    tail -c +\$((prev + 1)) '$FB' | head -c \$((o - prev)) >> /tmp/fb.new
+    printf '$lesc' >> /tmp/fb.new
+    cat /tmp/bomb.gz >> /tmp/fb.new
+    prev=\$e
+  done
+  tail -c +\$((prev + 1)) '$FB' >> /tmp/fb.new
+  mv /tmp/fb.new '$FB'; rm -f /tmp/bomb.gz
+"
+docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
+sleep 2 # the boot queue walk hits the bomb here — this is the bounded-inflate moment
+hwm=$(docker exec "$PG_CT" cat "/proc/$(worker_pid)/status" 2>/dev/null | awk '/^VmHWM/{print $2}')
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for bombA 10
+[ "$(received bombA)" = 10 ] || fail "bomb member: later members not replayed (bombA=$(received bombA)/10)"
+[ "$(received bombX)" = 0 ] || fail "bomb member: bomb content delivered?? (bombX=$(received bombX))"
+# Fresh shmem at the restart, so absolutes: one loss per bomb member (the
+# member, not its events), two skips per member (boot walk + drain), and
+# the skip must never escalate to a framing error.
+[ "$(statf events_lost)" = "$nb" ] || fail "bomb member: events_lost=$(statf events_lost), want $nb"
+[ "$(statf warn_fallback_skipped)" = $((2 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((2 * nb))"
+[ "$(statf fallback_broken)" = 0 ] || fail "bomb member: overflow escalated to a framing error"
+fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
+[ "$fb_sz" = 0 ] || fail "bomb member: queue not truncated after replay ($fb_sz bytes left)"
+[ -n "$hwm" ] && [ "$hwm" -lt 200000 ] 2>/dev/null \
+  || fail "bomb member: worker peak RSS ${hwm:-unreadable}kB — the 512MB bomb was inflated, not bounded"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "$nb bomb member(s) skipped, worker peak RSS ${hwm}kB bounded, bombA replayed 10/10"
+
+echo "== file:// url == fallback path: the pair is rejected at SET =="
+# The NDJSON sink and the PGLTFB01 queue framing cannot share a file; the
+# SET-time check rejects whichever GUC lands second. A reload between the
+# two ALTER SYSTEMs is load-bearing: the check hook in a fresh session
+# reads the peer GUC as the postmaster last parsed it, and ALTER SYSTEM
+# alone applies the value nowhere — without the reload the hook would still
+# see the old url and wave the pair through. Throwaway paths throughout:
+# while url=file:// is live the worker writes NDJSON there (no fallback is
+# set at that point, so no queue ever sees it), and all values are restored
+# at the end.
+al=/tmp/logtap-alias.bin
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'file://$al'" >/dev/null
+reload; sleep 2
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_fallback_file = '$al'" 2>&1)
+echo "$out" | grep -q ERROR || fail "aliasing: fallback='$al' accepted with url=file://$al"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_fallback_file")" = "" ] \
+  || fail "aliasing: rejected ALTER SYSTEM still changed the fallback GUC"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" >/dev/null
+reload; sleep 2
+# the other direction: fallback first (accepted — the url is http), then
+# the file:// url naming the same file
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = '$al'" >/dev/null
+reload; sleep 2
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = 'file://$al'" 2>&1)
+echo "$out" | grep -q ERROR || fail "aliasing: url=file://$al accepted with fallback='$al'"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = ''" >/dev/null
+reload; sleep 2
+# control: a DIFFERENT fallback path under a file:// url is fine — the
+# rejection is the aliasing, not file:// itself. The fallback is loaded
+# first so the check hook really sees it (same postmaster-parse rule), and
+# the SHOW after the reload proves the pair landed.
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = '/tmp/logtap-other.bin'" >/dev/null
+reload; sleep 2
+out3=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = 'file:///tmp/logtap-other2.bin'" 2>&1)
+echo "$out3" | grep -q ERROR && fail "aliasing: distinct file:// url + fallback rejected — the check overfires"
+reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "file:///tmp/logtap-other2.bin" ] \
+  || fail "aliasing: control pair not accepted"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" >/dev/null
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = ''" >/dev/null
+reload; sleep 2
+docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url" | grep -q "http://$VEC:8686" \
+  || fail "aliasing: rejected ALTER SYSTEM still changed the url GUC"
+ok "file:// url == fallback path rejected in both directions, a distinct pair accepted"
 
 echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # Anything able to write to the data directory must not be able to aim the

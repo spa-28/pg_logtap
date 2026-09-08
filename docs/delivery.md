@@ -51,7 +51,16 @@ duplicate windows, encrypted with TLS 1.2/1.3 (std.crypto.tls; client
 certificates / mTLS are not supported). One handshake per batch, inside the
 existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
 handshake is an ordinary failed send — the batch parks on the fallback file
-/ RAM backlog and retries. Three SIGHUP GUCs control verification:
+/ RAM backlog and retries. One timeout caveat, inherited from the TLS
+library: the handshake (and the best-effort `close_notify` after a send)
+runs several socket waits internally, each bounded by `export_timeout_ms`,
+while the absolute per-attempt deadline is enforced at the worker's stage
+boundaries around it — a peer dribbling handshake fragments can stretch the
+TLS stage to a small multiple of `export_timeout_ms` before the send fails.
+When a send has already consumed the budget, the worker skips its
+`close_notify` (the fd close is the backstop) rather than pay further
+socket waits on an already-successful send. Three SIGHUP GUCs control
+verification:
 
 - `export_tls_ca` — PEM file with the CA to verify the receiver against
   (for a self-signed receiver, the receiver's own certificate). Empty = the
@@ -136,8 +145,10 @@ already delivered.
 ### Worker pinned in one send
 
 While the worker sits in a single blocked send — up to `export_timeout_ms`
-against a receiver that accepted the connection but never answers — backends
-keep capturing, and only the ring absorbs it. Capture drops start when
+against a receiver that accepted the connection but never answers (the TLS
+handshake/close can stretch this to a small multiple — TLS section) —
+backends keep capturing, and only the ring absorbs it. Capture drops start
+when
 
 ```
 r × export_timeout_ms > ring_capacity        (events/s × s > events)
@@ -219,7 +230,8 @@ convention), so the file lives with your data by default; an absolute path
 works too. Keep it there — not in `/tmp` or `/var/log`: it is the durable copy
 and must survive reboots and log cleanup.
 
-When an `http://`/`tcp://` send fails and the path is set, the batch is
+When a send fails — any transport, `http(s)://`, `tcp(s)://`, `file://` — and
+the path is set, the batch is
 appended to the queue — one **gzip member per batch** behind a length framing
 (`PGLTFB01` magic, 0600, fdatasynced once per flush cycle) — and counted as
 `events_queued` (a lifecycle stage, not a durability claim — `fb_sync_failures`
@@ -252,6 +264,21 @@ shared volume): both writers share the framing magic, and their interleaved
 appends tear each other's members — both queues then read as corrupt and
 disable themselves. One file per cluster; `cluster_name` keeps the events
 apart downstream.
+
+A `file://` export_url and the fallback queue must not share one file either:
+the sink expects raw NDJSON, the queue `PGLTFB01` framing — each corrupts the
+other's format. Whichever GUC lands second on the pair is rejected at
+SET/`ALTER SYSTEM` time. One residual: flipping both GUCs in a single reload
+lands the pair together (each check sees the other's old value), and the
+queue's own foreign-content latch then degrades it loudly
+(`fallback_broken=1`, RAM-backlog bound) — never silent corruption.
+
+Durability liveness, part of the contract: a failed `fdatasync` (or a
+deferred one never followed by a later append) is not retried on a timer —
+the next append, truncate or landing compaction provides the next sync
+point, and until one does the affected member sits in the OS-crash window
+that `fb_sync_failures` names. Events replay throughout either way; only
+crash-durability is at stake.
 
 ### Size cap: `fallback_max_mb`
 

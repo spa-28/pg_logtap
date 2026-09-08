@@ -129,7 +129,7 @@ pub fn compactAborted() bool {
 }
 
 pub fn init() void {
-    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | tcp://host:port | file:///path; empty = no export worker (restart applies).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
@@ -138,7 +138,7 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path. Enforced as one absolute deadline per send attempt at the worker's stage boundaries; the one exception is the TLS handshake/close, which runs several socket waits inside the TLS library — a peer dribbling handshake fragments can stretch that stage to a small multiple of this before the send fails.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
@@ -571,6 +571,38 @@ fn warnUrlOnce(url: []const u8) void {
     elog.Log(@src(), "pg_logtap.export_url unparseable, export disabled until fixed: {s}", .{url});
 }
 
+/// Current pg_logtap.export_url value ("" while unset) — the fallback GUC's
+/// SET check reads it for the aliasing rule below.
+pub fn gucExportUrl() []const u8 {
+    return gucSpan(guc_export_url);
+}
+
+/// True when a file:// export_url and the fallback GUC value resolve to the
+/// same file — the NDJSON sink and the PGLTFB01 queue framing must not share
+/// one (each corrupts the other's format; whichever opens second sees foreign
+/// content). Rejected at SET of either GUC, so whichever lands second loses.
+pub fn fileUrlAliasesFallback(url: []const u8, fb_raw: []const u8) bool {
+    if (fb_raw.len == 0) return false;
+    const dest_v = dest_mod.parseUrl(url) orelse return false;
+    if (dest_v != .file) return false;
+    if (fb_raw[0] == '/') return std.mem.eql(u8, fb_raw, dest_v.file);
+    const dd_c = pg.DataDir orelse return false; // relative fallback → data dir, as fb.path resolves it
+    const dd = std.mem.span(@as([*:0]const u8, @ptrCast(dd_c)));
+    var buf: [4096]u8 = undefined;
+    const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dd, fb_raw }) catch return false;
+    return std.mem.eql(u8, full, dest_v.file);
+}
+
+/// SET-time aliasing check for export_url (rule on fileUrlAliasesFallback):
+/// guc.c runs this for SET and ALTER SYSTEM; boot runs '' through here too.
+fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    return !fileUrlAliasesFallback(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))), fbq.fileGucRaw());
+}
+
 // --- source identity (multi-host → one Vector): stamped into every event ------
 
 // Owned copies behind jsonl.source_*: refreshSourceId re-runs on every
@@ -819,7 +851,10 @@ fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) b
         got += nread;
     }
     if (!status2xx(status_buf[0..got])) return false;
-    tls_conn.end();
+    // close_notify is best-effort; with the attempt budget spent, skipping it
+    // beats paying up to two more socket waits after an already-successful
+    // send — the fd close is the backstop, as on the failed-send path.
+    if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end();
     return true;
 }
 
@@ -832,7 +867,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
     if (ep.tls) {
         const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts()) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;
-        tls_conn.end();
+        if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end(); // best-effort close_notify, skipped when the budget is spent
         return true;
     }
     if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
