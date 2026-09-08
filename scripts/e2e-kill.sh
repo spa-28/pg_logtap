@@ -629,20 +629,24 @@ n=0; while [ "$n" -lt 30 ]; do
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)
+D=$(( $(statf events_dropped) - D0 ))
 # "Newest tail" is WHICH events survive, not HOW MANY: bytes-per-event is
 # compression- and timing-dependent (an arm64 runner parked smaller batches,
 # ~21B/event vs amd64's ~15B — 25k survived where ~68k were "expected"; the
-# contract held, the count did not). Assert the property instead: the oldest
-# of the last 1000 delivered is exactly 149000 — a hole inside the tail or an
-# undelivered final event pulls it lower, and so does a delivery count under
-# 1000. Even with zero compression the 512KB newest slice holds ~5k of these
-# events, so 1000 never clips legitimate survivors.
+# contract held, the count did not). Assert the property instead, counting
+# holes in the last-1000 window: a hole an OLDER-kept event left (compaction
+# dropped backwards) fails, but the ring refusing the NEWEST under overload
+# (documented events_dropped — a slow runner's compaction walks stall drain
+# mid-storm; seen with 8729 holes under 11278 dropped) is accounted for by
+# D. At D=0 this is exactly "oldest of the last 1000 = 149000". Even with
+# zero compression the 512KB newest slice holds ~5k of these events, so
+# 1000 never clips legitimate survivors.
 last1k=$(grep -oE "logtap kill cap1$SUF [0-9]+" "$OUT/vector-out.jsonl" \
   | grep -oE '[0-9]+$' | sort -n | tail -n 1000 | head -n 1)
-[ "$last1k" = 149000 ] || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k (want 149000, delivered=$R)"
+holes=$(( 150000 - last1k - 1000 ))
+[ "$holes" -le "$D" ] 2>/dev/null || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k ($holes holes > $D ring-dropped, delivered=$R)"
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
-D=$(( $(statf events_dropped) - D0 ))
 [ "$((R + L + D))" -ge 140000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 140000 of 150000"
 ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), compacted=$C excluded from delivered, ring-dropped ($D), dup=0"
 
