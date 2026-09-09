@@ -18,22 +18,25 @@ pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Sta
 
     var body_buf: [body_cap]u8 = undefined;
     var body_w = std.Io.Writer.fixed(&body_buf);
-    var is_ok = true;
+    var status: u32 = 200;
+    var reason: []const u8 = "OK";
     if (!std.mem.eql(u8, method, "GET")) {
-        is_ok = false;
+        status = 405;
+        reason = "Method Not Allowed";
         try body_w.writeAll("method not allowed\n");
     } else if (std.mem.eql(u8, path, "/healthz")) {
         try body_w.writeAll("ok\n");
     } else if (std.mem.eql(u8, path, "/metrics")) {
         try writeBody(&body_w, snap);
     } else {
-        is_ok = false;
+        status = 404;
+        reason = "Not Found";
         try body_w.writeAll("not found\n");
     }
 
     try w.print("HTTP/1.1 {d} {s}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
-        @as(u32, if (is_ok) 200 else 404),
-        if (is_ok) "OK" else "Not Found",
+        status,
+        reason,
         body_w.buffered().len,
     });
     try w.writeAll(body_w.buffered());
@@ -186,4 +189,7 @@ test "healthz and unknown path" {
     var w404 = std.Io.Writer.fixed(&wbuf);
     try writeResponse(&w404, "GET /nope HTTP/1.1", snap);
     try std.testing.expect(std.mem.startsWith(u8, w404.buffered(), "HTTP/1.1 404 Not Found"));
+    var w405 = std.Io.Writer.fixed(&wbuf);
+    try writeResponse(&w405, "POST /metrics HTTP/1.1", snap);
+    try std.testing.expect(std.mem.startsWith(u8, w405.buffered(), "HTTP/1.1 405 Method Not Allowed"));
 }

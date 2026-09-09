@@ -136,7 +136,10 @@ const DeadlineReader = struct {
             return false;
         }
         const sock_tv = std.posix.timeval{ .sec = @divTrunc(remain_us, 1_000_000), .usec = @mod(remain_us, 1_000_000) };
-        std.posix.setsockopt(self.sock_fd, 1, 20, std.mem.asBytes(&sock_tv)) catch return false; // SOL_SOCKET, SO_RCVTIMEO
+        std.posix.setsockopt(self.sock_fd, 1, 20, std.mem.asBytes(&sock_tv)) catch |e| { // SOL_SOCKET, SO_RCVTIMEO
+            fail("tls setsockopt SO_RCVTIMEO: {s}", .{@errorName(e)});
+            return false;
+        };
         return true;
     }
 

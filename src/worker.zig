@@ -1170,6 +1170,11 @@ comptime {
     // misbehaving 32-bit build, refuse it.
     if (@sizeOf(usize) != 8)
         @compileError("pg_logtap's worker assumes a 64-bit platform (timeval layout, raw O_ flags); not built or tested for 32-bit");
+    // FileStat below is the asm-generic LP64 struct stat layout, not a
+    // per-OS translation — the inode-alias checks would read garbage fields
+    // anywhere but Linux.
+    if (@import("builtin").os.tag != .linux)
+        @compileError("pg_logtap's worker assumes Linux (raw syscall structs, O_ flag numbers); not built or tested elsewhere");
 }
 
 /// Remember why the last send failed; surfaces in the transition log line.
@@ -1233,12 +1238,15 @@ var metrics_open_addr: []const u8 = "";
 /// (Re)open the listening socket when port or address changed (SIGHUP).
 fn syncMetricsListener() void {
     const addr = if (guc_metrics_addr == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(guc_metrics_addr)));
-    if (metrics_open_port == guc_metrics_port and std.mem.eql(u8, metrics_open_addr, addr)) return;
+    // An overlong address can never listen (listenOn rejects it), so it
+    // compares as "": storing the GUC slice itself would leave a dangling
+    // pointer after the next reload frees that memory.
+    if (metrics_open_port == guc_metrics_port and std.mem.eql(u8, metrics_open_addr, if (addr.len > metrics_open_addr_buf.len) "" else addr)) return;
     metrics_open_port = guc_metrics_port;
     if (addr.len <= metrics_open_addr_buf.len) {
         @memcpy(metrics_open_addr_buf[0..addr.len], addr);
         metrics_open_addr = metrics_open_addr_buf[0..addr.len];
-    } else metrics_open_addr = addr; // overlong: listenOn will reject it anyway
+    } else metrics_open_addr = ""; // overlong: listenOn will reject it anyway
     if (metrics_fd >= 0) {
         _ = c.close(metrics_fd);
         metrics_fd = -1;

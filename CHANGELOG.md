@@ -53,6 +53,19 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   it); until the hop runs, the 0.4.x view keeps working —
   `jsonb_populate_record` ignores the new fields.
 
+### Fixed
+
+- `/metrics` answers `405 Method Not Allowed` (same body) to a non-GET
+  request instead of a misleading `404 Not Found`.
+- A `metrics_addr` longer than the listener's address buffer kept a slice
+  pointing into the GUC's own string storage, which the next reload frees —
+  the later comparison read freed memory. An overlong address compares as
+  an always-unlistenable empty one now (`listenOn` rejects it either way,
+  and the periodic re-listen attempts no longer log).
+- A `setsockopt` failure while arming the TLS read deadline was silent: the
+  send failed with an empty or previous-attempt reason in the transition
+  log; it names itself now.
+
 ### Hardening
 
 - A `file://` rollback after a failed `fdatasync` is synced too: the failed
@@ -134,6 +147,11 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   After a successful send that consumed the budget, the best-effort
   `close_notify` is skipped (the fd close is the backstop). e2e-tls phase
   10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
+- The network `export_url` schemes reject a host or path carrying a control
+  byte, a raw space or DEL at SET: both ride the HTTP request line verbatim,
+  so such a value could split or smuggle the request line on every send —
+  an unparseable URL fails loudly instead. `file://` paths are local
+  filenames and keep spaces.
 - The plain `http://`/`tcp://` body write checks the send attempt's
   absolute deadline between syscalls, like every other stage: each partial
   write resets the socket's per-write wait, so a receiver accepting one
@@ -197,6 +215,19 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   receiver side — the 1.2 half of the documented TLS 1.2/1.3 support is
   acceptance-tested instead of implied by the 1.3 passes (Zig's client
   offers both).
+- e2e-tls phase 13, the write-side dribbler on plain http: a receiver with a
+  tiny receive buffer draining one byte per second — every body-write
+  syscall succeeds inside its per-write `SO_SNDTIMEO` (a partial write
+  resets the wait), so the phase proves the between-syscall absolute
+  deadline is what fails the send; the body replays whole once repointed.
+  The write-side twin of phase 10's handshake dribbler.
+- Docs: the DNS last-known-good window is stated as hard 60 s (only a dial
+  after a fresh resolution refreshes it — the cached-address dial does
+  not), `export_tls_ca` is documented as local-disk (the per-handshake read
+  sits in the send path), the `file://` sink's single-writer assumption is
+  spelled out, and the README states the IPv6-literal stance next to the
+  export_url schemes. The worker also refuses to compile off-Linux now —
+  the raw syscall structs are asm-generic Linux layouts.
 - The DNS last-known-good address has explicit semantics, documented with
   the `export_url` schemes: it is used only while in-process resolution
   fails, only for the host that produced it, and only within 60 s of the

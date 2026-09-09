@@ -113,7 +113,7 @@ GUCs and restart again.
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
 | `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
 | `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
-| `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. The receiver may present leaf+intermediate — pin the root (or the intermediate itself); the file may hold several certs. |
+| `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. Keep it on local disk — the read sits inside the send attempt, and a hung network filesystem would stall the worker outside every timeout. The receiver may present leaf+intermediate — pin the root (or the intermediate itself); the file may hold several certs. |
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
 | `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
@@ -320,11 +320,17 @@ On top of that, the operational knobs:
 
 `export_url` schemes (gzip applies to the `http(s)://` schemes):
 
-- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it. When resolution fails in-process, the last address a dial actually reached is retried for up to 60 s (same host only; a later successful dial refreshes it) — emergency delivery through a wedged resolver, not a cache: with `https://`/`tcps://` a stale address that no longer serves the host fails certificate verification, with `http://`/`tcp://` a reassigned IP can receive logs for at most that 60 s window;
+- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it. When resolution fails in-process, the last address a dial actually reached is retried for up to 60 s (same host only; only a dial after a fresh, working resolution refreshes the window — the cached-address dial itself does not, so the 60 s bound is hard) — emergency delivery through a wedged resolver, not a cache: with `https://`/`tcps://` a stale address that no longer serves the host fails certificate verification, with `http://`/`tcp://` a reassigned IP can receive logs for at most that 60 s window;
 - `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_extra_headers` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
 - `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
 - `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
+
+IPv6 literal hosts (`https://[::1]:9428`) are not parsed in any network
+scheme — use a hostname or an IPv4 literal (bracket parsing is on the
+roadmap: `docs/TODO.md`). The host and path of a network scheme must be
+plain visible ASCII: a control byte or a space fails `SET` outright (both
+would malform the request line).
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
 (`Content-Encoding: gzip`) — same NDJSON after decompression, just less

@@ -31,7 +31,10 @@ line** mid-batch — the receiver's codec must tolerate or resync (a
 length-delimited codec does; a strict line parser will not). `file://`:
 the rollback above makes the file whole batches only — a receiver
 reading it concurrently may see a batch disappear for the length of
-the retry, then reappear complete.
+the retry, then reappear complete. The sink also assumes a single
+writer: the rollback truncates to the last full batch boundary, so
+another process appending concurrently loses whatever it landed after
+that point — keep the file pg_logtap's own.
 
 Measured end-to-end (v0.3.0, pg_logtap → Vector http → VictoriaLogs
 jsonline insert, docker stand, warning-size lines): a 1000-event batch
@@ -73,7 +76,9 @@ control verification:
 - `export_tls_ca` — PEM file with the CA to verify the receiver against
   (for a self-signed receiver, the receiver's own certificate). Empty = the
   system CA roots; a set file **replaces** them. The file is re-read before
-  every handshake, so certificate rotation needs no restart. Intermediate
+  every handshake, so certificate rotation needs no restart. Keep it on
+  local disk: the read sits inside the send attempt, and a hung network
+  filesystem would stall the worker outside every timeout. Intermediate
   chains are the normal PKI shape: the receiver presents leaf+intermediate
   and you pin the **root** — the path is built through the server-sent
   intermediate; pinning the intermediate itself works too, and the file may

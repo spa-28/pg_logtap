@@ -71,7 +71,20 @@ pub fn parseUrl(url: []const u8) ?Dest {
     return null;
 }
 
+/// The host and path of a network scheme ride the HTTP request line verbatim
+/// (or into getaddrinfo/dial for tcp), so a control byte or a space could
+/// split or smuggle the request — reject such a value at parse, where it
+/// fails SET loudly instead of corrupting every send. file:// paths are
+/// local filenames and keep spaces.
+fn cleanAscii(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch <= 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
 fn parseHttp(rest: []const u8, tls: bool) ?Dest {
+    if (!cleanAscii(rest)) return null;
     const slash = std.mem.findScalar(u8, rest, '/');
     const hostport = if (slash) |i| rest[0..i] else rest;
     const path = if (slash) |i| rest[i..] else "/";
@@ -80,6 +93,7 @@ fn parseHttp(rest: []const u8, tls: bool) ?Dest {
 }
 
 fn parseEndpoint(hostport: []const u8) ?Endpoint {
+    if (!cleanAscii(hostport)) return null;
     const colon = std.mem.findScalarLast(u8, hostport, ':') orelse return null;
     const host = hostport[0..colon];
     if (host.len == 0 or std.mem.findScalar(u8, host, ':') != null) return null; // IPv6 / garbage
@@ -123,6 +137,16 @@ test "reject garbage" {
     try std.testing.expect(parseUrl("file://relative") == null);
     try std.testing.expect(parseUrl("http://:80/x") == null);
     try std.testing.expect(parseUrl("") == null);
+}
+
+test "reject control bytes and spaces in network schemes" {
+    try std.testing.expect(parseUrl("http://v:8686/insert\r\nX-Evil: 1") == null); // request-line split
+    try std.testing.expect(parseUrl("http://v:8686/a\x00b") == null);
+    try std.testing.expect(parseUrl("http://v:8686/a b") == null); // space in the path
+    try std.testing.expect(parseUrl("http://ba d:8686/") == null); // space in the host
+    try std.testing.expect(parseUrl("tcp://h:9999\n") == null);
+    // file:// paths are local filenames: a space stays legal there.
+    try std.testing.expectEqualStrings("/tmp/my logs.jsonl", parseUrl("file:///tmp/my logs.jsonl").?.file);
 }
 
 test "export_http_extra_headers CR/LF discipline" {
