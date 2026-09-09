@@ -868,8 +868,8 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
     if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
-    if (!writeAll(conn_fd, head.buffered(), true)) return failSend("write head", std.c._errno().*);
-    if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
+    if (!writeAll(conn_fd, head.buffered(), true, net_deadline_us)) return failSend("write head", std.c._errno().*);
+    if (!writeAll(conn_fd, body, true, net_deadline_us)) return failSend("write body", std.c._errno().*);
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
     // TCP does not preserve write boundaries: the line may straddle recvs, and
     // a false failure here retries a body the receiver already accepted (a
@@ -933,7 +933,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
         if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end(); // best-effort close_notify, skipped when the budget is spent
         return true;
     }
-    if (!writeAll(conn_fd, body, true)) return failSend("write body", std.c._errno().*);
+    if (!writeAll(conn_fd, body, true, net_deadline_us)) return failSend("write body", std.c._errno().*);
     return true;
 }
 
@@ -966,7 +966,7 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         }
         return false;
     }
-    if (!writeAll(conn_fd, body, false)) {
+    if (!writeAll(conn_fd, body, false, null)) {
         // A partial write (ENOSPC mid-batch) leaves a torn line in the
         // sink's NDJSON stream forever; with O_APPEND a plain retry would
         // append the whole batch AGAIN after the torn prefix. Roll back to
@@ -1183,15 +1183,22 @@ var fail_reason: []const u8 = "";
 
 /// Blocking full write over a socket or regular-file fd; fbq.zig's appends
 /// and compaction go through here too.
-pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool) bool {
+pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?i64) bool {
     var off: usize = 0;
     while (off < buf.len) {
         // The abort check runs between syscalls: SO_SNDTIMEO bounds ONE
         // write, so a dribbling receiver otherwise makes this loop unbounded
-        // during the shutdown flush. Socket sends only — a local file write
-        // (fallback queue, file:// destination) is bounded by disk speed, and
-        // exactly those writes carry the parked backlog through shutdown.
-        if (abortable and sendAborted()) return false;
+        // during the shutdown flush. A send attempt also passes its absolute
+        // deadline — each partial write resets the socket's per-syscall wait,
+        // so a receiver taking one byte per just-under-timeout interval could
+        // stretch one body across many individually-bounded waits otherwise.
+        // The deadline is an explicit argument, never the global: callers
+        // outside a send attempt (compaction copy, metrics replies) are
+        // abort-aware but must not measure against a stale one. Socket sends
+        // only — a local file write (fallback queue, file:// destination) is
+        // bounded by disk speed, and exactly those writes carry the parked
+        // backlog through shutdown.
+        if (abortable and (sendAborted() or (deadline_us != null and pg.GetCurrentTimestamp() >= deadline_us.?))) return false;
         // write(2): works for both sockets and regular files (send does not).
         const count = net.write(conn_fd, buf.ptr + off, buf.len - off);
         if (count > 0) {
@@ -1321,7 +1328,7 @@ fn serveOne(conn_fd: c_int) void {
     var resp_buf: [metrics.body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
     metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
-    _ = writeAll(conn_fd, resp_w.buffered(), true);
+    _ = writeAll(conn_fd, resp_w.buffered(), true, null);
 }
 
 // --- signals -------------------------------------------------------------------

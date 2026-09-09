@@ -56,10 +56,16 @@ absolute deadline is re-armed before **every** socket read inside the
 handshake and the session after it, so a peer dribbling one TLS fragment
 per just-under-timeout interval cannot stretch the stage — each fragment
 costs only what is left of the budget, and once it is spent the send fails.
-The residual multiple is on the **write** side only: a stage with several
-TLS writes (the body chunks, and the best-effort `close_notify`) can
-stretch to a small multiple when the peer stops reading, each write bounded
-by `export_timeout_ms`. When a send has already consumed the budget, the
+The residual multiple is on the **write** side only, and it is a constant,
+not a function of batch size: the body goes out in 64 KB chunks, each chunk
+re-armed to the remaining budget before its records are written, and a
+64 KB chunk is ~4 TLS records — each socket write waits at most the value
+armed at the chunk's start, so a peer that stops reading stretches the
+write stage to at most ~4–5 × `export_timeout_ms` before the next chunk
+boundary finds the budget spent and fails the send. The plain
+`http://`/`tcp://` body write checks the same deadline between its write
+syscalls (each partial write would otherwise reset the per-write wait).
+When a send has already consumed the budget, the
 worker skips its `close_notify` (the fd close is the backstop) rather than
 pay further socket waits on an already-successful send. Three SIGHUP GUCs
 control verification:
@@ -162,6 +168,15 @@ cut `export_timeout_ms` to a few hundred ms. This is the structural reason a
 mute-but-accepting receiver is the worst case for capture, worse than a dead
 one (connection refused fails in milliseconds and the batch parks on the
 fallback file).
+
+The same arithmetic must cover the worker's longest **local** stall, not
+just the send: a `fallback_max_mb` compaction during an outage storm (the
+member walk plus the cap/2 copy) runs inside flush cycles, and on a slow
+disk it can hold drain for seconds — a 150k-event storm against a 1 MB cap
+was seen stalling drain past an 8192 ring on a CI runner (11k newest events
+refused at capture, accounted in `events_dropped`). When the cap is hit
+regularly on long outages, size `ring_capacity` for capture rate × (send
+timeout + the worst compaction walk), not for the send timeout alone.
 
 ### Receiver down for T minutes
 

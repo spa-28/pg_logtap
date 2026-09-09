@@ -40,6 +40,10 @@
 #            across reloads, two rounds of verified → cleared-ca fail →
 #            root-pinned chain → name-mismatch fail — the per-handshake
 #            bundle rebuild must land the right decision every time
+#   phase 12 a receiver pinned to TLS 1.2 ONLY (min=max=TLSv1_2): the 1.2
+#            half of the documented 1.2/1.3 support, acceptance-tested —
+#            verified delivery, and the negotiated version asserted from
+#            the receiver side (every recorded session = TLSv1.2)
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -55,11 +59,13 @@ EVIL_OUT=$DIR/evil-out.jsonl
 CHAIN_OUT=$DIR/chain-out.jsonl
 AMBIG_OUT=$DIR/ambig-out.jsonl
 AUTH_OUT=$DIR/auth-out.jsonl
+T12_OUT=$DIR/tls12-out.jsonl
+T12_VER=$DIR/tls12-ver.txt
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
-# E2E_TLS_BASE: the six host-side listeners move per PG major in a parallel
-# matrix (JOBS>1) — one base per major, 8 apart so the +1..+5 ranges cannot
+# E2E_TLS_BASE: the eight host-side listeners move per PG major in a parallel
+# matrix (JOBS>1) — one base per major, 16 apart so the +1..+7 ranges cannot
 # touch; sequentially the default keeps the historical ports.
 TLS_BASE=${E2E_TLS_BASE:-18443}
 PORT_HTTPS=$TLS_BASE
@@ -69,6 +75,7 @@ PORT_CHAIN=$((TLS_BASE + 3))
 PORT_AMBIG=$((TLS_BASE + 4))
 PORT_AUTH=$((TLS_BASE + 5))
 PORT_DRIB=$((TLS_BASE + 6))
+PORT_T12=$((TLS_BASE + 7))
 B64=$(printf %s 'pglogtap:s3cret' | base64 | tr -d '\n') # phase 9's Basic credentials
 
 # The receiver's address as seen from the pg container: the docker network
@@ -78,7 +85,7 @@ NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end
 GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
 
 mkdir -p "$DIR"
-rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT" "$AUTH_OUT"
+rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT" "$AUTH_OUT" "$T12_OUT" "$T12_VER"
 # The impostor's certificate: identical CN and SANs, its own key — only the
 # pinned CA can tell it from the real one. That is the phase 5 point.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -109,7 +116,7 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" PORT_T12="$PORT_T12" python3 - <<'PYEOF' &
 import base64
 import gzip
 import os
@@ -127,6 +134,12 @@ ctx_evil = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx_evil.load_cert_chain(os.path.join(d, "cert-evil.pem"), os.path.join(d, "key-evil.pem"))
 ctx_chain = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx_chain.load_cert_chain(os.path.join(d, "chain.pem"), os.path.join(d, "leaf.key"))
+# Phase 12's pinned-version receiver: TLS 1.2 ONLY — a 1.3-only client would
+# fail the handshake here, which is exactly what the phase must not happen.
+ctx12 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx12.load_cert_chain(os.path.join(d, "cert.pem"), os.path.join(d, "key.pem"))
+ctx12.minimum_version = ssl.TLSVersion.TLSv1_2
+ctx12.maximum_version = ssl.TLSVersion.TLSv1_2
 
 class H(BaseHTTPRequestHandler):
     sink = "https-out.jsonl"
@@ -257,6 +270,19 @@ class HAuth(H):
 httpd_auth = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_AUTH"])), HAuth)
 httpd_auth.socket = ctx.wrap_socket(httpd_auth.socket, server_side=True)
 threading.Thread(target=httpd_auth.serve_forever, daemon=True).start()
+# Phase 12's receiver: same cert as the main one, TLS 1.2 pinned. Records the
+# negotiated protocol of every session — the assert reads it back, so the
+# phase proves WHICH version carried the events, not just that they arrived.
+class HTls12(H):
+    sink = "tls12-out.jsonl"
+    def do_POST(self):
+        with open(os.path.join(d, "tls12-ver.txt"), "a") as f:
+            f.write(self.connection.version() + "\n")
+        return super().do_POST()
+
+httpd_t12 = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_T12"])), HTls12)
+httpd_t12.socket = ctx12.wrap_socket(httpd_t12.socket, server_side=True)
+threading.Thread(target=httpd_t12.serve_forever, daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -264,7 +290,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1); socket.create_connection(('127.0.0.1', $PORT_T12), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -548,5 +574,19 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_tls_server_name = 'localhost'"
 echo "phase 11 ok: 2 rounds of verified → cleared-ca fail → root-pinned chain → name-mismatch through SIGHUP churn, no stale trust, no leaks"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") ))"
+# --- phase 12: TLS 1.2, explicitly. The receiver offers 1.2 ONLY
+# (minimum=maximum=TLSv1_2) — the client's 1.3 offers cannot land, so a
+# delivered batch proves the 1.2 handshake path end to end (key exchange,
+# cipher, record framing), and the receiver-recorded session versions prove
+# WHICH version carried it. Every other phase negotiates 1.3 silently.
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_T12/insert/jsonline'"
+gen p12 "$N"
+wait_for p12 "$N" "$T12_OUT"
+VERS=$(sort -u "$T12_VER" 2>/dev/null)
+[ -n "$VERS" ] || { echo "e2e-tls: phase 12 no recorded session version — the receiver never answered"; exit 1; }
+[ "$VERS" = "TLSv1.2" ] || { echo "e2e-tls: phase 12 negotiated '$VERS', want TLSv1.2 (receiver pinned to 1.2 only)"; exit 1; }
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
+echo "phase 12 ok: TLS 1.2-only receiver delivered $N/$N, every session $VERS"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

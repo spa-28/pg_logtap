@@ -288,7 +288,7 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
     defer _ = c.close(file_fd);
     const size = fbSize(file_fd) orelse return .failed;
     if (size == 0) {
-        if (!worker.writeAll(file_fd, fb_magic, false)) {
+        if (!worker.writeAll(file_fd, fb_magic, false, null)) {
             // Roll the fresh file back to empty. A short write can stop
             // mid-magic, and a 1..7-byte file is "foreign content" to the
             // next open — fallback disabled over a torn header. The file
@@ -312,7 +312,7 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
     defer alloc.free(comp);
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
-    if (!worker.writeAll(file_fd, &len_buf, false) or !worker.writeAll(file_fd, comp, false)) {
+    if (!worker.writeAll(file_fd, &len_buf, false, null) or !worker.writeAll(file_fd, comp, false, null)) {
         // Roll the partial member back. A torn [len][half-member] left in
         // place shifts the framing of every later append — the next member
         // lands mid-garbage and the whole tail reads as "gzip damaged"
@@ -595,7 +595,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
         tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
         if (tmp_fd < 0) return;
     }
-    var copied_ok = worker.writeAll(tmp_fd, fb_magic, false);
+    var copied_ok = worker.writeAll(tmp_fd, fb_magic, false, null);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
     while (copied_ok and pos < size) {
@@ -611,7 +611,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
             copied_ok = false;
             break;
         }
-        copied_ok = worker.writeAll(tmp_fd, copy_buf[0..@intCast(got)], true);
+        copied_ok = worker.writeAll(tmp_fd, copy_buf[0..@intCast(got)], true, null);
         pos += @intCast(got);
     }
     if (copied_ok) copied_ok = fbDatasync(tmp_fd, true);

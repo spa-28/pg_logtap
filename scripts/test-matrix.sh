@@ -357,7 +357,7 @@ if [ "${JOBS:-1}" -gt 1 ]; then
     mkdir -p "$OUT/mx$v"
     rm -f "$OUT/mx$v/vector-out.jsonl" # stale sink symlink/file from an
     # earlier stand design: inside the per-major vector it points nowhere
-    E2E_OUT=$OUT/mx$v E2E_VECTOR=pglogtap-vector-mx$v E2E_TLS_BASE=$((18440 + v * 8)) \
+    E2E_OUT=$OUT/mx$v E2E_VECTOR=pglogtap-vector-mx$v E2E_TLS_BASE=$((18440 + v * 16)) \
       run_version "$v" >"$OUT/mx$v.log" 2>&1 &
     echo "pg$v: running (log: $OUT/mx$v.log)"
     pids+=("$!"); vers+=("$v")

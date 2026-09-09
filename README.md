@@ -119,7 +119,7 @@ GUCs and restart again.
 | `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
-| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One absolute deadline per send attempt: enforced at the worker's stage boundaries, and re-armed before every socket read inside a TLS handshake or session — a peer dribbling TLS fragments cannot stretch a read stage past it. A stage with several TLS writes (body chunks, `close_notify`) can still stretch to a small multiple when the peer stops reading, each write bounded by this. |
+| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One absolute deadline per send attempt: enforced at the worker's stage boundaries, checked between the plain transports' body-write syscalls, and re-armed before every socket read inside a TLS handshake or session — a peer dribbling TLS fragments cannot stretch a read stage past it. The one residual: a 64 KB body chunk's ~4 TLS records can stretch the write stage to a small constant multiple of this when the peer stops reading — never batch-proportional; the next chunk boundary fails the send once the budget is spent. |
 | `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
@@ -214,7 +214,13 @@ connection bursts on `log_connections`). Memory cost is `capacity ×
 `message_max = 8192` (≈86 MB), ≈1 MB at the maximum width (8192 slots
 ≈ 8.6 GB — the extreme corner, paid at boot). A slow
 or dead receiver is *not* a ring problem — that is what `export_backlog_max`
-and the fallback file absorb (next section).
+and the fallback file absorb (next section). One stall source is easy to
+miss: `fallback_max_mb` compactions during an outage storm run inside flush
+cycles, and on a slow disk the walk + cap/2 copy can hold drain for seconds
+(seen on a CI runner: a 150k-event storm against a 1 MB cap stalled drain
+past an 8192 ring — 11k newest events refused, counted in `events_dropped`).
+If the cap is hit regularly, size the ring for capture rate × (send timeout
++ worst compaction walk), not for the send timeout alone.
 
 ### Tuning delivery
 
@@ -498,7 +504,7 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: 
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off, auth gate (401 without headers, bearer/basic with)
+scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off, auth gate (401 without headers, bearer/basic with), TLS 1.2-only receiver
 scripts/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
 scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm

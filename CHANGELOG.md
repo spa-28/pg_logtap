@@ -127,11 +127,21 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   `SO_RCVTIMEO` never fired. The TLS socket reader wraps the deadline now
   (`remaining = deadline − now` before every read), so the handshake and
   the status reads after it are strictly inside `export_timeout_ms`; the
-  residual multiple is on the write side only (a stage with several TLS
-  writes can stretch when the peer stops reading, each write bounded).
+  residual multiple is on the write side only, and it is a constant —
+  one 64 KB chunk's ~4 TLS records, each waiting at most what was armed at
+  the chunk's start, never batch-proportional; the next chunk boundary
+  fails the send once the budget is spent.
   After a successful send that consumed the budget, the best-effort
   `close_notify` is skipped (the fd close is the backstop). e2e-tls phase
   10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
+- The plain `http://`/`tcp://` body write checks the send attempt's
+  absolute deadline between syscalls, like every other stage: each partial
+  write resets the socket's per-write wait, so a receiver accepting one
+  byte per just-under-timeout interval could stretch one body across many
+  individually-bounded waits (TLS already re-armed per chunk). The
+  deadline is an explicit argument to the shared writer, not ambient —
+  the compaction copy and metrics replies stay abort-aware without
+  measuring against a stale send deadline.
 - A metrics client that connects but dribbles its request line gets 50 ms
   (was 100 ms) before its connection is dropped — a loopback scraper's
   line lands in the first poll and a legitimately laggy client's
@@ -182,6 +192,11 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   root-pinned chain → name-mismatch fail — the per-handshake bundle rebuild
   must land the right trust decision every time (no stale bundle, no stale
   name), with failed-cycle and zero-leak asserts at every step.
+- e2e-tls phase 12, a receiver pinned to TLS 1.2 only (min = max =
+  TLSv1_2): verified delivery with the negotiated version asserted from the
+  receiver side — the 1.2 half of the documented TLS 1.2/1.3 support is
+  acceptance-tested instead of implied by the 1.3 passes (Zig's client
+  offers both).
 - The DNS last-known-good address has explicit semantics, documented with
   the `export_url` schemes: it is used only while in-process resolution
   fails, only for the host that produced it, and only within 60 s of the
