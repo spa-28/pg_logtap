@@ -217,6 +217,9 @@ parked to the fallback file in full — parking is local-disk work with no
 deadline by design: its fdatasync is the one deliberately non-abortable
 write in the flush (everything else checks the abort budget between
 syscalls), because that sync is the durability the crash contract rests on.
+The queue path is local disk by the same contract as `export_tls_ca`: on a
+hung NFS/FUSE mount the final parking — and every send-cycle append —
+blocks without a timeout, SIGTERM shutdown included.
 SIGKILL skips all of it.
 With `export_fallback_file` set, the queue is on disk and **survives the
 crash** — the restarted worker replays it; the exposure shrinks to roughly one

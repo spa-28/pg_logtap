@@ -21,7 +21,10 @@ pub const Dest = union(enum) {
 /// the fixed headers) and a raw CR/LF byte. Lines are separated by the
 /// two-character "\n" sequence: a config-file GUC value cannot carry a real
 /// newline at all (ALTER SYSTEM rejects one outright), so the escape is the
-/// only multi-line form there is.
+/// only multi-line form there is. A line must be "Name: value", and the name
+/// must be one the sender does not own — the framing/identity names (Host,
+/// Content-Length, …) are rejected case-insensitively: a config-supplied
+/// second copy makes a request with conflicting HTTP semantics.
 pub fn headerValid(val: []const u8) bool {
     var rest = val;
     while (rest.len > 0) {
@@ -29,6 +32,15 @@ pub fn headerValid(val: []const u8) bool {
         const line = rest[0..eol];
         if (std.mem.indexOfAny(u8, line, "\r\n") != null) return false; // raw CR/LF byte
         if (line.len == 0) return false; // empty line ends the header section early
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false; // "Name: value" — no colon is not a header
+        const name = line[0..colon];
+        // The sender owns these names: they carry the request's framing and
+        // identity, and a second one from config makes a request with
+        // conflicting semantics (two Content-Lengths is smuggling-shaped).
+        // Application headers (Authorization, X-*) stay allowed.
+        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "content-encoding", "te", "upgrade", "proxy-connection" }) |owned| {
+            if (std.ascii.eqlIgnoreCase(name, owned)) return false;
+        }
         if (eol == rest.len) return true;
         rest = rest[eol + 2 ..];
     }
@@ -159,6 +171,26 @@ test "export_http_extra_headers CR/LF discipline" {
     try std.testing.expect(!headerValid("X-A: 1\r\nX-B: 2")); // raw CR/LF bytes — ALTER SYSTEM
     try std.testing.expect(!headerValid("X-A: 1\nX-B: 2")); // cannot deliver one anyway,
     try std.testing.expect(!headerValid("X-A: 1\r")); // reject them regardless
+}
+
+test "export_http_extra_headers protocol-owned names rejected" {
+    try std.testing.expect(!headerValid("Host: evil.example"));
+    try std.testing.expect(!headerValid("host: evil.example")); // case-insensitive
+    try std.testing.expect(!headerValid("Content-Length: 5"));
+    try std.testing.expect(!headerValid("content-length: 5"));
+    try std.testing.expect(!headerValid("Transfer-Encoding: chunked"));
+    try std.testing.expect(!headerValid("Connection: keep-alive"));
+    try std.testing.expect(!headerValid("Content-Encoding: gzip"));
+    try std.testing.expect(!headerValid("TE: trailers"));
+    try std.testing.expect(!headerValid("Upgrade: h2c"));
+    try std.testing.expect(!headerValid("Proxy-Connection: keep-alive"));
+    try std.testing.expect(!headerValid("X-A: 1\\nHost: evil.example")); // anywhere in the list
+    // "Hostname" is not "Host": a prefix collision must not reject an
+    // unowned (if odd) name, and an application header stays allowed.
+    try std.testing.expect(headerValid("Hostname: x"));
+    try std.testing.expect(headerValid("Authorization: Bearer t"));
+    // No colon = not a header line at all.
+    try std.testing.expect(!headerValid("not-a-header"));
 }
 
 test "export_http_extra_headers wire form" {

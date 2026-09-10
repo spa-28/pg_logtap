@@ -196,6 +196,13 @@ fn fail(comptime fmt: []const u8, args: anytype) void {
 /// later as an opaque chain error: a wrong/unreadable path, and a file that
 /// parses but holds no certificates (created empty, or the wrong file).
 fn bundleReady(ca_path: []const u8) bool {
+    // The worker is single-threaded so the mutation cannot race a live
+    // handshake today, but the TLS client DOES take this lock shared while
+    // verifying (Client.zig's ca.lock.lockShared) — replacing the bundle
+    // under the same lock makes the ownership contract hold by construction
+    // instead of by the call graph.
+    ca_lock.lockUncancelable(io());
+    defer ca_lock.unlock(io());
     ca_bundle.deinit(alloc);
     ca_bundle = .empty;
     if (ca_path.len == 0) return true;

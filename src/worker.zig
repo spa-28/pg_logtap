@@ -27,6 +27,7 @@ const c = struct {
     extern "c" fn accept4(conn_fd: c_int, addr: ?*anyopaque, len: ?*u32, flags: c_int) c_int;
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
+    extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
     extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
@@ -127,11 +128,11 @@ var compact_deadline_us: i64 = 0;
 /// knob; documented in the GUC table).
 var net_deadline_us: i64 = 0;
 
-/// Arm net_deadline_us on the send socket: false (with failSend reason)
-/// when the budget is spent or the socket refuses the timeouts — callers
-/// treat it exactly like the stage failing.
-fn netArmDeadline(fd: c_int) bool {
-    const remain_us = net_deadline_us - pg.GetCurrentTimestamp();
+/// Arm an EXPLICIT deadline's remainder on a socket — the per-syscall
+/// re-arm inside writeAll. netArmDeadline below is the stage-boundary
+/// version (the send attempt's global deadline).
+fn armDeadlineFrom(fd: c_int, deadline: i64) bool {
+    const remain_us = deadline - pg.GetCurrentTimestamp();
     if (remain_us < 1000) return failSend("send deadline", 0);
     const timeval = timevalMs(@divTrunc(remain_us, 1000));
     if (net.setsockopt(fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
@@ -139,6 +140,13 @@ fn netArmDeadline(fd: c_int) bool {
         return failSend("setsockopt", std.c._errno().*);
     }
     return true;
+}
+
+/// Arm net_deadline_us on the send socket: false (with failSend reason)
+/// when the budget is spent or the socket refuses the timeouts — callers
+/// treat it exactly like the stage failing.
+fn netArmDeadline(fd: c_int) bool {
+    return armDeadlineFrom(fd, net_deadline_us);
 }
 
 fn sendAborted() bool {
@@ -955,6 +963,10 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
     if (conn_fd < 0) return false;
     defer _ = c.close(conn_fd);
+    // 0600 above applies at creation only — pull a pre-existing file (an
+    // operator may have made it world-readable) down to it. Best-effort: a
+    // chmod failing here means a filesystem that would fail the writes too.
+    _ = c.fchmod(conn_fd, @as(c_uint, 0o600));
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
     // Inode-level alias with the fallback queue (see fdAliasesFallback):
@@ -975,7 +987,14 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         // regular file that just took the write only fails on a dying disk,
         // the damage is one torn line, and a broken-sink state machine buys
         // nothing the warning does not.
-        if (c.ftruncate(conn_fd, @intCast(end_before)) != 0 and !file_rollback_warned) {
+        if (c.ftruncate(conn_fd, @intCast(end_before)) == 0) {
+            // Sync the rollback itself — the same resurrection window the
+            // failed-sync rollback below closes: an unsynced truncate lets
+            // an OS crash bring the torn tail back, and the retried batch
+            // would append a whole copy after it. Best-effort; a sync that
+            // fails too keeps the retry (at-least-once), the trade below.
+            _ = c.fdatasync(conn_fd);
+        } else if (!file_rollback_warned) {
             file_rollback_warned = true;
             elog.Warning(@src(), "pg_logtap file:// rollback of a torn write failed (errno={d}): a torn line stays in {s} and the next batch appends after it", .{ std.c._errno().*, path });
         }
@@ -1037,6 +1056,10 @@ var dns_good_at_us: i64 = 0;
 var dns_good_addr: [128]u8 align(8) = undefined;
 var dns_good_addr_len: u32 = 0;
 var dns_good_family: c_int = 0;
+// The port is part of the cache key, not just cargo: the sockaddr below
+// carries it baked in, so a host whose URL port changed would otherwise be
+// dialed on the OLD port for as long as the resolver outage lasts.
+var dns_good_port: u16 = 0;
 
 /// getaddrinfo + first connectable address; hostnames and IPv4 literals.
 /// getaddrinfo is blocking with NO timeout knob — export_timeout_ms bounds
@@ -1089,7 +1112,7 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
             else if (dns_fail_streak == 10)
                 elog.Log(@src(), "pg_logtap resolver re-initialized after consecutive dns failures", .{});
         }
-        if (dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {
+        if (dns_good_port == port and dns_good_host_len == host.len and std.mem.eql(u8, dns_good_host[0..host.len], host)) {
             // TTL, not forever: reused-IP environments would otherwise dial
             // whatever service now owns the cached address.
             if (pg.GetCurrentTimestamp() - dns_good_at_us <= 60_000_000) { // 60s in µs
@@ -1117,6 +1140,7 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
                 @memcpy(dns_good_addr[0..ai.addrlen], @as([*]const u8, @ptrCast(ai.addr.?))[0..ai.addrlen]);
                 dns_good_addr_len = ai.addrlen;
                 dns_good_family = ai.family;
+                dns_good_port = port;
                 dns_good_at_us = pg.GetCurrentTimestamp();
             }
             return conn_fd;
@@ -1204,6 +1228,10 @@ pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?
         // bounded by disk speed, and exactly those writes carry the parked
         // backlog through shutdown.
         if (abortable and (sendAborted() or (deadline_us != null and pg.GetCurrentTimestamp() >= deadline_us.?))) return false;
+        // Re-arm to the REMAINDER before every write: the check above only
+        // runs between syscalls, so a write started just inside the deadline
+        // could otherwise block for one more full SO_SNDTIMEO past it.
+        if (deadline_us != null and !armDeadlineFrom(conn_fd, deadline_us.?)) return false;
         // write(2): works for both sockets and regular files (send does not).
         const count = net.write(conn_fd, buf.ptr + off, buf.len - off);
         if (count > 0) {

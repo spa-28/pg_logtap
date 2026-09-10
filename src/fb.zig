@@ -24,6 +24,7 @@ const c = struct {
     extern "c" fn close(conn_fd: c_int) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
     extern "c" fn fsync(fd: c_int) c_int;
+    extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
     extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
     extern "c" fn unlink(path: [*:0]const u8) c_int;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
@@ -203,6 +204,9 @@ fn fbOpen() ?c_int {
         // rule compact already enforces for its temp. ELOOP (the path IS
         // a symlink) just fails the open: the caller parks in RAM instead.
         file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | fb_no_follow, @as(c_uint, 0o600));
+        // The mode argument only covers creation; a pre-existing queue may
+        // sit wider (operator-made 0644). Best-effort tighten — see sendFile.
+        if (file_fd >= 0) _ = c.fchmod(file_fd, @as(c_uint, 0o600));
     }
     // Any other errno (EACCES, EROFS, ENOTDIR, …) fails as is — a retrying
     // open would only mask the real reason. An unopenable queue is as
@@ -229,7 +233,14 @@ fn fbOpen() ?c_int {
 }
 
 /// fsync the parent of a path: makes a fresh directory entry durable. Best
-/// effort — a failure costs durability of the creation, not correctness.
+/// effort — a failure costs durability of the CREATION only: the queue's data
+/// is still fdatasynced, and until the kernel writes the directory back an
+/// OS crash may drop the queue's name (the events degrade to what a RAM-only
+/// worker would have lost, never worse). A failure is warned once — a
+/// directory fsync that fails is a dying-disk signal, the same class as
+/// fb_sync_failures — but no broken-mark: the queue still beats RAM.
+var dir_sync_warned = false;
+
 fn fsyncDirOf(path_str: []const u8) void {
     const dir_end = std.mem.findScalarLast(u8, path_str, '/') orelse return;
     var dir_buf: [4096]u8 = undefined;
@@ -238,9 +249,14 @@ fn fsyncDirOf(path_str: []const u8) void {
     @memcpy(dir_buf[0..dir.len], dir);
     dir_buf[dir.len] = 0;
     const dir_fd = c.open(@ptrCast(&dir_buf), 0, @as(c_uint, 0)); // O_RDONLY
-    if (dir_fd < 0) return;
-    defer _ = c.close(dir_fd);
-    _ = c.fsync(dir_fd);
+    const synced = dir_fd >= 0 and blk: {
+        defer _ = c.close(dir_fd);
+        break :blk c.fsync(dir_fd) == 0;
+    };
+    if (!synced and !dir_sync_warned) {
+        dir_sync_warned = true;
+        elog.Warning(@src(), "pg_logtap fallback queue directory fsync failed: the creation is not durable until the kernel writes the directory back (an OS crash may drop the queue's name): {s}", .{path_str});
+    }
 }
 
 fn fbSize(fd: c_int) ?u64 {

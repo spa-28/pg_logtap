@@ -384,6 +384,29 @@ docker exec "$PG_CT" sh -c "rm -f '$FB' '$FB_DIR/pg_logtap-canary'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "symlink refused: canary intact, fallback_broken=1 warned once, 20/20 via the RAM backlog"
 
+echo "== pre-existing queue at 0644: tightened to 0600 on open =="
+# The 0600 in fbOpen's open(2) applies at creation only. A queue file left
+# world-readable by an operator is pulled down to 0600 on the first open —
+# the queue holds the whole log stream; other local users must not read it
+# (the same stance as creation). Pre-created as postgres so the open
+# succeeds and the phase observes the MODE, not EACCES.
+FB3_REL=pg_logtap-fallback3.bin
+FB3="$FB_DIR/$FB3_REL"
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3'; touch '$FB3'; chmod 0644 '$FB3'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
+gen perm 20; sleep 3
+mode=$(docker exec "$PG_CT" stat -c %a "$FB3")
+[ "$mode" = 600 ] || fail "queue perms: mode=$mode after open, want 600"
+q0=$(statf events_queued)
+[ "$q0" -gt 0 ] || fail "queue perms: events did not queue through the pre-existing file (queued=$q0)"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for perm 20
+[ "$(received perm)" = 20 ] || fail "queue perms: replay did not drain ($(received perm)/20)"
+docker exec "$PG_CT" sh -c "rm -f '$FB3'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "pre-existing 0644 queue tightened to 0600 on open, 20/20 queued and replayed"
+
 echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
 # The SET-time check compares PATH STRINGS; a symlink names the same inode
 # under a different string, so the pair loads. The open-time inode check is
