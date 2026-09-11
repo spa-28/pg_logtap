@@ -359,6 +359,23 @@ docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url" | grep -q
   || fail "aliasing: rejected ALTER SYSTEM still changed the url GUC"
 ok "file:// url == fallback path rejected in both directions, a distinct pair accepted"
 
+echo "== unparseable network url: rejected at ALTER SYSTEM, not first at send time =="
+# checkUrl runs parseUrl: a control byte or a space in the host/path rides
+# the HTTP request line verbatim, so it must fail ALTER SYSTEM loudly —
+# not land in auto.conf and die in the worker's warnUrlOnce a cycle later.
+# (SET cannot reach the hook at all: export_url is PGC_SIGHUP, a session
+# SET dies with "cannot be changed now" before any value check runs.)
+cr=$(printf '\r'); del=$(printf '\177') # $'..' is not POSIX sh — a dash host would expand it to the PID
+for bad in "http://v:8686/a b" "http://v:8686/insert${cr}X-Evil: 1" "http://ba d:8686/" "http://v:8686/p${del}ath"; do
+  out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = '$bad'" 2>&1)
+  echo "$out" | grep -q ERROR || fail "bad url: '$bad' accepted at ALTER SYSTEM"
+done
+# file:// paths are local filenames — spaces stay legal there. No reload
+# after: the next scenario's setguc repoints the url anyway.
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'file:///tmp/my logs.jsonl'" >/dev/null \
+  || fail "bad url: file:// with a space rejected"
+ok "space/DEL/CR in a network url rejected at ALTER SYSTEM; file:// keeps spaces"
+
 echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # Anything able to write to the data directory must not be able to aim the
 # queue at another file: a symlink at the fallback path is refused

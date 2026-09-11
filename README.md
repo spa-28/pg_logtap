@@ -329,8 +329,8 @@ On top of that, the operational knobs:
 IPv6 literal hosts (`https://[::1]:9428`) are not parsed in any network
 scheme — use a hostname or an IPv4 literal (bracket parsing is on the
 roadmap: `docs/TODO.md`). The host and path of a network scheme must be
-plain visible ASCII: a control byte or a space fails `SET` outright (both
-would malform the request line).
+plain visible ASCII: a control byte or a space is rejected at `ALTER
+SYSTEM` outright (both would malform the request line).
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
 (`Content-Encoding: gzip`) — same NDJSON after decompression, just less

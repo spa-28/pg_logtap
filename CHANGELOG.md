@@ -69,6 +69,19 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   changed in `export_url` during a resolver outage, the cached address
   still carried the old port and the worker dialed it. The port is part of
   the cache key now.
+- The `export_url` check hook runs the URL parser: a control byte, raw
+  space or DEL in a network scheme's host or path was documented to fail
+  at SET time, but the check hook only tested the fallback aliasing — the
+  value loaded into the GUC and only died in the worker's
+  unparseable-URL warning a cycle later. e2e-kill drives the rejections
+  through ALTER SYSTEM (the GUC is `PGC_SIGHUP`, so ALTER SYSTEM is the
+  path that reaches the hook) and a spaced `file://` path through
+  acceptance.
+- A transient metrics bind failure (the port still held by a dying
+  process, the interface not up yet) no longer records the listener as
+  served: the failed state stays unrecorded, so the next SIGHUP retries
+  instead of the listener staying down until the GUC changed again; the
+  failure logs once per streak.
 
 ### Hardening
 
@@ -103,7 +116,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   sender owns the framing and identity headers, and a config-supplied
   second copy makes a request with conflicting semantics (two
   Content-Lengths is smuggling-shaped). Application headers
-  (`Authorization`, `X-*`) are unaffected.
+  (`Authorization`, `X-*`) are unaffected. A name carrying whitespace
+  before its colon is not a distinct header — lenient parsers read
+  `Content-Length : 5` as the owned name — so the name must be a real
+  RFC 7230 token (tchar bytes only, non-empty) and the value visible
+  ASCII with SP/HTAB; raw control bytes and raw UTF-8 in a value are
+  rejected too (non-ASCII belongs percent-encoded).
 - TLS failures name their fix instead of an error name: a certificate name
   mismatch appends the `export_tls_server_name` hint (IP-literal URLs always
   need it), an unknown CA appends the `export_tls_ca` hint, decode-class
@@ -127,6 +145,12 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   like any other sync failure: a landed compaction is one of the queue's
   documented durability points, so its failed sync belongs in the counter
   (safety unchanged — the rewrite is abandoned, the original queue stands).
+- Every queue-side truncate is a durability event and syncs like one: the
+  rollback of a torn queue header, the rollback of a torn member
+  mid-append and the torn-tail repair in replay all `ftruncate` and then
+  `fdatasync` — an unsynced truncate lets an OS crash resurrect the torn
+  tail, and the next append would land after garbage and shift the
+  framing of everything past it.
 - A `file://` export_url and `export_fallback_file` cannot resolve to the
   same file: the NDJSON sink and the `PGLTFB01` framing corrupt each other.
   Whichever GUC lands second is rejected at SET/`ALTER SYSTEM`. The docs
@@ -158,13 +182,17 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   one 64 KB chunk's ~4 TLS records, each waiting at most what was armed at
   the chunk's start, never batch-proportional; the next chunk boundary
   fails the send once the budget is spent.
-  After a successful send that consumed the budget, the best-effort
-  `close_notify` is skipped (the fd close is the backstop). e2e-tls phase
+  After a successful send, the best-effort `close_notify` is re-armed to
+  the deadline's remainder before it writes — it used to check the clock
+  and then write with whatever `SO_SNDTIMEO` the last stage had armed,
+  one full extra timeout past the budget. With no remainder left it is
+  skipped (the fd close is the backstop). e2e-tls phase
   10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
 - The network `export_url` schemes reject a host or path carrying a control
-  byte, a raw space or DEL at SET: both ride the HTTP request line verbatim,
-  so such a value could split or smuggle the request line on every send —
-  an unparseable URL fails loudly instead. `file://` paths are local
+  byte, a raw space, DEL or any non-ASCII byte at SET: the host and path
+  ride the HTTP request line verbatim, so such a value could split or
+  smuggle the request line on every send — an unparseable URL fails loudly
+  instead, and non-ASCII belongs percent-encoded. `file://` paths are local
   filenames and keep spaces.
 - The plain `http://`/`tcp://` body write checks the send attempt's
   absolute deadline between syscalls, like every other stage: each partial
@@ -193,7 +221,8 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   silent): the queue's data is still fdatasynced, but until the kernel
   writes the directory back an OS crash may drop the queue's name — that
   window degrades to what a RAM-only worker would lose, never worse, so
-  no broken-mark: the queue still beats RAM.
+  no broken-mark: the queue still beats RAM. The warning re-arms on a
+  successful sync — an independent later failure is heard again.
 - The `export_fallback_file` docs state the local-disk contract explicitly,
   mirroring `export_tls_ca`: appends and the final shutdown parking have
   no timeout, so a hung network filesystem at the queue path blocks the
@@ -212,6 +241,10 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   bad warns twice, like the file:// latches). A TLS receiver closing the
   session cleanly before any status line is reported as `tls eof`, not as
   the previous attempt's leftover error text.
+- `writeAll` owns its failure reason — the abort exit says `write abort`,
+  a write error says `write errno=N`, and the deadline arming says its
+  own; the network callers return it instead of stamping a stage label
+  over it with an errno that may belong to an earlier syscall.
 - The `events_queued` Prometheus HELP and the fallback section of
   delivery.md call it a lifecycle stage like the counters glossary already
   did, and delivery.md's `events_captured ≈ …` invariant subtracts

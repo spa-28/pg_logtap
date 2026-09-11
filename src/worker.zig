@@ -167,7 +167,7 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after the fixed headers — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return or an empty line is rejected at SET (both would malform every request). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after the fixed headers — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte or an empty line is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -626,14 +626,23 @@ pub fn fileUrlAliasesFallback(url: []const u8, fb_raw: []const u8) bool {
     return std.mem.eql(u8, full, dest_v.file);
 }
 
-/// SET-time aliasing check for export_url (rule on fileUrlAliasesFallback):
-/// guc.c runs this for SET and ALTER SYSTEM; boot runs '' through here too.
+/// SET-time check for export_url: the URL must parse (network schemes
+/// reject control bytes and spaces here — the host and path ride the HTTP
+/// request line verbatim, so they must be plain visible ASCII), and a
+/// file:// dest must not name the fallback queue's file (rule on
+/// fileUrlAliasesFallback). guc.c runs this for ALTER SYSTEM (a session SET
+/// is refused before any value check — PGC_SIGHUP); boot
+/// runs '' through here too — empty means "no export worker", not a bad URL.
 fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
     const ptr = newval orelse return true;
     const raw_c = ptr.* orelse return true;
-    return !fileUrlAliasesFallback(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))), fbq.fileGucRaw());
+    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (raw.len == 0) return true;
+    const dest_v = dest_mod.parseUrl(raw) orelse return false;
+    if (dest_v != .file) return true;
+    return !fileUrlAliasesFallback(raw, fbq.fileGucRaw());
 }
 
 /// Inode of an open fd (null when fstat fails).
@@ -726,7 +735,8 @@ fn gucStrRaw(name: [:0]const u8) []const u8 {
 }
 
 /// SET-time CR/LF check for export_http_extra_headers (discipline in export.zig,
-/// unit-tested there): guc.c runs this for SET and ALTER SYSTEM, and boot
+/// unit-tested there): guc.c runs this for ALTER SYSTEM (a session SET is
+/// refused before any value check — PGC_SIGHUP), and boot
 /// runs the default '' through here too (always accepted).
 fn checkHeader(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
@@ -876,8 +886,8 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
     head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
     if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
-    if (!writeAll(conn_fd, head.buffered(), true, net_deadline_us)) return failSend("write head", std.c._errno().*);
-    if (!writeAll(conn_fd, body, true, net_deadline_us)) return failSend("write body", std.c._errno().*);
+    if (!writeAll(conn_fd, head.buffered(), true, net_deadline_us)) return false; // writeAll owns the reason
+    if (!writeAll(conn_fd, body, true, net_deadline_us)) return false;
     // Status line is enough: "HTTP/1.1 200 ..." — 2xx accepted, anything else retries.
     // TCP does not preserve write boundaries: the line may straddle recvs, and
     // a false failure here retries a body the receiver already accepted (a
@@ -925,7 +935,10 @@ fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) b
     // close_notify is best-effort; with the attempt budget spent, skipping it
     // beats paying up to two more socket waits after an already-successful
     // send — the fd close is the backstop, as on the failed-send path.
-    if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end();
+    // Re-arm to the remainder FIRST: end() writes through the socket with
+    // whatever SO_SNDTIMEO the last stage armed, and a check-then-write
+    // would let it block one full extra timeout past the budget.
+    if (netArmDeadline(conn_fd)) tls_conn.end();
     return true;
 }
 
@@ -938,10 +951,10 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
     if (ep.tls) {
         const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts(), net_deadline_us - pg.GetCurrentTimestamp()) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;
-        if (pg.GetCurrentTimestamp() < net_deadline_us) tls_conn.end(); // best-effort close_notify, skipped when the budget is spent
+        if (netArmDeadline(conn_fd)) tls_conn.end(); // best-effort close_notify, re-armed to the remainder (see sendHttpTls)
         return true;
     }
-    if (!writeAll(conn_fd, body, true, net_deadline_us)) return failSend("write body", std.c._errno().*);
+    if (!writeAll(conn_fd, body, true, net_deadline_us)) return false; // writeAll owns the reason
     return true;
 }
 
@@ -1211,7 +1224,9 @@ var fail_reason_buf: [160]u8 = undefined; // wide enough for a tls.zig reason wi
 var fail_reason: []const u8 = "";
 
 /// Blocking full write over a socket or regular-file fd; fbq.zig's appends
-/// and compaction go through here too.
+/// and compaction go through here too. Every false exit owns its fail_reason
+/// ("write abort", "write errno=N", or armDeadlineFrom's) — callers return
+/// it, they do not stamp their own label over it with a possibly-stale errno.
 pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?i64) bool {
     var off: usize = 0;
     while (off < buf.len) {
@@ -1227,7 +1242,7 @@ pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?
         // only — a local file write (fallback queue, file:// destination) is
         // bounded by disk speed, and exactly those writes carry the parked
         // backlog through shutdown.
-        if (abortable and (sendAborted() or (deadline_us != null and pg.GetCurrentTimestamp() >= deadline_us.?))) return false;
+        if (abortable and (sendAborted() or (deadline_us != null and pg.GetCurrentTimestamp() >= deadline_us.?))) return failSend("write abort", 0);
         // Re-arm to the REMAINDER before every write: the check above only
         // runs between syscalls, so a write started just inside the deadline
         // could otherwise block for one more full SO_SNDTIMEO past it.
@@ -1238,7 +1253,7 @@ pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?
             off += @intCast(count);
         } else if (count == -1 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) {
             continue; // EINTR is legal here even with SA_RESTART handlers
-        } else return false;
+        } else return failSend("write", std.c._errno().*);
     }
     return true;
 }
@@ -1261,6 +1276,7 @@ fn recvSome(conn_fd: c_int, buf: []u8) usize {
 var metrics_fd: c_int = -1;
 var metrics_open_port: c_int = -1; // port the socket currently reflects
 var metrics_open_addr_buf: [64]u8 = undefined; // …and the address it reflects
+var metrics_listen_failed = false; // edge-triggered listen-failure log latch
 var metrics_open_addr: []const u8 = "";
 
 /// (Re)open the listening socket when port or address changed (SIGHUP).
@@ -1270,20 +1286,33 @@ fn syncMetricsListener() void {
     // compares as "": storing the GUC slice itself would leave a dangling
     // pointer after the next reload frees that memory.
     if (metrics_open_port == guc_metrics_port and std.mem.eql(u8, metrics_open_addr, if (addr.len > metrics_open_addr_buf.len) "" else addr)) return;
-    metrics_open_port = guc_metrics_port;
-    if (addr.len <= metrics_open_addr_buf.len) {
-        @memcpy(metrics_open_addr_buf[0..addr.len], addr);
-        metrics_open_addr = metrics_open_addr_buf[0..addr.len];
-    } else metrics_open_addr = ""; // overlong: listenOn will reject it anyway
     if (metrics_fd >= 0) {
         _ = c.close(metrics_fd);
         metrics_fd = -1;
     }
-    if (guc_metrics_port <= 0) return;
+    if (guc_metrics_port <= 0 or addr.len > metrics_open_addr_buf.len) {
+        // Off (or an overlong address listenOn would reject anyway) is a
+        // settled state: record it so the guard above stops re-running.
+        metrics_open_port = guc_metrics_port;
+        metrics_open_addr = "";
+        return;
+    }
     metrics_fd = listenOn(addr, @intCast(guc_metrics_port)) orelse {
-        elog.Log(@src(), "pg_logtap.metrics_port {d} on \"{s}\" failed to listen, metrics disabled", .{ guc_metrics_port, addr });
+        // NOT recorded as open: the failure may be transient (port still
+        // held by a dying process, interface not up yet), and recording it
+        // would silence the listener until the GUC changes again — leaving
+        // the previous values makes the guard retry on the next sync
+        // (every SIGHUP). Logged once per failure streak, not per attempt.
+        if (!metrics_listen_failed) {
+            metrics_listen_failed = true;
+            elog.Log(@src(), "pg_logtap.metrics_port {d} on \"{s}\" failed to listen, metrics down until it succeeds again", .{ guc_metrics_port, addr });
+        }
         return;
     };
+    metrics_listen_failed = false;
+    metrics_open_port = guc_metrics_port;
+    @memcpy(metrics_open_addr_buf[0..addr.len], addr);
+    metrics_open_addr = metrics_open_addr_buf[0..addr.len];
     elog.Log(@src(), "pg_logtap metrics serving /metrics and /healthz on {s}:{d}", .{ addr, guc_metrics_port });
 }
 

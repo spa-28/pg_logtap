@@ -106,9 +106,10 @@ pub fn fileGucRaw() []const u8 {
 /// The queue's path buffers are 4096 bytes and compaction rewrites through
 /// "<path>.compact": a value that fits the queue but leaves no room for the
 /// suffix parks events fine, yet the cap can never fire — compact cannot
-/// even name its temp. Reject the value at SET (the call path guc.c uses for
-/// both SET and ALTER SYSTEM; boot runs the default '' through here too, and
-/// empty is always accepted). Relative paths measure against the data
+/// even name its temp. Reject the value at ALTER SYSTEM (a session SET is
+/// refused before any value check — PGC_SIGHUP); boot runs the default ''
+/// through here too, and empty is always accepted. Relative paths measure
+/// against the data
 /// directory, exactly as path() resolves them. A path aliasing a file://
 /// export_url is rejected the same way (rule on worker.fileUrlAliasesFallback).
 fn checkFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
@@ -253,7 +254,11 @@ fn fsyncDirOf(path_str: []const u8) void {
         defer _ = c.close(dir_fd);
         break :blk c.fsync(dir_fd) == 0;
     };
-    if (!synced and !dir_sync_warned) {
+    if (synced) {
+        // Edge-triggered like every warn latch here: a clean creation
+        // re-arms it, so an independent later failure warns again.
+        dir_sync_warned = false;
+    } else if (!dir_sync_warned) {
         dir_sync_warned = true;
         elog.Warning(@src(), "pg_logtap fallback queue directory fsync failed: the creation is not durable until the kernel writes the directory back (an OS crash may drop the queue's name): {s}", .{path_str});
     }
@@ -310,7 +315,15 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
             // next open — fallback disabled over a torn header. The file
             // holds no members yet, so the rollback costs nothing; the next
             // append writes the magic whole again.
-            if (c.ftruncate(file_fd, 0) != 0) {
+            if (c.ftruncate(file_fd, 0) == 0) {
+                // Sync the rollback: an unsynced truncate lets an OS crash
+                // resurrect the torn header — the next open then reads
+                // foreign content and disables the queue for nothing. A
+                // failed sync only re-opens that window (counted like any
+                // other durability point); the repair re-runs at the next
+                // open's foreign-content check.
+                _ = fbDatasync(file_fd, false);
+            } else {
                 broken = true;
                 elog.Warning(@src(), "pg_logtap fallback append could not roll back a partial queue header (errno={d}), replay disabled: {s}", .{ std.c._errno().*, path() orelse "" });
             }
@@ -333,7 +346,13 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
         // place shifts the framing of every later append — the next member
         // lands mid-garbage and the whole tail reads as "gzip damaged"
         // instead of just this batch retrying from RAM.
-        if (c.ftruncate(file_fd, @intCast(size)) != 0) {
+        if (c.ftruncate(file_fd, @intCast(size)) == 0) {
+            // Sync the rollback, same window as the header rollback above:
+            // an unsynced truncate can resurrect the torn [len][half-member]
+            // after an OS crash, and an append landing after the resurrected
+            // tail shifts the framing of everything past it.
+            _ = fbDatasync(file_fd, false);
+        } else {
             broken = true;
             elog.Warning(@src(), "pg_logtap fallback append could not roll back a partial member (errno={d}), replay disabled: {s}", .{ std.c._errno().*, path() orelse "" });
         }
@@ -438,7 +457,13 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
         // The truncation is what lets the next append land on a member edge;
         // if it fails the framing after offset is lost until a human
         // looks — replaying garbage is worse than stopping.
-        if (c.ftruncate(file_fd, @intCast(offset)) != 0) {
+        if (c.ftruncate(file_fd, @intCast(offset)) == 0) {
+            // The repair restores the framing invariant for every future
+            // append, so it is a durability point like the drain's truncate:
+            // unsynced, an OS crash can resurrect the torn tail the next
+            // append would then land after.
+            _ = fbDatasync(file_fd, false);
+        } else {
             broken = true;
             elog.Warning(@src(), "pg_logtap fallback torn tail at offset {d} could not be truncated (errno={d}), replay disabled: {s}", .{ offset, std.c._errno().*, path() orelse "" });
         }

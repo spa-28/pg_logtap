@@ -34,6 +34,20 @@ pub fn headerValid(val: []const u8) bool {
         if (line.len == 0) return false; // empty line ends the header section early
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false; // "Name: value" — no colon is not a header
         const name = line[0..colon];
+        // The name must be a real RFC 7230 token: non-empty, tchar bytes
+        // only. "Content-Length : 5" or "Host\t: x" (OWS inside the name)
+        // is not a distinct header — lenient parsers read it as the owned
+        // one, so whitespace must not bypass the denylist below.
+        if (name.len == 0) return false; // ": value" has no name at all
+        for (name) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", ch) == null) return false;
+        }
+        // Field values carry visible ASCII, SP and HTAB only — any other
+        // control byte (or raw high byte) would corrupt the wire form
+        // writeHeaderLines emits; non-ASCII belongs percent-encoded.
+        for (line[colon + 1 ..]) |ch| {
+            if (ch != ' ' and ch != '\t' and (ch < 0x21 or ch > 0x7e)) return false;
+        }
         // The sender owns these names: they carry the request's framing and
         // identity, and a second one from config makes a request with
         // conflicting semantics (two Content-Lengths is smuggling-shaped).
@@ -90,7 +104,9 @@ pub fn parseUrl(url: []const u8) ?Dest {
 /// local filenames and keep spaces.
 fn cleanAscii(s: []const u8) bool {
     for (s) |ch| {
-        if (ch <= 0x20 or ch == 0x7f) return false;
+        // Plain visible ASCII (0x21..0x7e): high bytes would ride the
+        // request line as raw UTF-8 — non-ASCII belongs percent-encoded.
+        if (ch < 0x21 or ch > 0x7e) return false;
     }
     return true;
 }
@@ -157,6 +173,7 @@ test "reject control bytes and spaces in network schemes" {
     try std.testing.expect(parseUrl("http://v:8686/a b") == null); // space in the path
     try std.testing.expect(parseUrl("http://ba d:8686/") == null); // space in the host
     try std.testing.expect(parseUrl("tcp://h:9999\n") == null);
+    try std.testing.expect(parseUrl("http://v:8686/insert/\xc3\xa9") == null); // raw UTF-8, not percent-encoded
     // file:// paths are local filenames: a space stays legal there.
     try std.testing.expectEqualStrings("/tmp/my logs.jsonl", parseUrl("file:///tmp/my logs.jsonl").?.file);
 }
@@ -191,6 +208,18 @@ test "export_http_extra_headers protocol-owned names rejected" {
     try std.testing.expect(headerValid("Authorization: Bearer t"));
     // No colon = not a header line at all.
     try std.testing.expect(!headerValid("not-a-header"));
+    // OWS inside the name is not a distinct header — lenient parsers read
+    // it as the owned one, and the denylist must not be bypassable by it.
+    try std.testing.expect(!headerValid("Content-Length : 5")); // space before the colon
+    try std.testing.expect(!headerValid("Host\t: evil.example")); // tab before the colon
+    try std.testing.expect(!headerValid(": x")); // no name at all
+    try std.testing.expect(!headerValid("X A: 1")); // space is not a tchar
+    // Values: visible ASCII, SP and HTAB only.
+    try std.testing.expect(!headerValid("X-A: va\x01lue")); // control byte
+    try std.testing.expect(!headerValid("X-A: va\x7flue")); // DEL
+    try std.testing.expect(!headerValid("X-A: t\xc3\xa9nant")); // raw UTF-8 — percent-encode instead
+    try std.testing.expect(headerValid("X-Good_Name-1: a spaced value"));
+    try std.testing.expect(headerValid("X-A: tab\tseparated"));
 }
 
 test "export_http_extra_headers wire form" {
