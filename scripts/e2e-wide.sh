@@ -8,55 +8,22 @@
 # Usage: scripts/e2e-wide.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
-set -eu
-PG_CT="${1:-pglogtap-pg}"
-NET=pglogtap-e2e_default
-OUT=/tmp/logtap-e2e
-VEC=pglogtap-vector
+set -u
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init wide "${1:-}"
+e2e_gate
 WIDE=8192
 
-fail() {
-  echo "e2e-wide: FAILED: $*" >&2
-  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  exit 1
-}
-ok() { echo "  ok: $*"; }
-
-# Stand gate: the compose one-shot must have passed.
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
-  || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN
-
-setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-SUF="-$$" # per-run marker suffix
-received() { grep -c "logtap wide $1$SUF" "$OUT/vector-out.jsonl" 2>/dev/null || true; }
-stats() { docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
-wait_ready() { # TCP probe: the restarting server's socket comes and goes
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
-wait_vector() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "receiver $VEC not accepting connections after 60s"
-}
-wait_for() { # wait_for <marker> <count> [tries]
+# wide's markers carry free text (not a trailing number) after the marker
+# word, so counting is line-based — override the common DISTINCT-counter.
+received() { grep -c "logtap wide $1$SUF" "$OUT/vector-out.jsonl" 2>/dev/null; }
+wait_for() { # wait_for <marker> <count> [tries] — FAILS on timeout
   n=0; tries=${3:-30}
   while [ "$n" -lt "$tries" ]; do
     [ "$(received "$1")" -ge "$2" ] && return 0
     n=$((n + 1)); sleep 1
   done
+  fail "wait_for $1: received $(received "$1") of $2 in ${tries}s"
 }
 
 # Every delivered marker line must parse as JSON — a torn slot or a botched
@@ -87,7 +54,7 @@ sleep 2
 # no truncation bit (before 0.4.0 this arrived clipped at 1024).
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'logtap wide full$SUF %', repeat('é', 2500);
-  END \$\$" >/dev/null 2>&1 || true
+  END \$\$" >/dev/null 2>&1
 wait_for full 1 20
 [ "$(received full)" = 1 ] || fail "wide: $(received full) events for the full-message probe (expected 1)"
 json_check full >/dev/null || fail "wide: delivered line is not valid JSON/UTF-8"
@@ -108,7 +75,7 @@ ok "5000B message delivered whole, truncated=[]"
 # backs off to 8190, names message in truncated.
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'logtap wide clip$SUF %', repeat('€', 3000);
-  END \$\$" >/dev/null 2>&1 || true
+  END \$\$" >/dev/null 2>&1
 wait_for clip 1 20
 [ "$(received clip)" = 1 ] || fail "wide: $(received clip) events for the clip probe (expected 1)"
 json_check clip >/dev/null || fail "wide: delivered line is not valid JSON/UTF-8"
@@ -133,7 +100,7 @@ ok "9000B message cut at a char boundary (~8192B), truncated=[message]"
 docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
   RAISE WARNING 'logtap wide aux$SUF %', repeat('é', 100)
     USING DETAIL = repeat('д', 1000);
-  END \$\$" >/dev/null 2>&1 || true
+  END \$\$" >/dev/null 2>&1
 wait_for aux 1 20
 [ "$(received aux)" = 1 ] || fail "wide: $(received aux) events for the aux probe (expected 1)"
 json_check aux >/dev/null || fail "wide: delivered line is not valid JSON/UTF-8"
@@ -161,7 +128,7 @@ docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
   WHILE i < $N LOOP
     RAISE WARNING 'logtap wide burst$SUF % %', i, repeat('é', 4000);
     i := i + 1;
-  END LOOP; END \$\$" >/dev/null 2>&1 || true
+  END LOOP; END \$\$" >/dev/null 2>&1
 t1=$(date +%s)
 wait_for burst "$N" 120
 capd=$(( $(statf events_captured) - bcap )); drpd=$(( $(statf events_dropped) - bdrp ))

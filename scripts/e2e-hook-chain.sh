@@ -4,25 +4,13 @@
 # is preloaded BEFORE pg_logtap, which makes it pg_logtap's prev_hook — every
 # event must reach it first AND still be captured by pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
-set -eu
-PG_CT="${1:-pglogtap-pg}"
-OUT=/tmp/logtap-hookchain
+set -u
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init hookchain "${1:-}"
+e2e_gate
+OUT=${E2E_OUT:-/tmp/logtap-e2e}/hookchain # per container in a parallel matrix
 
-fail() { echo "e2e-hook-chain: FAILED: $*" >&2; exit 1; }
-ok() { echo "  ok: $*"; }
 psql_ct() { docker exec "$PG_CT" psql -U postgres "$@"; }
-
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
 
 # Build hookchain.so against the target major's server headers (the fmgr
 # magic block is version-checked at load, so a pg18 .so won't load into 15).
@@ -36,10 +24,10 @@ if command -v pg_config >/dev/null 2>&1; then # CI: server-dev for this major
     tests/e2e/hookchain.c -o "$OUT/hookchain.so"
 else # local: the pgzx-build container has server-dev 15-18
   INC=$(docker exec pgzx-build "/usr/lib/postgresql/$MAJ/bin/pg_config" --includedir-server)
-  docker cp tests/e2e/hookchain.c pgzx-build:/tmp/hookchain.c
+  docker cp tests/e2e/hookchain.c "pgzx-build:/tmp/hookchain-$PG_CT.c"
   docker exec pgzx-build /opt/zig016/files/zig cc -shared -fPIC -Wno-ignored-attributes -I"$INC" \
-    /tmp/hookchain.c -o /tmp/hookchain.so
-  docker cp pgzx-build:/tmp/hookchain.so "$OUT/hookchain.so"
+    /tmp/hookchain-"$PG_CT".c -o /tmp/hookchain-"$PG_CT".so
+  docker cp "pgzx-build:/tmp/hookchain-$PG_CT.so" "$OUT/hookchain.so"
 fi
 docker cp "$OUT/hookchain.so" "$PG_CT:$LIBDIR/"
 
@@ -53,7 +41,7 @@ restore() {
   psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = '$SAVED_LIST'" \
     -qc "ALTER SYSTEM SET pg_logtap.export_url = '$URL_SAVED'" >/dev/null
   docker restart "$PG_CT" >/dev/null
-  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1 || true
+  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1
   wait_ready
 }
 trap restore EXIT INT TERM

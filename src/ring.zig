@@ -103,6 +103,15 @@ pub const ShmState = extern struct {
     /// 1 = pg_logtap.redact_pattern did not compile; that redaction layer is
     /// OFF (fail-open) until the pattern is fixed.
     redact_pattern_failed: u8 = 0,
+    /// Operator-facing WARNING/LOG lines the extension emitted, cumulative
+    /// per kind — the log lines are edge-triggered (once per worker life or
+    /// per transition), these are the queryable/alertable copy: verify=off
+    /// seen, fallback queue unopenable, unreadable member skipped, divert
+    /// into an unbounded (fallback_max_mb=0) queue.
+    warn_tls_no_verify: u64 = 0,
+    warn_fallback_open: u64 = 0,
+    warn_fallback_skipped: u64 = 0,
+    warn_fallback_unbounded: u64 = 0,
 };
 
 /// Byte stride of one slot: head + message region, rounded up so every slot
@@ -145,6 +154,10 @@ pub const Stats = struct {
     fallback_broken: u8,
     fb_sync_failures: u64,
     redact_pattern_failed: u8,
+    warn_tls_no_verify: u64,
+    warn_fallback_open: u64,
+    warn_fallback_skipped: u64,
+    warn_fallback_unbounded: u64,
     count: u32,
     capacity: u32,
     seq_next: u64,
@@ -216,6 +229,10 @@ pub fn snapshot(r: Ring) Stats {
         .fallback_broken = r.state.fallback_broken,
         .fb_sync_failures = r.state.fb_sync_failures,
         .redact_pattern_failed = r.state.redact_pattern_failed,
+        .warn_tls_no_verify = r.state.warn_tls_no_verify,
+        .warn_fallback_open = r.state.warn_fallback_open,
+        .warn_fallback_skipped = r.state.warn_fallback_skipped,
+        .warn_fallback_unbounded = r.state.warn_fallback_unbounded,
         .count = r.state.count,
         .capacity = r.state.capacity,
         .seq_next = r.state.seq_next,

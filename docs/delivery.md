@@ -16,7 +16,9 @@ view) restarts from zero on every restart.
 | Scheme | Semantics | ACK | Duplicate window |
 |---|---|---|---|
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
+| `https://` | same transport over TLS (see the TLS section below) | any HTTP 2xx status line | same as `http://` |
 | `tcp://` | **at-most-once** live; **at-least-once** once `export_fallback_file` is set — a failed send (including a partial write the receiver did see) parks the batch to the queue and it is retried | none — `write(2)` success counts as delivered | with the queue set: the receiver accepted the data but the send failed anyway (torn write, timeout) → the parked retry resends it. Without the queue there is no duplicate window — a receiver dying after accept loses silently; use `http://` for loss-sensitive receivers |
+| `tcps://` | same transport over TLS | none — `write(2)` success counts as delivered | same as `tcp://` |
 | `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle; a rollback that fails too is warned once — one torn line stays and the next batch appends after it (dying-disk signal) |
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
 
@@ -29,7 +31,10 @@ line** mid-batch — the receiver's codec must tolerate or resync (a
 length-delimited codec does; a strict line parser will not). `file://`:
 the rollback above makes the file whole batches only — a receiver
 reading it concurrently may see a batch disappear for the length of
-the retry, then reappear complete.
+the retry, then reappear complete. The sink also assumes a single
+writer: the rollback truncates to the last full batch boundary, so
+another process appending concurrently loses whatever it landed after
+that point — keep the file pg_logtap's own.
 
 Measured end-to-end (v0.3.0, pg_logtap → Vector http → VictoriaLogs
 jsonline insert, docker stand, warning-size lines): a 1000-event batch
@@ -41,6 +46,63 @@ captures at ~12 k ev/s, above).
 
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
+
+## TLS (`https://`, `tcps://`)
+
+Both network schemes have TLS twins — same transports, same ACKs and
+duplicate windows, encrypted with TLS 1.2/1.3 (std.crypto.tls; client
+certificates / mTLS are not supported). One handshake per batch, inside the
+existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
+handshake is an ordinary failed send — the batch parks on the fallback file
+/ RAM backlog and retries. The timeout is a strict per-attempt budget: the
+absolute deadline is re-armed before **every** socket read inside the
+handshake and the session after it, so a peer dribbling one TLS fragment
+per just-under-timeout interval cannot stretch the stage — each fragment
+costs only what is left of the budget, and once it is spent the send fails.
+The residual multiple is on the **write** side only, and it is a constant,
+not a function of batch size: the body goes out in 64 KB chunks, each chunk
+re-armed to the remaining budget before its records are written, and a
+64 KB chunk is ~4 TLS records — each socket write waits at most the value
+armed at the chunk's start, so a peer that stops reading stretches the
+write stage to at most ~4–5 × `export_timeout_ms` before the next chunk
+boundary finds the budget spent and fails the send. The plain
+`http://`/`tcp://` body write checks the same deadline between its write
+syscalls (each partial write would otherwise reset the per-write wait).
+When a send has already consumed the budget, the
+worker skips its `close_notify` (the fd close is the backstop) rather than
+pay further socket waits on an already-successful send. Three SIGHUP GUCs
+control verification:
+
+- `export_tls_ca` — PEM file with the CA to verify the receiver against
+  (for a self-signed receiver, the receiver's own certificate). Empty = the
+  system CA roots; a set file **replaces** them. The file is re-read before
+  every handshake, so certificate rotation needs no restart. Keep it on
+  local disk: the read sits inside the send attempt, and a hung network
+  filesystem would stall the worker outside every timeout. Intermediate
+  chains are the normal PKI shape: the receiver presents leaf+intermediate
+  and you pin the **root** — the path is built through the server-sent
+  intermediate; pinning the intermediate itself works too, and the file may
+  hold several certificates.
+- `export_tls_verify` — `off` disables chain and name verification.
+  Development only: with it off, a man in the middle can read the logs.
+  The first TLS send with it off logs one WARNING per worker life, and
+  handshake failures carry the likely fix in the transition-log reason
+  (the `export_tls_server_name` / `export_tls_ca` hint, or "the receiver
+  may not be speaking TLS on this port" for an https:// URL at a
+  plain-http port).
+- `export_tls_server_name` — certificate name to verify and SNI to send when
+  it differs from the URL host. Two cases need it: IP-literal URLs (name
+  verification matches DNS `dNSName` SANs only — an `iPAddress` SAN never
+  matches an IP-literal host) and a TLS-terminating load balancer in front
+  of the receiver. Empty = the URL host.
+
+`export_http_extra_headers` (plain `http://` included) appends extra header
+line(s) to every http(s) request after the fixed headers — e.g.
+`'Authorization: Bearer <token>'` for VictoriaLogs. Multiple lines are
+separated by the two-character `\n` sequence — a GUC value cannot carry a
+real newline (ALTER SYSTEM rejects one outright), so the escape is the only
+multi-line form; each line is CRLF-terminated on send. SET rejects a raw
+`\r` or an empty line (either would malform every request).
 
 ## Ordering and identity
 
@@ -96,8 +158,10 @@ already delivered.
 ### Worker pinned in one send
 
 While the worker sits in a single blocked send — up to `export_timeout_ms`
-against a receiver that accepted the connection but never answers — backends
-keep capturing, and only the ring absorbs it. Capture drops start when
+against a receiver that accepted the connection but never answers (a stage
+with several TLS writes can stretch this to a small multiple — TLS
+section) — backends keep capturing, and only the ring absorbs it. Capture
+drops start when
 
 ```
 r × export_timeout_ms > ring_capacity        (events/s × s > events)
@@ -109,6 +173,15 @@ cut `export_timeout_ms` to a few hundred ms. This is the structural reason a
 mute-but-accepting receiver is the worst case for capture, worse than a dead
 one (connection refused fails in milliseconds and the batch parks on the
 fallback file).
+
+The same arithmetic must cover the worker's longest **local** stall, not
+just the send: a `fallback_max_mb` compaction during an outage storm (the
+member walk plus the cap/2 copy) runs inside flush cycles, and on a slow
+disk it can hold drain for seconds — a 150k-event storm against a 1 MB cap
+was seen stalling drain past an 8192 ring on a CI runner (11k newest events
+refused at capture, accounted in `events_dropped`). When the cap is hit
+regularly on long outages, size `ring_capacity` for capture rate × (send
+timeout + the worst compaction walk), not for the send timeout alone.
 
 ### Receiver down for T minutes
 
@@ -144,6 +217,9 @@ parked to the fallback file in full — parking is local-disk work with no
 deadline by design: its fdatasync is the one deliberately non-abortable
 write in the flush (everything else checks the abort budget between
 syscalls), because that sync is the durability the crash contract rests on.
+The queue path is local disk by the same contract as `export_tls_ca`: on a
+hung NFS/FUSE mount the final parking — and every send-cycle append —
+blocks without a timeout, SIGTERM shutdown included.
 SIGKILL skips all of it.
 With `export_fallback_file` set, the queue is on disk and **survives the
 crash** — the restarted worker replays it; the exposure shrinks to roughly one
@@ -179,11 +255,13 @@ convention), so the file lives with your data by default; an absolute path
 works too. Keep it there — not in `/tmp` or `/var/log`: it is the durable copy
 and must survive reboots and log cleanup.
 
-When an `http://`/`tcp://` send fails and the path is set, the batch is
+When a send fails — any transport, `http(s)://`, `tcp(s)://`, `file://` — and
+the path is set, the batch is
 appended to the queue — one **gzip member per batch** behind a length framing
 (`PGLTFB01` magic, 0600, fdatasynced once per flush cycle) — and counted as
-`events_queued`: it left pg_logtap durably, and is counted again as
-`events_replayed` when delivered. The queue is an internal format, not a
+`events_queued` (a lifecycle stage, not a durability claim — `fb_sync_failures`
+names the cycles that are not durable) and again as `events_replayed` when
+delivered. The queue is an internal format, not a
 tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
@@ -211,6 +289,21 @@ shared volume): both writers share the framing magic, and their interleaved
 appends tear each other's members — both queues then read as corrupt and
 disable themselves. One file per cluster; `cluster_name` keeps the events
 apart downstream.
+
+A `file://` export_url and the fallback queue must not share one file either:
+the sink expects raw NDJSON, the queue `PGLTFB01` framing — each corrupts the
+other's format. Whichever GUC lands second on the pair is rejected at
+SET/`ALTER SYSTEM` time. One residual: flipping both GUCs in a single reload
+lands the pair together (each check sees the other's old value), and the
+queue's own foreign-content latch then degrades it loudly
+(`fallback_broken=1`, RAM-backlog bound) — never silent corruption.
+
+Durability liveness, part of the contract: a failed `fdatasync` (or a
+deferred one never followed by a later append) is not retried on a timer —
+the next append, truncate or landing compaction provides the next sync
+point, and until one does the affected member sits in the OS-crash window
+that `fb_sync_failures` names. Events replay throughout either way; only
+crash-durability is at stake.
 
 ### Size cap: `fallback_max_mb`
 
@@ -318,8 +411,10 @@ natively as long as the Prometheus scrape interval is shorter than the restart.
 
 Each event is counted once per lifecycle stage it actually passes through.
 The delivery invariant is `events_captured ≈ events_sent +
-(events_queued - events_replayed) + events_dropped + events_lost +
-in-flight/ring`. Names are identical in `pg_logtap_stats()` text, the
+(events_queued - events_replayed - events_compacted) + events_dropped +
+events_lost + in-flight/ring` — compacted events sit in both the backlog
+term and `events_lost` (they are never replayed), so leaving them in the
+backlog double-counts them. Names are identical in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition; the view adds
 derived `queue_backlog` and `delivered`.
 
@@ -341,5 +436,9 @@ itself queued. Persisting the offset in the file header is on the roadmap.
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while undelivered (also in `events_lost`; never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable queue member skipped, or a `fallback_max_mb` compaction dropping undelivered members |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
-| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth (`PgLogtapFbSyncFailing` uses `increase()`), not its level |
+| `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life): https/tcps is shipping unauthenticated. The server-log line is edge-triggered; this is its cumulative copy |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
+| `warn_fallback_skipped` | **lines** | an unreadable queue member was skipped (twice per member by design: the boot walk that credits the backlog, then the drain's own read); its events are counted in `events_lost` |
+| `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

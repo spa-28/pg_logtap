@@ -1,10 +1,381 @@
 # Changelog
 
+## 0.5.0 (2026-09-07)
+
+TLS export and HTTP auth-header round. Upgrade is the
+0.4.5 → 0.5.0 script (the four warn-counter attributes and the re-created
+view) + binary replace + restart; the four new GUCs are all SIGHUP.
+Audit `pg_logtap.export_url` before upgrading: a network URL with a space,
+DEL or raw UTF-8 byte (or a `file://` path of 4096+ bytes) that 0.4.x
+loaded with a worker-side warning is rejected at config parse now —
+ALTER SYSTEM refuses it, and a postgresql.conf/auto.conf holding one
+fails the reload (at boot it is fatal).
+
+### Added
+
+- `https://` and `tcps://` export URLs — the existing http/tcp transports
+  over TLS 1.2/1.3 (std.crypto.tls; no new dependencies; client
+  certificates / mTLS not supported). One handshake per batch over the
+  already-dialed socket, inside the existing `export_timeout_ms` and
+  SIGTERM-abort discipline; a failed handshake is an ordinary failed send.
+- `export_tls_ca` — PEM file with the receiver's CA (the receiver's own
+  certificate for a self-signed one); empty = the system CA roots, a set
+  file replaces them. Re-read before every handshake, so rotation needs no
+  restart — clearing the GUC falls back to the system roots on the next
+  handshake.
+- `export_tls_verify` (default on) and `export_tls_server_name` — the name
+  to verify and the SNI to send when it differs from the URL host:
+  IP-literal URLs (name verification matches dNSName SANs only) and
+  TLS-terminating load balancers.
+- `export_http_extra_headers` — extra header line(s) on every http(s)
+  request, e.g. `'Authorization: Bearer <token>'`. Multiple lines are
+  separated by the two-character `\n` sequence — a GUC value cannot carry
+  a real newline (ALTER SYSTEM rejects one outright), so the escape is the
+  only multi-line form; each line is CRLF-terminated on send, and the
+  plain quoted form just works.
+- `scripts/e2e-tls.sh` — acceptance against a self-signed receiver: verified
+  https delivery, handshake must fail (and later replay) with the CA cleared
+  and with an empty CA file, tcps delivery, verify=off delivering with
+  exactly one WARNING. Two substitution negatives: an impostor certificate
+  carrying the right name but its own key is rejected on the chain alone
+  (nothing reaches the impostor), and a `server_name` absent from the SANs
+  fails the handshake on the name alone — both recovering by SIGHUP. An
+  intermediate-CA chain: pinning only the root verifies through the
+  server-sent intermediate, and the intermediate itself works as the trust
+  anchor. The auth gate: a receiver demanding a tenant header plus
+  Authorization answers 401 to every send without them (failed cycles,
+  nothing accepted) and delivers with the `\n`-separated bearer form and
+  with Basic credentials.
+- Warning counters in `pg_logtap_stats()` / `pg_logtap_delivery`:
+  `warn_tls_no_verify`, `warn_fallback_open`, `warn_fallback_skipped`,
+  `warn_fallback_unbounded` — the cumulative, queryable copy of the
+  operator-facing WARNING lines (verify=off seen, fallback queue
+  unopenable, unreadable member skipped, divert into an unbounded queue).
+  The log lines stay edge-triggered; the counters are for alerts and the
+  e2e suites — in the Prometheus exposition too (named like their SQL
+  fields, no `_total`). In `pg_logtap_delivery` after the update script
+  (a stored view does not follow type changes, so the script re-creates
+  it); until the hop runs, the 0.4.x view keeps working —
+  `jsonb_populate_record` ignores the new fields.
+
+### Fixed
+
+- `/metrics` answers `405 Method Not Allowed` (same body) to a non-GET
+  request instead of a misleading `404 Not Found`.
+- A `metrics_addr` longer than the listener's address buffer kept a slice
+  pointing into the GUC's own string storage, which the next reload frees —
+  the later comparison read freed memory. An overlong address compares as
+  an always-unlistenable empty one now (`listenOn` rejects it either way,
+  and the periodic re-listen attempts no longer log).
+- A `setsockopt` failure while arming the TLS read deadline was silent: the
+  send failed with an empty or previous-attempt reason in the transition
+  log; it names itself now.
+- The DNS last-known-good cache keyed on the hostname only: with the port
+  changed in `export_url` during a resolver outage, the cached address
+  still carried the old port and the worker dialed it. The port is part of
+  the cache key now.
+- The `export_url` check hook runs the URL parser: a control byte, raw
+  space or DEL in a network scheme's host or path was documented to fail
+  at SET time, but the check hook only tested the fallback aliasing — the
+  value loaded into the GUC and only died in the worker's
+  unparseable-URL warning a cycle later. A `file://` path of 4096+ bytes
+  is rejected the same way — it loaded fine and then failed every send
+  silently (the sink's path buffers are 4096 bytes). e2e-kill drives the
+  rejections through ALTER SYSTEM (the GUC is `PGC_SIGHUP`, so ALTER
+  SYSTEM is the path that reaches the hook) and a spaced `file://` path
+  through acceptance.
+- A transient metrics bind failure (the port still held by a dying
+  process, the interface not up yet) no longer records the listener as
+  served: the failed state stays unrecorded, so the next SIGHUP retries
+  instead of the listener staying down until the GUC changed again; the
+  failure logs once per streak. The stale open state of the fd the failed
+  attempt closed is poisoned with a port no GUC can hold: a SIGHUP back to
+  the previously-open port/address re-opens the listener instead of
+  matching the early-return guard, and turning metrics off re-arms the
+  failure log for a later streak.
+
+### Hardening
+
+- A `file://` rollback after a failed `fdatasync` is synced too: the failed
+  sync may already have pushed the batch's pages and size out, and an
+  unsynced `ftruncate` could resurrect them after an OS crash — where the
+  retried batch, parked on the fallback queue, would replay a second copy
+  after the resurrected one. A rollback sync that fails as well keeps the
+  retry (at-least-once), the same trade the rollback-failed path documents.
+  The rollback after a torn write mid-batch syncs the same way: the
+  truncation itself is a durability event there too, not only when the
+  sync failed first.
+- A send attempt runs on one absolute budget. Each socket syscall was
+  already bounded by `export_timeout_ms`, but the stages were not: a
+  stalled resolver could spend seconds before a connect that bought its
+  own full timeout, then a write, then a status read — several budgets in
+  one attempt. The timeout is armed as a deadline at send start and
+  re-armed on the socket at every stage boundary and loop iteration
+  (post-dial, TLS handshake, body chunks, status reads); an attempt past
+  its budget fails as an ordinary send and the batch takes the usual
+  retry/fallback path. DNS stays outside the budget, as before and as the
+  GUC table documents (getaddrinfo has no timeout knob).
+- `export_http_extra_headers` cannot malform a request: a raw CR/LF byte and
+  an embedded empty line are rejected at SET (each would end the header
+  section early), and everything else about line endings is normalized on
+  send — each configured line gets its CRLF and the value is always
+  terminated, so the fixed headers after it always start on a fresh line.
+  Unit-tested in export.zig, gate-tested by e2e-tls phase 9.
+  Protocol-owned names — `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Connection`, `Content-Encoding`, `TE`, `Upgrade`, `Proxy-Connection`,
+  `Expect`, `Content-Type` —
+  are rejected case-insensitively, as is a line without a colon: the
+  sender owns the framing and identity headers, and a config-supplied
+  second copy makes a request with conflicting semantics (two
+  Content-Lengths is smuggling-shaped). `Expect` would invite interim
+  1xx responses the first-line-only status reader cannot parse, and
+  `Content-Type` is always the sender's `application/x-ndjson`.
+  Application headers
+  (`Authorization`, `X-*`) are unaffected. A name carrying whitespace
+  before its colon is not a distinct header — lenient parsers read
+  `Content-Length : 5` as the owned name — so the name must be a real
+  RFC 7230 token (tchar bytes only, non-empty) and the value visible
+  ASCII with SP/HTAB; raw control bytes and raw UTF-8 in a value are
+  rejected too (non-ASCII belongs percent-encoded).
+- TLS failures name their fix instead of an error name: a certificate name
+  mismatch appends the `export_tls_server_name` hint (IP-literal URLs always
+  need it), an unknown CA appends the `export_tls_ca` hint, decode-class
+  errors say the receiver may not be speaking TLS on that port (an https://
+  URL at a plain-http port is the classic). A `export_tls_ca` file that
+  cannot be read, or parses but holds no certificates (created empty, wrong
+  file), fails with the path in the reason instead of an opaque chain error
+  on every handshake.
+- `export_tls_verify=off` logs one WARNING per worker life at the first
+  TLS send — the documented development escape hatch now leaves an
+  operator-visible trace in the server log.
+- A fallback member that inflates past the framing bound cannot grow the
+  worker's memory: the `member_max` check bounds only the compressed input,
+  so a small crafted member (a decompression bomb) could inflate into an
+  unbounded buffer before the post-inflate check ran. The inflate buffer is
+  fixed at `member_max` now — a member that crosses it fails the write and
+  is skipped as unreadable exactly like a gzip-damaged one (framing intact,
+  counted in `events_lost`, `fallback_broken` untouched), in replay and in
+  the compaction walk alike. ~5 MB allocated once on first replay.
+- A failed compaction `fdatasync` counts in `fb_sync_failures` and warns
+  like any other sync failure: a landed compaction is one of the queue's
+  documented durability points, so its failed sync belongs in the counter
+  (safety unchanged — the rewrite is abandoned, the original queue stands).
+- Every queue-side truncate is a durability event and syncs like one: the
+  rollback of a torn queue header, the rollback of a torn member
+  mid-append and the torn-tail repair in replay all `ftruncate` and then
+  `fdatasync` — an unsynced truncate lets an OS crash resurrect the torn
+  tail, and the next append would land after garbage and shift the
+  framing of everything past it.
+- A `file://` export_url and `export_fallback_file` cannot resolve to the
+  same file: the NDJSON sink and the `PGLTFB01` framing corrupt each other.
+  Whichever GUC lands second is rejected at SET/`ALTER SYSTEM`. The docs
+  now state the fallback queue's scope for what it already was — every
+  transport parks there, `file://` included — and the same-reload
+  double-flip residual (the foreign-content latch handles that pair loudly).
+- The alias rule above is enforced on the filesystem object, not just the
+  path string: a symlink or hardlink names the same inode under a different
+  string, which the SET-time check cannot see. At open time, on both sides,
+  the actual `(st_dev, st_ino)` decides — the `file://` sink refuses the
+  send (warned once; events ride the RAM backlog) when its fd is the
+  queue's file, and the queue latches `fallback_broken` exactly like any
+  unusable queue when its fd is the sink's file. The check is symmetric, so
+  an alias disables both writers and the shared file never holds mixed
+  formats; recovery is one GUC repoint. Residual, by design: a path swapped
+  between its check and the other side's open (a racing writer inside the
+  data directory) can still land both on one inode — the foreign-content
+  latch keeps that from silent corruption. e2e-kill drives both shapes
+  (symlinked sink, hardlinked queue) and asserts the file stays empty.
+- Every socket read inside a TLS handshake or session is re-armed to the
+  send attempt's absolute deadline: the TLS library's handshake loop has no
+  bound on the number of reads it will do, so a peer dribbling one record
+  fragment per just-under-timeout interval could pin the worker inside the
+  handshake forever — each individual recv succeeded, the per-read
+  `SO_RCVTIMEO` never fired. The TLS socket reader wraps the deadline now
+  (`remaining = deadline − now` before every read), so the handshake and
+  the status reads after it are strictly inside `export_timeout_ms`; the
+  residual multiple is on the write side only, and it is a constant —
+  one 64 KB chunk's ~4 TLS records, each waiting at most what was armed at
+  the chunk's start, never batch-proportional; the next chunk boundary
+  fails the send once the budget is spent.
+  After a successful send, the best-effort `close_notify` is re-armed to
+  the deadline's remainder before it writes — it used to check the clock
+  and then write with whatever `SO_SNDTIMEO` the last stage had armed,
+  one full extra timeout past the budget. With no remainder left it is
+  skipped (the fd close is the backstop). e2e-tls phase
+  10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
+- The network `export_url` schemes reject a host or path carrying a control
+  byte, a raw space, DEL or any non-ASCII byte at SET: the host and path
+  ride the HTTP request line verbatim, so such a value could split or
+  smuggle the request line on every send — an unparseable URL fails loudly
+  instead, and non-ASCII belongs percent-encoded. `file://` paths are local
+  filenames and keep spaces.
+- The plain `http://`/`tcp://` body write checks the send attempt's
+  absolute deadline between syscalls, like every other stage: each partial
+  write resets the socket's per-write wait, so a receiver accepting one
+  byte per just-under-timeout interval could stretch one body across many
+  individually-bounded waits (TLS already re-armed per chunk). The
+  deadline is an explicit argument to the shared writer, not ambient —
+  the compaction copy and metrics replies stay abort-aware without
+  measuring against a stale send deadline. The socket timeout is re-armed
+  to the deadline's remainder before every write syscall too: the check
+  between syscalls alone let a write started just inside the deadline
+  block for one more full `SO_SNDTIMEO` past it.
+- A metrics client that connects but dribbles its request line gets 50 ms
+  (was 100 ms) before its connection is dropped — a loopback scraper's
+  line lands in the first poll and a legitimately laggy client's
+  inter-fragment gap stays covered (e2e-metrics drives a 20 ms one), so
+  the tightening costs nothing real while halving the per-cycle tax a
+  broken scraper can levy; the 250 ms per-cycle scrape budget still caps
+  the total.
+- A pre-existing fallback queue or `file://` sink file is tightened to
+  0600 on open: the mode argument of `open(2)` applies at creation only,
+  so a file an operator left world-readable stayed that way while the
+  queue's compressed log stream accumulated in it. e2e-kill pre-creates a
+  0644 queue and asserts the mode after the first open.
+- A failed parent-directory fsync at queue creation warns once (it was
+  silent): the queue's data is still fdatasynced, but until the kernel
+  writes the directory back an OS crash may drop the queue's name — that
+  window degrades to what a RAM-only worker would lose, never worse, so
+  no broken-mark: the queue still beats RAM. The warning re-arms on a
+  successful sync — an independent later failure is heard again.
+- The `export_fallback_file` docs state the local-disk contract explicitly,
+  mirroring `export_tls_ca`: appends and the final shutdown parking have
+  no timeout, so a hung network filesystem at the queue path blocks the
+  worker and its SIGTERM shutdown outright.
+
+### Internal
+
+- The CA bundle replacement under a rotating `export_tls_ca` takes the
+  same lock the TLS client takes shared while verifying: the mutation was
+  safe only by the worker's single-threaded call graph, now it holds by
+  construction.
+- SIGHUP resets the receiver-slow flag (a stale flag from the previous
+  receiver — or from a threshold since disabled — parked the new
+  destination's batches until a quiet cycle re-probed it), and the
+  unparseable-URL warning re-arms when a URL parses again (bad → fixed →
+  bad warns twice, like the file:// latches). A TLS receiver closing the
+  session cleanly before any status line is reported as `tls eof`, not as
+  the previous attempt's leftover error text.
+- `writeAll` owns its failure reason — the abort exit says `write abort`,
+  a write error says `write errno=N`, and the deadline arming says its
+  own; the network callers return it instead of stamping a stage label
+  over it with an errno that may belong to an earlier syscall.
+- The `events_queued` Prometheus HELP and the fallback section of
+  delivery.md call it a lifecycle stage like the counters glossary already
+  did, and delivery.md's `events_captured ≈ …` invariant subtracts
+  `events_compacted` from the backlog term — compacted events sit in both
+  `queued − replayed` and `events_lost`, so the formula double-counted
+  them.
+- The Makefile is the single entry point now: `make check` (fmt + lint +
+  unit tests + the .so compile), `make container` (the same battery in the
+  pgzx-build container), `make e2e` (the docker matrix), `make deploy` —
+  thin aliases over the scripts, plus the conventional
+  `make && make install`. CI runs the make targets itself, so the interface
+  cannot drift from the real build.
+- The extension's update chain is continuous again: the
+  0.4.4 → 0.4.5 hop was missing (0.4.5 changed no SQL, but every version
+  ships one — without it `ALTER EXTENSION UPDATE` could not leave 0.4.4).
+  It ships now, comment-only, alongside this version's 0.4.5 → 0.5.0
+  script.
+- SIGHUP no longer leaks the source-identity strings (hostname/cluster/
+  pgdata were duped on every reload and never freed; the copies are owned
+  now, and a reload with unchanged values keeps the allocation), and the
+  oid→name cache is bounded (4096 entries per map — a database/role
+  create-drop storm grew it forever; past the bound the maps reset and
+  re-fill lazily from the catalog).
+- `fb_sync_failures` non-zero is history, not current state, everywhere the
+  counter appears (README, delivery.md, the /metrics HELP): the next
+  successful sync — or a compaction, whose rewrite is fdatasynced before
+  the rename — makes the queue durable again while the counter stays;
+  alert on its growth, not its level.
+- e2e-tls phase 11, rapid trust rotation through SIGHUP: ca / server_name /
+  url alternated across reloads, two rounds of verified → cleared-CA fail →
+  root-pinned chain → name-mismatch fail — the per-handshake bundle rebuild
+  must land the right trust decision every time (no stale bundle, no stale
+  name), with failed-cycle and zero-leak asserts at every step.
+- e2e-tls phase 12, a receiver pinned to TLS 1.2 only (min = max =
+  TLSv1_2): verified delivery with the negotiated version asserted from the
+  receiver side — the 1.2 half of the documented TLS 1.2/1.3 support is
+  acceptance-tested instead of implied by the 1.3 passes (Zig's client
+  offers both).
+- e2e-tls phase 13, the write-side dribbler on plain http: a receiver with a
+  tiny receive buffer draining one byte per second — every body-write
+  syscall succeeds inside its per-write `SO_SNDTIMEO` (a partial write
+  resets the wait), so the phase proves the between-syscall absolute
+  deadline is what fails the send; the body replays whole once repointed.
+  The write-side twin of phase 10's handshake dribbler.
+- Docs: the DNS last-known-good window is stated as hard 60 s (only a dial
+  after a fresh resolution refreshes it — the cached-address dial does
+  not), `export_tls_ca` is documented as local-disk (the per-handshake read
+  sits in the send path), the `file://` sink's single-writer assumption is
+  spelled out, and the README states the IPv6-literal stance next to the
+  export_url schemes. The worker also refuses to compile off-Linux now —
+  the raw syscall structs are asm-generic Linux layouts.
+- The DNS last-known-good address has explicit semantics, documented with
+  the `export_url` schemes: it is used only while in-process resolution
+  fails, only for the host that produced it, and only within 60 s of the
+  last successful dial (a successful dial refreshes it). On
+  `https://`/`tcps://` a stale address that no longer serves the host fails
+  certificate verification; on plain `http://`/`tcp://` a reassigned IP can
+  receive logs for at most that window.
+- e2e-tls phase 8, the ambiguous close: a receiver whose TLS layer takes
+  the whole request body and then ends the session before any status line.
+  The send fails on the status read (with tls.zig's stage detail folded
+  into the reason now), the events survive in RAM and replay whole to the
+  next url, and the body the closer did accept is asserted present — the
+  duplicate window the contract allows for exactly this shape.
+- The eleven e2e scripts share `scripts/e2e-common.sh` instead of a
+  copy-pasted prologue: container/GUC/marker helpers, the ready gate and a
+  per-container `flock` so two suites cannot race one stand. The container
+  argument is now optional everywhere (defaults to the running compose
+  stand), and e2e-tls counts per-phase named markers instead of number
+  ranges, so one phase's asserts cannot be satisfied by another's events.
+  e2e-kill's no-loss asserts became deltas — the counters are
+  per-cluster-life and a reused container already carried a previous run's
+  deliberate losses.
+- The e2e suites run under plain `set -u` (asserts are explicit; `set -e`
+  only bred `|| true` noise around every expected-to-fail command), and
+  `wait_for` FAILS on timeout instead of silently falling through — a wait
+  that rode the fall-through once green-lit suites on follow-up asserts or
+  on nothing. The four WARNING-count checks read the new warn_* counters
+  via `pg_logtap_stats()` instead of grepping `docker logs` (torn-tail
+  escalations via the `fallback_broken` gauge), and robust's
+  pattern_exclude control event is actually awaited now — the old marker
+  never matched.
+- The TLS suite is a `test-matrix.sh` phase (`PHASES=…,tls,…`, on by
+  default): every PG major gets the verified/impostor/server_name/
+  intermediate/tcps/verify=off acceptance, not just the dev stand's
+  major. The receivers run host-side, so the phase needs `openssl` and
+  `python` on the host. `set_gucs` applies a reload barrier instead of
+  timed sleeps — SHOW polled in a fresh session until the new config
+  generation is visible, plus one `export_timeout_ms` for the worker's
+  worst in-flight send — so markers generated after a url switch cannot
+  ride the old destination; the suite also clears any fallback file
+  inherited from earlier matrix phases, whose failure-phase parking
+  belonged to those suites' scenarios, not this one's.
+- `JOBS=N test-matrix.sh` runs the PG majors in parallel (~1.7× on four):
+  each major gets its own output dir, its own vector receiver (the
+  kill/robust suites stop THEIR receiver mid-scenario — with one shared
+  vector those phases serialized the whole matrix behind a lock, measured
+  slower than sequential; vlogs and the mute silent receiver stay shared,
+  nothing stops them and the vlogs asserts are marker-filtered), its own
+  TLS receiver ports and per-container names for the ephemeral receivers
+  (slow/faults/metrics/frag/hookchain). The tested pg containers are plain
+  `docker run` on the stand's network — compose offers one container per
+  project+service, and the cross-major recreate/label-rm dance existed
+  only to fake per-major service slots. Builds and stand bring-ups
+  serialize on one lock (shared zig-out and the pgzx-build cache).
+- The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
+  the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
+  chunk bounds shared with buildBody, and its boot path (compaction-litter
+  cleanup, backlog credit). No behavior change — the same functions under
+  `fb.` with namespaced state; the worker keeps the transports, deadlines
+  and the metrics server.
+
 ## 0.4.5 (2026-09-04)
 
-Boot-safety and delivery-contract documentation round from the fifth
-external review. No schema, GUC or counter changes; upgrade is binary
-replace + restart.
+Boot-safety and delivery-contract documentation round. No schema, GUC or
+counter changes; upgrade is binary replace + restart.
 
 ### Fixed
 
@@ -31,7 +402,7 @@ replace + restart.
 
 ## 0.4.4 (2026-09-04)
 
-TCP-stream parsing and accounting round from the fourth external review.
+TCP-stream parsing and accounting round.
 Upgrade is the 0.4.3 → 0.4.4 script (schema unchanged — the script only
 provides the update path) + binary replace + restart; no new GUCs or
 counters.
@@ -75,7 +446,7 @@ counters.
 
 ## 0.4.3 (2026-09-03)
 
-Filesystem-hardening round from the third external review. Upgrade is the
+Filesystem-hardening round. Upgrade is the
 0.4.2 → 0.4.3 script (schema unchanged — the script only provides the
 update path) + binary replace + restart; no new GUCs or counters.
 
@@ -117,7 +488,7 @@ update path) + binary replace + restart; no new GUCs or counters.
 
 ## 0.4.2 (2026-09-02)
 
-Delivery-hardening round from the second external review. Upgrade is the
+Delivery-hardening round. Upgrade is the
 0.4.1 → 0.4.2 script (one new counter attribute) + binary replace +
 restart.
 
@@ -154,7 +525,7 @@ restart.
 
 ## 0.4.1 (2026-09-01)
 
-Hardening round from the 0.4.0 external review. No schema or shmem
+Hardening round. No schema or shmem
 changes; upgrade is a binary replace + restart as usual.
 
 ### Fixed

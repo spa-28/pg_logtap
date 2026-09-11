@@ -14,9 +14,20 @@
 #                        replay stays on
 #   corrupt-member     : a damaged gzip member mid-queue (framing intact) is
 #                        skipped and counted lost; later members still replay
+#   bomb-member        : a member under the compressed bound that inflates
+#                        far past it (gzip bomb) is skipped like a damaged
+#                        one; the worker's memory stays flat, later members
+#                        still replay
+#   url-fb-aliasing    : a file:// export_url and the fallback path naming
+#                        one file are rejected at SET, in both directions
 #   symlink-queue      : a symlink at the fallback path is refused — the file
 #                        it names stays intact, fallback_broken=1 + one
 #                        WARNING, events ride the RAM backlog
+#   inode-aliasing     : symlink/hardlink aliases the SET-time string check
+#                        cannot see are refused at OPEN time on both sides —
+#                        the sink refuses to send (queue framing stays
+#                        intact), the queue latches broken (the live sink
+#                        keeps delivering pure NDJSON)
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -29,107 +40,31 @@
 # Usage: scripts/e2e-kill.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
-set -eu
-PG_CT="${1:-pglogtap-pg}"
-NET=pglogtap-e2e_default
-OUT=/tmp/logtap-e2e
-VEC=pglogtap-vector
-SILENT=pglogtap-silent
+set -u
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init kill "${1:-}"
+e2e_gate
 
-fail() {
-  echo "e2e-kill: FAILED: $*" >&2
-  # Post-mortem for the log: counters, worker liveness, export transition
-  # lines, the receiver's own log. The server-log grep scans the WHOLE log
-  # and only then tails: a burst of the very events being lost once pushed
-  # the "export failing (fail_reason)" line past a plain tail -15.
-  docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  docker exec "$PG_CT" psql -U postgres -Atc \
-    "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'" >&2 || true
-  docker logs "$PG_CT" 2>&1 | grep -iE "logtap.*(failing|recovered|divert|fallback|lost)|PANIC|FATAL" | tail -8 >&2 || true
-  # Receiver state: a vector that died mid-scenario (observed in CI: silent
-  # death ~1s after docker start) leaves the worker's dials failing fast while
-  # every count comes up short — name the killer.
-  docker inspect -f "receiver: {{.State.Status}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}" "$VEC" >&2 || true
-  # Ground truth on the name at the moment of failure: a fresh glibc lookup
-  # (what the bash probe uses) vs the worker's wedged one, plus the container's
-  # actual network registration — repeated, because the wedge sets in AFTER a
-  # brief good window following docker start.
+# Ground truth on the receiver name at failure time: a fresh glibc lookup
+# (what the bash probe uses) vs the worker's wedged one, plus the container's
+# actual network registration — repeated, because the wedge sets in AFTER a
+# brief good window following docker start.
+fail_extra() {
   n=1; while [ "$n" -le 3 ]; do
-    docker exec "$PG_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
+    docker exec "$E2E_CT" getent hosts "$VEC" >&2 2>&1 || echo "  getent #$n: FAIL" >&2
     n=$((n + 1)); sleep 2
   done
-  docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2 || true
-  docker exec "$PG_CT" getent hosts "$PG_CT" >&2 || true
-  docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2 || true
-  docker logs --tail 8 "$VEC" >&2 2>&1 || true
-  exit 1
-}
-ok() { echo "  ok: $*"; }
-
-wait_vector() { # until the receiver actually accepts TCP again after the
-  # suite itself stopped it (docker start): vector rebinds its port SLOWLY on
-  # a loaded host (observed 30 s locally), and generating before that fails
-  # every send and burns the wait_for windows.
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" bash -c "exec 3<>/dev/tcp/$VEC/8686" 2>/dev/null && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "receiver $VEC not accepting connections after 60s"
-}
-
-# Stand gate: the compose one-shot must have passed — pg healthy AND the
-# receiver port answering at boot (tests/e2e/compose.yaml, `ready`).
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
-  || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
-mkdir -p "$OUT" # vector-out.jsonl accumulates across runs BY DESIGN:
-                # counting is marker-based, never line-total-based
-
-setguc() { docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$PG_CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
-SUF="-$$" # per-run marker suffix: vector-out.jsonl accumulates across runs
-gen() { # gen <marker> <count> — distinct events from one psql round trip.
-  # Markers carry the run's PID ($SUF): vector-out.jsonl accumulates across
-  # runs, and identical markers would make an old run's lines satisfy this
-  # run's asserts. WARNING: above the default log_min_messages (so it reaches
-  # the hook) and not an error (so the loop is not aborted); a caught RAISE
-  # EXCEPTION never reaches the server log at all.
-  docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
-    WHILE i < $2 LOOP
-      RAISE WARNING 'logtap kill $1$SUF %', i;
-      i := i + 1;
-    END LOOP; END \$\$" >/dev/null 2>&1 || echo "  gen $1: psql FAILED (events never emitted)" >&2
-}
-# Count distinct marker events; the trailing digit requirement keeps out the
-# duration-log line of the generating DO statement itself (its message quotes
-# the RAISE format string when log_min_duration_statement is on).
-received() { grep -oE "logtap kill $1$SUF [0-9]+" "$OUT/vector-out.jsonl" 2>/dev/null | sort -u | wc -l; }
-seqs_of() { grep -E "logtap kill $1$SUF [0-9]+" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | cut -d: -f2; }
-# TCP probe only: the official image's temporary initdb server answers a plain
-# pg_isready on the unix socket before the real server exists.
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$PG_CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  fail "postgres in $PG_CT not ready after 60s"
-}
-stats() { docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
-wait_for() { # wait_for <marker> <count>
-  n=0
-  while [ "$n" -lt 15 ]; do
-    [ "$(received "$1")" -ge "$2" ] && return 0
-    n=$((n + 1)); sleep 1
-  done
+  docker inspect -f "receiver nets: {{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}}={{\$v.IPAddress}} {{end}}" "$VEC" >&2
+  docker exec "$E2E_CT" getent hosts "$E2E_CT" >&2
+  docker logs "$VEC" 2>&1 | grep -iE "panic|fatal|shut" | tail -3 >&2
+  docker logs --tail 8 "$VEC" >&2 2>&1
 }
 
 echo "== receiver outage: down → up =="
+# Counters are per-cluster-life: a previous kill run's lossy scenarios
+# (fallback_max_mb) leave them non-zero on a reused container, so the
+# no-loss asserts below are DELTAS from here, not absolute zeros.
+lost0=$(statf events_lost); drp0=$(statf events_dropped)
 setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 gen outage1 20; wait_for outage1 20
 gen outage2 100 # more baseline traffic, all delivered while the receiver is up
@@ -154,8 +89,8 @@ dups=$(grep 'logtap kill' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sor
 [ "$(received outage1)" = 20 ] && [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ] \
   || fail "receiver outage: loss (outage1=$(received outage1) outage3=$(received outage3) outage4=$(received outage4))"
 [ "$dups" = 0 ] || fail "receiver outage: $dups duplicate seqs — dedup-by-seq contract broken"
-[ "$(statf events_lost)" = 0 ] && [ "$(statf events_dropped)" = 0 ] \
-  || fail "receiver outage: counters lost=$(statf events_lost) dropped=$(statf events_dropped)"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] && [ "$(( $(statf events_dropped) - drp0 ))" = 0 ] \
+  || fail "receiver outage: counters lost=$(( $(statf events_lost) - lost0 )) dropped=$(( $(statf events_dropped) - drp0 ))"
 ok "140/140 delivered, 0 duplicate seqs, lost=0 dropped=0"
 
 echo "== postmaster kill: SIGKILL with a RAM backlog =="
@@ -166,7 +101,7 @@ base_cap=$(statf events_captured); base_exp=$(statf events_sent)
 gen kill1 300; sleep 3
 [ $(( $(statf events_captured) - base_cap )) -ge 300 ] || fail "postmaster kill: events not captured"
 [ $(( $(statf events_sent) - base_exp )) = 0 ] || fail "postmaster kill: sent moved with a dead receiver"
-[ "$(statf events_lost)" = 0 ] || fail "postmaster kill: backlog overflowed (ring too small for 300 events?)"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "postmaster kill: backlog overflowed (ring too small for 300 events?)"
 pre_seq=$(grep -o '"seq":[0-9]*' "$OUT/vector-out.jsonl" | cut -d: -f2 | sort -n | tail -1)
 docker kill "$PG_CT" >/dev/null # SIGKILL: postmaster, worker, shmem — all gone
 docker start "$PG_CT" >/dev/null; wait_ready
@@ -191,19 +126,24 @@ FB="$FB_DIR/$FB_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
-# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so in
-# the log — exactly one WARNING per divert, not one per append. docker logs
-# --since does not reliably bound the window on a long-lived container (its
-# filter misses older entries), so count the DELTA over the whole log: what
-# the scenario added is what the divert produced.
-warns0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true)
-setguc pg_logtap.fallback_max_mb 0; reload; sleep 1
+# R-4: parking into an UNBOUNDED queue (fallback_max_mb=0) must say so —
+# exactly one WARNING per divert, not one per append. The warn_fallback_unbounded
+# counter (in pg_logtap_stats) is the queryable copy of that log line.
+warns0=$(statf warn_fallback_unbounded)
+setguc pg_logtap.fallback_max_mb 0; reload
+# SHOW barrier, not a timed sleep: on a slow runner the whole 2600-event
+# burst parks before the worker applies the reload, every divert sees the
+# old cap and the unbounded warning never fires (seen on a CI arm64 box).
+n=0; while [ "$n" -lt 20 ] && [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.fallback_max_mb")" != 0 ]; do
+  n=$((n + 1)); sleep 1
+done
+sleep 1 # one flush cycle for the worker to apply the landed config
 gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
-warns=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue is unbounded" || true) - warns0 ))
+warns=$(( $(statf warn_fallback_unbounded) - warns0 ))
 [ "$warns" = 1 ] || fail "fallback-queue: unbounded-queue WARNING count is $warns, want exactly 1"
 ok "receiver dead → 2600 events queued compressed ($fb_sz bytes), lost=0, unbounded warned once"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
@@ -224,9 +164,8 @@ echo "== torn queue tail: crash mid-append =="
 # The exact shape a crash mid-append leaves: magic, a member header claiming
 # 1000 bytes, then only 100. The worker's next read (its boot-time queue
 # walk) must cut the file back to the member boundary and append there —
-# not disable replay, not misparse the framing. (docker logs --since does
-# not bound the window on a long-lived container — count the delta.)
-corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
+# not disable replay, not misparse the framing (fallback_broken stays 0).
+corr0=$(statf fallback_broken)
 # Write the template while the fallback is still off (export_fallback_file=''
 # since the previous scenario) — the worker does not open the file at all.
 # Writing it after the reload instead raced the worker's own appends: parking
@@ -244,8 +183,7 @@ sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for torn1 20
 [ "$(received torn1)" = 20 ] || fail "torn queue tail: replay broken (torn1=$(received torn1)/20)"
-corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
-[ "$corr" = 0 ] || fail "torn queue tail: misparsed as corrupt instead of cut"
+[ "$(statf fallback_broken)" = "$corr0" ] || fail "torn queue tail: misparsed as corrupt instead of cut (fallback_broken=$(statf fallback_broken))"
 ok "torn tail cut at the member boundary, appends resumed, 20/20 replayed"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
@@ -271,7 +209,7 @@ while [ "$off" -lt "$sz" ]; do
   len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
   [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "corrupt member: framing unreadable at $off (len='$len')"
   end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
-  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null || true)
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
   case "$body" in
     *"logtap kill cmX"*)
       # A member holding cmX AND another marker means a flush-cycle stall
@@ -288,8 +226,6 @@ done
 for h in $hits; do
   docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=$((h + 4)) count=16 conv=notrunc" >/dev/null 2>&1
 done
-skip0=$(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true)
-corr0=$(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true)
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
@@ -300,16 +236,150 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 # lost — one per damaged member (the member, not its events, is the loss
 # unit)
 [ "$(statf events_lost)" = "$nhits" ] || fail "corrupt member: events_lost=$(statf events_lost), want $nhits"
-skip=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "unreadable, skipped" || true) - skip0 ))
-# twice per member by design: the boot walk that credits the backlog logs
-# it, then the drain's own read of the damaged member logs it again
+skip=$(statf warn_fallback_skipped)
+# twice per member by design: the boot walk that credits the backlog counts
+# it, then the drain's own read of the damaged member counts it again
 [ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
-corr=$(( $(docker logs "$PG_CT" 2>&1 | grep -cE "replay disabled|framing corrupt|not a pg_logtap queue" || true) - corr0 ))
-[ "$corr" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
+[ "$(statf fallback_broken)" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 [ "$fb_sz" = 0 ] || fail "corrupt member: queue not truncated after replay ($fb_sz bytes left)"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "$nhits damaged member(s) skipped (lost=$(statf events_lost)), A/B/C replayed 30/30, framing held"
+
+echo "== decompression-bomb member: inflate bounded, member skipped not inflated =="
+# A member whose COMPRESSED length passes the framing bound but which
+# inflates far past member_max: the fixed inflate buffer is the ceiling —
+# the member is skipped as unreadable exactly like a damaged one, the
+# worker's memory stays flat, and later members replay. An unbounded
+# inflate would have taken 512MB of RSS before a post-hoc size check.
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+gen bombX 10; sleep 1; gen bombA 10; sleep 2
+# The bomb: 512MB of zeros gzip-9s to well under the ~5.2MB framing bound
+# and inflates a hundredfold past it. Built in-container — dd and gzip are
+# the same tools the walk above uses.
+docker exec "$PG_CT" sh -c "dd if=/dev/zero bs=1048576 count=512 2>/dev/null | gzip -9 -c > /tmp/bomb.gz"
+blen=$(docker exec "$PG_CT" stat -c %s /tmp/bomb.gz)
+[ "$blen" -lt 5000000 ] 2>/dev/null || fail "bomb member: compressed $blen not under the framing bound — scenario broken"
+# Replace every bombX member's gzip payload with the bomb (framing [len]
+# rewritten to the bomb's length) — same walk as the corrupt-member phase.
+sz=$(docker exec "$PG_CT" stat -c %s "$FB")
+off=8; segs=""; nb=0
+while [ "$off" -lt "$sz" ]; do
+  len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
+  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "bomb member: framing unreadable at $off (len='$len')"
+  end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "bomb member: torn member at $off (end=$end sz=$sz)"
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
+  case "$body" in
+    *"logtap kill bombX"*) segs="$segs $off:$end"; nb=$((nb + 1)) ;;
+  esac
+  off=$end
+done
+[ "$nb" -ge 1 ] || fail "bomb member: no bombX member found in the queue"
+# Splice in ONE docker exec ending in an atomic mv: a worker cycle landing
+# mid-rebuild sees either the old or the new file, never a torn one.
+b0=$((blen & 255)); b1=$(((blen >> 8) & 255)); b2=$(((blen >> 16) & 255)); b3=$(((blen >> 24) & 255))
+lesc=$(printf '\\%03o\\%03o\\%03o\\%03o' "$b0" "$b1" "$b2" "$b3")
+docker exec "$PG_CT" sh -c "
+  : > /tmp/fb.new
+  prev=0
+  for s in $segs; do
+    o=\${s%:*}; e=\${s#*:}
+    tail -c +\$((prev + 1)) '$FB' | head -c \$((o - prev)) >> /tmp/fb.new
+    printf '$lesc' >> /tmp/fb.new
+    cat /tmp/bomb.gz >> /tmp/fb.new
+    prev=\$e
+  done
+  tail -c +\$((prev + 1)) '$FB' >> /tmp/fb.new
+  mv /tmp/fb.new '$FB'; rm -f /tmp/bomb.gz
+"
+docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
+sleep 2 # the boot queue walk hits the bomb here — this is the bounded-inflate moment
+hwm=$(docker exec "$PG_CT" cat "/proc/$(worker_pid)/status" 2>/dev/null | awk '/^VmHWM/{print $2}')
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for bombA 10
+[ "$(received bombA)" = 10 ] || fail "bomb member: later members not replayed (bombA=$(received bombA)/10)"
+[ "$(received bombX)" = 0 ] || fail "bomb member: bomb content delivered?? (bombX=$(received bombX))"
+# Fresh shmem at the restart, so absolutes: one loss per bomb member (the
+# member, not its events), two skips per member (boot walk + drain), and
+# the skip must never escalate to a framing error.
+[ "$(statf events_lost)" = "$nb" ] || fail "bomb member: events_lost=$(statf events_lost), want $nb"
+[ "$(statf warn_fallback_skipped)" = $((2 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((2 * nb))"
+[ "$(statf fallback_broken)" = 0 ] || fail "bomb member: overflow escalated to a framing error"
+fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
+[ "$fb_sz" = 0 ] || fail "bomb member: queue not truncated after replay ($fb_sz bytes left)"
+[ -n "$hwm" ] && [ "$hwm" -lt 200000 ] 2>/dev/null \
+  || fail "bomb member: worker peak RSS ${hwm:-unreadable}kB — the 512MB bomb was inflated, not bounded"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "$nb bomb member(s) skipped, worker peak RSS ${hwm}kB bounded, bombA replayed 10/10"
+
+echo "== file:// url == fallback path: the pair is rejected at SET =="
+# The NDJSON sink and the PGLTFB01 queue framing cannot share a file; the
+# SET-time check rejects whichever GUC lands second. A reload between the
+# two ALTER SYSTEMs is load-bearing: the check hook in a fresh session
+# reads the peer GUC as the postmaster last parsed it, and ALTER SYSTEM
+# alone applies the value nowhere — without the reload the hook would still
+# see the old url and wave the pair through. Throwaway paths throughout:
+# while url=file:// is live the worker writes NDJSON there (no fallback is
+# set at that point, so no queue ever sees it), and all values are restored
+# at the end.
+al=/tmp/logtap-alias.bin
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'file://$al'" >/dev/null
+reload; sleep 2
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_fallback_file = '$al'" 2>&1)
+echo "$out" | grep -q ERROR || fail "aliasing: fallback='$al' accepted with url=file://$al"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_fallback_file")" = "" ] \
+  || fail "aliasing: rejected ALTER SYSTEM still changed the fallback GUC"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" >/dev/null
+reload; sleep 2
+# the other direction: fallback first (accepted — the url is http), then
+# the file:// url naming the same file
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = '$al'" >/dev/null
+reload; sleep 2
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = 'file://$al'" 2>&1)
+echo "$out" | grep -q ERROR || fail "aliasing: url=file://$al accepted with fallback='$al'"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = ''" >/dev/null
+reload; sleep 2
+# control: a DIFFERENT fallback path under a file:// url is fine — the
+# rejection is the aliasing, not file:// itself. The fallback is loaded
+# first so the check hook really sees it (same postmaster-parse rule), and
+# the SHOW after the reload proves the pair landed.
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = '/tmp/logtap-other.bin'" >/dev/null
+reload; sleep 2
+out3=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = 'file:///tmp/logtap-other2.bin'" 2>&1)
+echo "$out3" | grep -q ERROR && fail "aliasing: distinct file:// url + fallback rejected — the check overfires"
+reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "file:///tmp/logtap-other2.bin" ] \
+  || fail "aliasing: control pair not accepted"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" >/dev/null
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = ''" >/dev/null
+reload; sleep 2
+docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url" | grep -q "http://$VEC:8686" \
+  || fail "aliasing: rejected ALTER SYSTEM still changed the url GUC"
+ok "file:// url == fallback path rejected in both directions, a distinct pair accepted"
+
+echo "== unparseable network url: rejected at ALTER SYSTEM, not first at send time =="
+# checkUrl runs parseUrl: a control byte or a space in the host/path rides
+# the HTTP request line verbatim, so it must fail ALTER SYSTEM loudly —
+# not land in auto.conf and die in the worker's warnUrlOnce a cycle later.
+# (SET cannot reach the hook at all: export_url is PGC_SIGHUP, a session
+# SET dies with "cannot be changed now" before any value check runs.)
+cr=$(printf '\r'); del=$(printf '\177') # $'..' is not POSIX sh — a dash host would expand it to the PID
+for bad in "http://v:8686/a b" "http://v:8686/insert${cr}X-Evil: 1" "http://ba d:8686/" "http://v:8686/p${del}ath"; do
+  out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = '$bad'" 2>&1)
+  echo "$out" | grep -q ERROR || fail "bad url: '$bad' accepted at ALTER SYSTEM"
+done
+# file:// paths are local filenames — spaces stay legal there. No reload
+# after: the next scenario's setguc repoints the url anyway.
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'file:///tmp/my logs.jsonl'" >/dev/null \
+  || fail "bad url: file:// with a space rejected"
+# A file:// path past sendFile's 4096-byte buffers is rejected the same way
+# (it loaded fine and failed every send silently before).
+long="file:///tmp/$(printf '%*s' 4100 '' | tr ' ' a)"
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = '$long'" 2>&1)
+echo "$out" | grep -q ERROR || fail "bad url: a 4100-byte file:// path accepted at ALTER SYSTEM"
+ok "space/DEL/CR/overlong-path urls rejected at ALTER SYSTEM; file:// keeps spaces"
 
 echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # Anything able to write to the data directory must not be able to aim the
@@ -321,13 +391,13 @@ echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # repointing the GUC or a restart re-checks — the foreign-file recovery).
 docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
-warn0=$(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true)
+warn0=$(statf warn_fallback_open)
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 gen sl1 20; sleep 3
 canary=$(docker exec "$PG_CT" cat "$FB_DIR/pg_logtap-canary" 2>/dev/null || echo GONE)
 [ "$canary" = "CANARY-INTACT" ] || fail "symlink queue: canary written through the symlink ('$canary')"
 [ "$(statf fallback_broken)" = 1 ] || fail "symlink queue: fallback_broken=$(statf fallback_broken), want 1 — a refused open must show on the gauge"
-warn=$(( $(docker logs "$PG_CT" 2>&1 | grep -c "fallback queue cannot be opened" || true) - warn0 ))
+warn=$(( $(statf warn_fallback_open) - warn0 ))
 [ "$warn" = 1 ] || fail "symlink queue: 'cannot be opened' warned $warn time(s), want 1 (once — fb_broken stops the re-opens)"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for sl1 20
@@ -335,6 +405,100 @@ wait_for sl1 20
 docker exec "$PG_CT" sh -c "rm -f '$FB' '$FB_DIR/pg_logtap-canary'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "symlink refused: canary intact, fallback_broken=1 warned once, 20/20 via the RAM backlog"
+
+echo "== pre-existing queue at 0644: tightened to 0600 on open =="
+# The 0600 in fbOpen's open(2) applies at creation only. A queue file left
+# world-readable by an operator is pulled down to 0600 on the first open —
+# the queue holds the whole log stream; other local users must not read it
+# (the same stance as creation). Pre-created as postgres so the open
+# succeeds and the phase observes the MODE, not EACCES.
+FB3_REL=pg_logtap-fallback3.bin
+FB3="$FB_DIR/$FB3_REL"
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3'; touch '$FB3'; chmod 0644 '$FB3'"
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
+gen perm 20; sleep 3
+mode=$(docker exec "$PG_CT" stat -c %a "$FB3")
+[ "$mode" = 600 ] || fail "queue perms: mode=$mode after open, want 600"
+q0=$(statf events_queued)
+[ "$q0" -gt 0 ] || fail "queue perms: events did not queue through the pre-existing file (queued=$q0)"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for perm 20
+[ "$(received perm)" = 20 ] || fail "queue perms: replay did not drain ($(received perm)/20)"
+docker exec "$PG_CT" sh -c "rm -f '$FB3'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "pre-existing 0644 queue tightened to 0600 on open, 20/20 queued and replayed"
+
+echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
+# The SET-time check compares PATH STRINGS; a symlink names the same inode
+# under a different string, so the pair loads. The open-time inode check is
+# what catches it — and it is symmetric (each side stats the other's file),
+# so BOTH refuse: no send lands raw NDJSON in the queue's framing, the queue
+# never appends PGLTFB01 into the sink, and the RAM backlog carries the
+# events until the GUC is repointed. A FRESH queue name on purpose: the
+# symlink phase left the old string broken-latched, and path() re-checks
+# only on a string change — fbOpen must actually run to create the file
+# the sink-side stat compares against.
+FB2_REL=pg_logtap-fallback2.bin
+FB2="$FB_DIR/$FB2_REL"
+docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'; ln -s '$FB2_REL' '$FB_DIR/logtap-sink-alias.bin'"
+# fallback FIRST, while the url is still http: fbOpen creates the (empty)
+# queue file; with the url not yet file:// neither check fires and nothing
+# writes through the symlink. Only then does the url land, and the first
+# send meets both refusals — so "file stayed empty" is deterministic.
+setguc pg_logtap.export_fallback_file "$FB2_REL"; reload; sleep 2
+setguc pg_logtap.export_url "file://$FB_DIR/logtap-sink-alias.bin"; reload; sleep 2
+failA0=$(statf send_cycles_failed)
+gen salias 20; sleep 3
+[ "$(statf send_cycles_failed)" -gt "$failA0" ] \
+  || fail "sink alias: send cycles not failing against the symlinked sink"
+[ "$(statf fallback_broken)" = 1 ] || fail "sink alias: fallback_broken=$(statf fallback_broken), want 1 — the queue-side inode check must fire too"
+asize=$(docker exec "$PG_CT" stat -c %s "$FB2" 2>/dev/null || echo 0)
+[ "$asize" = 0 ] \
+  || fail "sink alias: $asize bytes at the queue path — one of the two writers landed in the other's file"
+[ "$(docker exec "$PG_CT" grep -c "logtap $E2E_TAG" "$FB2" 2>/dev/null)" = 0 ] \
+  || fail "sink alias: raw NDJSON marker lines landed in the queue file"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for salias 20
+docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "symlinked sink refused at the inode: file stayed empty, 20/20 carried by the RAM backlog"
+
+echo "== fallback path hardlinked to the file:// sink: refused at the inode =="
+# The mirror case through a HARDLINK (O_NOFOLLOW passes those; the SET
+# strings differ): the file:// url names the real path, the fallback GUC
+# names its hardlink. Yet another FRESH queue name — path() re-checks only
+# on a string change, and the symlink scenario left fallback2 latched
+# broken. Same symmetric outcome: the queue latches broken, the sink
+# refuses, the shared file stays empty, recovery is one repoint. Both
+# files live in PGDATA: a hardlink cannot cross filesystems.
+FB3_REL=pg_logtap-fallback3.bin
+FB3="$FB_DIR/$FB3_REL"
+# -u postgres: docker exec defaults to root, and a root-owned file is EACCES
+# to the worker — the scenario would test permissions, not inodes.
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'; : > '$FB_DIR/logtap-real2.bin'; ln '$FB_DIR/logtap-real2.bin' '$FB3'"
+# Same order as the symlink scenario: the fallback loads while the url is
+# still http (fbOpen sees the hardlink, no file:// side to alias yet), then
+# the url lands and both refusals fire before the first write.
+warnB0=$(statf warn_fallback_open)
+setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
+setguc pg_logtap.export_url "file://$FB_DIR/logtap-real2.bin"; reload; sleep 2
+failB0=$(statf send_cycles_failed)
+gen halias 20; sleep 3
+[ "$(statf fallback_broken)" = 1 ] || fail "hardlink queue: fallback_broken=$(statf fallback_broken), want 1"
+[ "$(( $(statf warn_fallback_open) - warnB0 ))" -ge 1 ] || fail "hardlink queue: no WARNING for the refused queue open"
+[ "$(statf send_cycles_failed)" -gt "$failB0" ] \
+  || fail "hardlink queue: send cycles not failing against the aliased sink"
+bsize=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/logtap-real2.bin" 2>/dev/null || echo 0)
+[ "$bsize" = 0 ] || fail "hardlink queue: $bsize bytes in the shared file — one of the two writers landed in the other's file"
+# Reload before the rm: a file:// worker whose sink path vanishes re-creates
+# it (O_CREAT) and "delivers" the backlog there — the url must point at the
+# vector first, the files go after the drain.
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+wait_for halias 20
+docker exec "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'"
+ok "hardlinked queue refused at the inode: fallback_broken=1 warned, file stayed empty, 20/20 via the RAM backlog"
 
 echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log
@@ -401,7 +565,7 @@ wpid=$(docker exec "$PG_CT" psql -U postgres -Atc \
 gen dterm 300; sleep 1
 docker exec "$PG_CT" kill -TERM "$wpid"
 sleep 2 # flush entered its recv against the mute receiver
-docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null || true # worker ignores? no: exit now
+docker exec "$PG_CT" kill -TERM "$wpid" 2>/dev/null # worker ignores? no: exit now
 gone_s=-1; n=0
 while [ "$n" -lt 10 ]; do
   docker exec "$PG_CT" psql -U postgres -Atc \
@@ -510,20 +674,24 @@ n=0; while [ "$n" -lt 30 ]; do
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)
+D=$(( $(statf events_dropped) - D0 ))
 # "Newest tail" is WHICH events survive, not HOW MANY: bytes-per-event is
 # compression- and timing-dependent (an arm64 runner parked smaller batches,
 # ~21B/event vs amd64's ~15B — 25k survived where ~68k were "expected"; the
-# contract held, the count did not). Assert the property instead: the oldest
-# of the last 1000 delivered is exactly 149000 — a hole inside the tail or an
-# undelivered final event pulls it lower, and so does a delivery count under
-# 1000. Even with zero compression the 512KB newest slice holds ~5k of these
-# events, so 1000 never clips legitimate survivors.
+# contract held, the count did not). Assert the property instead, counting
+# holes in the last-1000 window: a hole an OLDER-kept event left (compaction
+# dropped backwards) fails, but the ring refusing the NEWEST under overload
+# (documented events_dropped — a slow runner's compaction walks stall drain
+# mid-storm; seen with 8729 holes under 11278 dropped) is accounted for by
+# D. At D=0 this is exactly "oldest of the last 1000 = 149000". Even with
+# zero compression the 512KB newest slice holds ~5k of these events, so
+# 1000 never clips legitimate survivors.
 last1k=$(grep -oE "logtap kill cap1$SUF [0-9]+" "$OUT/vector-out.jsonl" \
   | grep -oE '[0-9]+$' | sort -n | tail -n 1000 | head -n 1)
-[ "$last1k" = 149000 ] || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k (want 149000, delivered=$R)"
+holes=$(( 150000 - last1k - 1000 ))
+[ "$holes" -le "$D" ] 2>/dev/null || fail "fallback_max_mb: newest tail broken — oldest of the last 1000 delivered is $last1k ($holes holes > $D ring-dropped, delivered=$R)"
 dups=$(grep "logtap kill cap1$SUF" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$dups" = 0 ] || fail "fallback_max_mb: $dups duplicate seqs — compaction replayed delivered members"
-D=$(( $(statf events_dropped) - D0 ))
 [ "$((R + L + D))" -ge 140000 ] || fail "fallback_max_mb: delivered($R) + lost($L) + dropped($D) < 140000 of 150000"
 ok "1MB cap held the file at ${sz}B, newest tail delivered ($R), loss counted ($L), compacted=$C excluded from delivered, ring-dropped ($D), dup=0"
 

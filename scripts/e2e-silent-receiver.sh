@@ -7,19 +7,12 @@
 # served again — all three asserted here.
 # Usage: scripts/e2e-silent-receiver.sh [pg_container] [sink_port]
 # The mute receiver is the compose stand's `silent` service.
-set -eu
-PG_CT="${1:-pglogtap-pg}"
+set -u
+. "$(dirname "$0")/e2e-common.sh"
+e2e_init silent "${1:-}"
 PORT="${2:-9499}"
-NET=pglogtap-e2e_default
 SINK=pglogtap-silent
-
-[ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] || {
-  echo "e2e-silent: stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d" >&2
-  exit 1
-}
-# A stale .so (copied without a restart) would test yesterday's code.
-"$(dirname "$0")/e2e-require-ext.sh" "$PG_CT"
-docker network connect "$NET" "$PG_CT" 2>/dev/null || true # non-stand pg arg
+e2e_gate
 
 # 1s timeout, fallback file on: failed sends must divert, not lose.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_timeout_ms = 1000" \
@@ -52,10 +45,10 @@ fail=$((fail - bfail)); que=$((que - bque)); drp=$((drp - bdrp)); lost=$((lost -
 # process, and the postmaster (PID 1 in a container) emergency-restarts the
 # whole cluster when it reaps an unknown signalled child: a container
 # footgun that looks exactly like an extension crash. On unfixed code the
-# read times out (status >128, no signal escapes) — captured via || true.
+# read times out (status >128, no signal escapes).
 healthz=$(docker exec "$PG_CT" bash -c \
   'exec 3<>/dev/tcp/127.0.0.1/9187 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && IFS= read -r -t 8 line <&3 && echo "$line"' \
-  2>/dev/null || true)
+  2>/dev/null)
 
 echo "failed_cycles=$fail queued=$que dropped=$drp lost=$lost healthz=${healthz:-none}"
 [ "$fail" -ge 1 ] && [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ]

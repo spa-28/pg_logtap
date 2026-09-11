@@ -8,7 +8,7 @@ const ring = @import("ring.zig");
 /// widest (20 digits) — the "metrics body fits" test below pins that, and a
 /// new metric that breaks it must raise this. Callers serving the response
 /// need body_cap + 512 for the status line and headers on top.
-pub const body_cap = 4096;
+pub const body_cap = 8192;
 
 /// Full HTTP/1.1 response for one scraped request line ("GET /metrics HTTP/1.1").
 pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Stats) !void {
@@ -18,22 +18,25 @@ pub fn writeResponse(w: *std.Io.Writer, request_line: []const u8, snap: ring.Sta
 
     var body_buf: [body_cap]u8 = undefined;
     var body_w = std.Io.Writer.fixed(&body_buf);
-    var is_ok = true;
+    var status: u32 = 200;
+    var reason: []const u8 = "OK";
     if (!std.mem.eql(u8, method, "GET")) {
-        is_ok = false;
+        status = 405;
+        reason = "Method Not Allowed";
         try body_w.writeAll("method not allowed\n");
     } else if (std.mem.eql(u8, path, "/healthz")) {
         try body_w.writeAll("ok\n");
     } else if (std.mem.eql(u8, path, "/metrics")) {
         try writeBody(&body_w, snap);
     } else {
-        is_ok = false;
+        status = 404;
+        reason = "Not Found";
         try body_w.writeAll("not found\n");
     }
 
     try w.print("HTTP/1.1 {d} {s}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
-        @as(u32, if (is_ok) 200 else 404),
-        if (is_ok) "OK" else "Not Found",
+        status,
+        reason,
         body_w.buffered().len,
     });
     try w.writeAll(body_w.buffered());
@@ -51,7 +54,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
         \\# TYPE pg_logtap_events_sent_total counter
         \\pg_logtap_events_sent_total {d}
-        \\# HELP pg_logtap_events_queued_total Events durably appended to the fallback file. Stuck in the queue right now = events_queued - events_replayed - events_compacted.
+        \\# HELP pg_logtap_events_queued_total Events appended to the fallback file — a lifecycle stage, not a durability claim (fb_sync_failures names the cycles that are not durable). Stuck in the queue right now = events_queued - events_replayed - events_compacted.
         \\# TYPE pg_logtap_events_queued_total counter
         \\pg_logtap_events_queued_total {d}
         \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.
@@ -78,19 +81,32 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_fallback_broken 1 = the fallback queue file is foreign or corrupt and is neither appended to nor replayed: durability degraded to the RAM backlog bound until the GUC points at a different path or the worker restarts.
         \\# TYPE pg_logtap_fallback_broken gauge
         \\pg_logtap_fallback_broken {d}
-        \\# HELP pg_logtap_fb_sync_failures Failed fdatasync calls on the fallback queue, cumulative. Events of such a cycle are in the file but not durable (lost on OS crash, not on postmaster death); the log WARNING is once per failure streak, this counter is not — a growing value is a dying disk.
+        \\# HELP pg_logtap_fb_sync_failures Failed fdatasync calls on the fallback queue, cumulative. Events of such a cycle are in the file but not durable (lost on OS crash, not on postmaster death); the log WARNING is once per failure streak, this counter is not — a growing value is a dying disk. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level.
         \\# TYPE pg_logtap_fb_sync_failures counter
         \\pg_logtap_fb_sync_failures {d}
         \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern did not compile and that redaction layer is OFF (fail-open). The compile error text is in the server log.
         \\# TYPE pg_logtap_redact_pattern_failed gauge
         \\pg_logtap_redact_pattern_failed {d}
+        \\# HELP pg_logtap_warn_tls_no_verify The verify=off WARNING fired (once per worker life): https/tcps export is shipping unauthenticated.
+        \\# TYPE pg_logtap_warn_tls_no_verify counter
+        \\pg_logtap_warn_tls_no_verify {d}
+        \\# HELP pg_logtap_warn_fallback_open The fallback queue could not be opened; fallback_broken also goes 1.
+        \\# TYPE pg_logtap_warn_fallback_open counter
+        \\pg_logtap_warn_fallback_open {d}
+        \\# HELP pg_logtap_warn_fallback_skipped Unreadable fallback members skipped (twice per member by design: boot walk + drain read); their events are in events_lost.
+        \\# TYPE pg_logtap_warn_fallback_skipped counter
+        \\pg_logtap_warn_fallback_skipped {d}
+        \\# HELP pg_logtap_warn_fallback_unbounded Diverts into an unbounded (fallback_max_mb=0) fallback queue — once per divert, not per append.
+        \\# TYPE pg_logtap_warn_fallback_unbounded counter
+        \\pg_logtap_warn_fallback_unbounded {d}
         \\
     , .{
-        snap.captured,         snap.dropped,               snap.sent,
-        snap.queued,           snap.replayed,              snap.compacted,
-        snap.send_failed,      snap.export_lost,           snap.count,
-        snap.capacity,         snap.dns_fail_streak,       snap.fallback_broken,
-        snap.fb_sync_failures, snap.redact_pattern_failed,
+        snap.captured,           snap.dropped,               snap.sent,
+        snap.queued,             snap.replayed,              snap.compacted,
+        snap.send_failed,        snap.export_lost,           snap.count,
+        snap.capacity,           snap.dns_fail_streak,       snap.fallback_broken,
+        snap.fb_sync_failures,   snap.redact_pattern_failed, snap.warn_tls_no_verify,
+        snap.warn_fallback_open, snap.warn_fallback_skipped, snap.warn_fallback_unbounded,
     });
 }
 
@@ -102,7 +118,9 @@ test "metrics response" {
     snap.fallback_broken = 1;
     snap.fb_sync_failures = 3;
     snap.redact_pattern_failed = 1;
-    var wbuf: [4096]u8 = undefined;
+    snap.warn_tls_no_verify = 1;
+    snap.warn_fallback_skipped = 4;
+    var wbuf: [body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&wbuf);
     try writeResponse(&resp_w, "GET /metrics HTTP/1.1", snap);
     const got = resp_w.buffered();
@@ -114,6 +132,8 @@ test "metrics response" {
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fb_sync_failures 3\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_tls_no_verify 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_skipped 4\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;
@@ -138,6 +158,10 @@ test "metrics body fits with every counter at u64 width" {
     snap.dns_fail_streak = 4294967295;
     snap.fallback_broken = 255;
     snap.redact_pattern_failed = 255;
+    snap.warn_tls_no_verify = 12345678901234567890;
+    snap.warn_fallback_open = 12345678901234567890;
+    snap.warn_fallback_skipped = 12345678901234567890;
+    snap.warn_fallback_unbounded = 12345678901234567890;
     snap.count = 4294967295;
     snap.capacity = 4294967295;
     var wbuf: [body_cap + 512]u8 = undefined;
@@ -148,7 +172,7 @@ test "metrics body fits with every counter at u64 width" {
     // — and today fails the write outright): first, middle and last.
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_captured_total 12345678901234567890\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_events_compacted_total 12345678901234567890\n") != null);
-    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 255\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_unbounded 12345678901234567890\n") != null);
     // Content-Length must match the body that actually follows it.
     const hdr_end = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     const cl_idx = std.mem.find(u8, got, "Content-Length: ").? + "Content-Length: ".len;
@@ -165,4 +189,7 @@ test "healthz and unknown path" {
     var w404 = std.Io.Writer.fixed(&wbuf);
     try writeResponse(&w404, "GET /nope HTTP/1.1", snap);
     try std.testing.expect(std.mem.startsWith(u8, w404.buffered(), "HTTP/1.1 404 Not Found"));
+    var w405 = std.Io.Writer.fixed(&wbuf);
+    try writeResponse(&w405, "POST /metrics HTTP/1.1", snap);
+    try std.testing.expect(std.mem.startsWith(u8, w405.buffered(), "HTTP/1.1 405 Method Not Allowed"));
 }
