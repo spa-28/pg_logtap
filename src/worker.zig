@@ -642,6 +642,10 @@ fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv
     if (raw.len == 0) return true;
     const dest_v = dest_mod.parseUrl(raw) orelse return false;
     if (dest_v != .file) return true;
+    // sendFile's path buffers are 4096 bytes: a longer path used to load
+    // fine and then fail every send silently (no reason, no detail) —
+    // reject it here, the fallback GUC's own length rule's twin.
+    if (dest_v.file.len >= 4096) return false;
     return !fileUrlAliasesFallback(raw, fbq.fileGucRaw());
 }
 
@@ -1295,6 +1299,9 @@ fn syncMetricsListener() void {
         // settled state: record it so the guard above stops re-running.
         metrics_open_port = guc_metrics_port;
         metrics_open_addr = "";
+        // Off ends the failure streak: a later bind failure on a different
+        // port is a new streak and must be heard.
+        metrics_listen_failed = false;
         return;
     }
     metrics_fd = listenOn(addr, @intCast(guc_metrics_port)) orelse {
@@ -1302,7 +1309,13 @@ fn syncMetricsListener() void {
         // held by a dying process, interface not up yet), and recording it
         // would silence the listener until the GUC changes again — leaving
         // the previous values makes the guard retry on the next sync
-        // (every SIGHUP). Logged once per failure streak, not per attempt.
+        // (every SIGHUP). Those stale values must not survive the closed fd
+        // either: returning to the exact port/addr the guard still
+        // remembers would early-return with metrics down, so poison them
+        // with a port no GUC can hold. Logged once per failure streak,
+        // not per attempt.
+        metrics_open_port = -1;
+        metrics_open_addr = "";
         if (!metrics_listen_failed) {
             metrics_listen_failed = true;
             elog.Log(@src(), "pg_logtap.metrics_port {d} on \"{s}\" failed to listen, metrics down until it succeeds again", .{ guc_metrics_port, addr });

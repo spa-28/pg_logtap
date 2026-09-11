@@ -5,6 +5,11 @@
 TLS export and HTTP auth-header round. Upgrade is the
 0.4.5 → 0.5.0 script (the four warn-counter attributes and the re-created
 view) + binary replace + restart; the four new GUCs are all SIGHUP.
+Audit `pg_logtap.export_url` before upgrading: a network URL with a space,
+DEL or raw UTF-8 byte (or a `file://` path of 4096+ bytes) that 0.4.x
+loaded with a worker-side warning is rejected at config parse now —
+ALTER SYSTEM refuses it, and a postgresql.conf/auto.conf holding one
+fails the reload (at boot it is fatal).
 
 ### Added
 
@@ -73,15 +78,21 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   space or DEL in a network scheme's host or path was documented to fail
   at SET time, but the check hook only tested the fallback aliasing — the
   value loaded into the GUC and only died in the worker's
-  unparseable-URL warning a cycle later. e2e-kill drives the rejections
-  through ALTER SYSTEM (the GUC is `PGC_SIGHUP`, so ALTER SYSTEM is the
-  path that reaches the hook) and a spaced `file://` path through
-  acceptance.
+  unparseable-URL warning a cycle later. A `file://` path of 4096+ bytes
+  is rejected the same way — it loaded fine and then failed every send
+  silently (the sink's path buffers are 4096 bytes). e2e-kill drives the
+  rejections through ALTER SYSTEM (the GUC is `PGC_SIGHUP`, so ALTER
+  SYSTEM is the path that reaches the hook) and a spaced `file://` path
+  through acceptance.
 - A transient metrics bind failure (the port still held by a dying
   process, the interface not up yet) no longer records the listener as
   served: the failed state stays unrecorded, so the next SIGHUP retries
   instead of the listener staying down until the GUC changed again; the
-  failure logs once per streak.
+  failure logs once per streak. The stale open state of the fd the failed
+  attempt closed is poisoned with a port no GUC can hold: a SIGHUP back to
+  the previously-open port/address re-opens the listener instead of
+  matching the early-return guard, and turning metrics off re-arms the
+  failure log for a later streak.
 
 ### Hardening
 
@@ -111,11 +122,15 @@ view) + binary replace + restart; the four new GUCs are all SIGHUP.
   terminated, so the fixed headers after it always start on a fresh line.
   Unit-tested in export.zig, gate-tested by e2e-tls phase 9.
   Protocol-owned names — `Host`, `Content-Length`, `Transfer-Encoding`,
-  `Connection`, `Content-Encoding`, `TE`, `Upgrade`, `Proxy-Connection` —
+  `Connection`, `Content-Encoding`, `TE`, `Upgrade`, `Proxy-Connection`,
+  `Expect`, `Content-Type` —
   are rejected case-insensitively, as is a line without a colon: the
   sender owns the framing and identity headers, and a config-supplied
   second copy makes a request with conflicting semantics (two
-  Content-Lengths is smuggling-shaped). Application headers
+  Content-Lengths is smuggling-shaped). `Expect` would invite interim
+  1xx responses the first-line-only status reader cannot parse, and
+  `Content-Type` is always the sender's `application/x-ndjson`.
+  Application headers
   (`Authorization`, `X-*`) are unaffected. A name carrying whitespace
   before its colon is not a distinct header — lenient parsers read
   `Content-Length : 5` as the owned name — so the name must be a real

@@ -374,7 +374,12 @@ done
 # after: the next scenario's setguc repoints the url anyway.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'file:///tmp/my logs.jsonl'" >/dev/null \
   || fail "bad url: file:// with a space rejected"
-ok "space/DEL/CR in a network url rejected at ALTER SYSTEM; file:// keeps spaces"
+# A file:// path past sendFile's 4096-byte buffers is rejected the same way
+# (it loaded fine and failed every send silently before).
+long="file:///tmp/$(printf '%*s' 4100 '' | tr ' ' a)"
+out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = '$long'" 2>&1)
+echo "$out" | grep -q ERROR || fail "bad url: a 4100-byte file:// path accepted at ALTER SYSTEM"
+ok "space/DEL/CR/overlong-path urls rejected at ALTER SYSTEM; file:// keeps spaces"
 
 echo "== symlink at the queue path: refused, RAM backlog carries the events =="
 # Anything able to write to the data directory must not be able to aim the

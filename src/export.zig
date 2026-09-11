@@ -51,8 +51,11 @@ pub fn headerValid(val: []const u8) bool {
         // The sender owns these names: they carry the request's framing and
         // identity, and a second one from config makes a request with
         // conflicting semantics (two Content-Lengths is smuggling-shaped).
-        // Application headers (Authorization, X-*) stay allowed.
-        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "content-encoding", "te", "upgrade", "proxy-connection" }) |owned| {
+        // Expect would invite interim 1xx responses the status reader does
+        // not parse (it takes the first status line only), and Content-Type
+        // is always the sender's application/x-ndjson. Application headers
+        // (Authorization, X-*) stay allowed.
+        for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "content-encoding", "te", "upgrade", "proxy-connection", "expect", "content-type" }) |owned| {
             if (std.ascii.eqlIgnoreCase(name, owned)) return false;
         }
         if (eol == rest.len) return true;
@@ -201,6 +204,8 @@ test "export_http_extra_headers protocol-owned names rejected" {
     try std.testing.expect(!headerValid("TE: trailers"));
     try std.testing.expect(!headerValid("Upgrade: h2c"));
     try std.testing.expect(!headerValid("Proxy-Connection: keep-alive"));
+    try std.testing.expect(!headerValid("Expect: 100-continue")); // interim 1xx — the status reader takes the first line only
+    try std.testing.expect(!headerValid("Content-Type: application/json")); // sender always writes x-ndjson
     try std.testing.expect(!headerValid("X-A: 1\\nHost: evil.example")); // anywhere in the list
     // "Hostname" is not "Host": a prefix collision must not reject an
     // unowned (if odd) name, and an application header stays allowed.
