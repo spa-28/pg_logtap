@@ -101,7 +101,10 @@ fails the reload (at boot it is fatal).
   unsynced `ftruncate` could resurrect them after an OS crash — where the
   retried batch, parked on the fallback queue, would replay a second copy
   after the resurrected one. A rollback sync that fails as well keeps the
-  retry (at-least-once), the same trade the rollback-failed path documents.
+  retry (at-least-once), the same trade the rollback-failed path documents,
+  and warns once — the resurrection window it failed to close is named
+  (the torn line after a torn write, the whole batch after a failed first
+  sync), and a clean batch re-arms the latch.
   The rollback after a torn write mid-batch syncs the same way: the
   truncation itself is a durability event there too, not only when the
   sync failed first.
@@ -185,18 +188,18 @@ fails the reload (at boot it is fatal).
   data directory) can still land both on one inode — the foreign-content
   latch keeps that from silent corruption. e2e-kill drives both shapes
   (symlinked sink, hardlinked queue) and asserts the file stays empty.
-- Every socket read inside a TLS handshake or session is re-armed to the
-  send attempt's absolute deadline: the TLS library's handshake loop has no
-  bound on the number of reads it will do, so a peer dribbling one record
-  fragment per just-under-timeout interval could pin the worker inside the
-  handshake forever — each individual recv succeeded, the per-read
-  `SO_RCVTIMEO` never fired. The TLS socket reader wraps the deadline now
-  (`remaining = deadline − now` before every read), so the handshake and
-  the status reads after it are strictly inside `export_timeout_ms`; the
-  residual multiple is on the write side only, and it is a constant —
-  one 64 KB chunk's ~4 TLS records, each waiting at most what was armed at
-  the chunk's start, never batch-proportional; the next chunk boundary
-  fails the send once the budget is spent.
+- Every socket read and write inside a TLS handshake or session is re-armed
+  to the send attempt's absolute deadline: the TLS library's handshake loop
+  has no bound on the number of reads it will do, so a peer dribbling one
+  record fragment per just-under-timeout interval could pin the worker
+  inside the handshake forever — each individual recv succeeded, the
+  per-read `SO_RCVTIMEO` never fired. The TLS socket reader wraps the
+  deadline now (`remaining = deadline − now` before every read), and so
+  does the writer: the write side's residual multiple — a 64 KB chunk's
+  ~4 TLS records each inheriting the timeout armed at the chunk boundary —
+  is gone, every record write waits at most what is left of the whole
+  budget on either side, so a peer dribbling fragments or stalling its
+  reads cannot stretch any stage past `export_timeout_ms`.
   After a successful send, the best-effort `close_notify` is re-armed to
   the deadline's remainder before it writes — it used to check the clock
   and then write with whatever `SO_SNDTIMEO` the last stage had armed,
@@ -230,8 +233,11 @@ fails the reload (at boot it is fatal).
 - A pre-existing fallback queue or `file://` sink file is tightened to
   0600 on open: the mode argument of `open(2)` applies at creation only,
   so a file an operator left world-readable stayed that way while the
-  queue's compressed log stream accumulated in it. e2e-kill pre-creates a
-  0644 queue and asserts the mode after the first open.
+  queue's compressed log stream accumulated in it. A tighten that fails
+  warns once instead of passing silently — the sink keeps working, but the
+  left-open window (local users may read the stream) is named; a
+  successful tighten or a clean batch re-arms the warning. e2e-kill
+  pre-creates a 0644 queue and asserts the mode after the first open.
 - A failed parent-directory fsync at queue creation warns once (it was
   silent): the queue's data is still fdatasynced, but until the kernel
   writes the directory back an OS crash may drop the queue's name — that
@@ -304,6 +310,20 @@ fails the reload (at boot it is fatal).
   resets the wait), so the phase proves the between-syscall absolute
   deadline is what fails the send; the body replays whole once repointed.
   The write-side twin of phase 10's handshake dribbler.
+- e2e-tls phase 14, the TLS write-dribbler over both encrypted schemes: a
+  receiver that completes the handshake normally and then drains one
+  decrypted byte per second — every TLS record write succeeds inside its
+  per-write `SO_SNDTIMEO` and a 64 KB chunk spans several records, so the
+  phase proves the per-write re-arm of the absolute deadline is what fails
+  the send (https first, then tcps on the same listener); both bodies
+  replay whole once repointed.
+- delivery.md states the compaction duplicate window: the rewrite's rename
+  is made durable by a directory fsync, and its failure (already warned
+  once like the queue's other sync failures) means an OS crash can
+  resurrect pre-compaction members — events already counted as compacted
+  replaying again. At-least-once: delivery is the extension's job, the
+  receiver dedups on the documented `(host, seq)` recipe, and nothing is
+  lost in either outcome.
 - Docs: the DNS last-known-good window is stated as hard 60 s (only a dial
   after a fresh resolution refreshes it — the cached-address dial does
   not), `export_tls_ca` is documented as local-disk (the per-handshake read

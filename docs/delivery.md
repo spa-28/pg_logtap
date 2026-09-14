@@ -55,18 +55,12 @@ certificates / mTLS are not supported). One handshake per batch, inside the
 existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
 handshake is an ordinary failed send — the batch parks on the fallback file
 / RAM backlog and retries. The timeout is a strict per-attempt budget: the
-absolute deadline is re-armed before **every** socket read inside the
-handshake and the session after it, so a peer dribbling one TLS fragment
-per just-under-timeout interval cannot stretch the stage — each fragment
-costs only what is left of the budget, and once it is spent the send fails.
-The residual multiple is on the **write** side only, and it is a constant,
-not a function of batch size: the body goes out in 64 KB chunks, each chunk
-re-armed to the remaining budget before its records are written, and a
-64 KB chunk is ~4 TLS records — each socket write waits at most the value
-armed at the chunk's start, so a peer that stops reading stretches the
-write stage to at most ~4–5 × `export_timeout_ms` before the next chunk
-boundary finds the budget spent and fails the send. The plain
-`http://`/`tcp://` body write checks the same deadline between its write
+absolute deadline is re-armed before **every** socket read and write inside
+the handshake and the session after it, so a peer dribbling one TLS
+fragment or stalling its reads per just-under-timeout interval cannot
+stretch the stage — each fragment or partial write costs only what is left
+of the budget, and once it is spent the send fails. The plain
+`http://`/`tcp://` body write holds the same deadline between its write
 syscalls (each partial write would otherwise reset the per-write wait).
 When a send has already consumed the budget, the
 worker skips its `close_notify` (the fd close is the backstop) rather than
@@ -324,6 +318,13 @@ sent + replayed` counts only events a receiver actually got) and
 `events_lost` (they never arrived — `PgLogtapEventsLost` fires, correctly
 reading "the outage outlasted the queue"). After recovery the newest ≈ cap/2
 of data is delivered in order.
+One duplicate window the at-least-once contract already covers: the
+compaction's rename is made durable by a directory fsync, and if that sync
+fails (warned once, like the queue's other sync failures) an OS crash can
+resurrect the pre-compaction members — events already counted as compacted
+replay again as duplicates. Delivery is the extension's job, so the
+receiver dedups on `(host, seq)` as the README recipe describes; nothing is
+lost in either outcome.
 A cap smaller than one member (~a hundred KB compressed) bounds the file
 only at member granularity. Fill rate measured (v0.3.0, one 16-core
 host, 8-client pgbench with every statement duration-logged into a dead

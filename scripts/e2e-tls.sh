@@ -49,6 +49,12 @@
 #            inside its per-write SO_SNDTIMEO (each partial write resets the
 #            wait), so only the between-syscall absolute deadline can fail
 #            the send (failed cycles grow, the body replays once repointed)
+#   phase 14 the TLS write-dribbler, both encrypted schemes: the handshake
+#            completes, then the receiver drains one decrypted byte per
+#            second — every TLS record write succeeds inside its per-write
+#            SO_SNDTIMEO and a 64 KB chunk spans several records, so only
+#            the per-write re-arm of the absolute deadline fails the send
+#            (https first, then tcps; both bodies replay once repointed)
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -69,8 +75,8 @@ T12_VER=$DIR/tls12-ver.txt
 CERT=$DIR/cert.pem
 KEY=$DIR/key.pem
 CA_IN_CT=/tmp/logtap-ca.pem
-# E2E_TLS_BASE: the nine host-side listeners move per PG major in a parallel
-# matrix (JOBS>1) — one base per major, 16 apart so the +1..+8 ranges cannot
+# E2E_TLS_BASE: the ten host-side listeners move per PG major in a parallel
+# matrix (JOBS>1) — one base per major, 16 apart so the +1..+9 ranges cannot
 # touch; sequentially the default keeps the historical ports.
 TLS_BASE=${E2E_TLS_BASE:-18443}
 PORT_HTTPS=$TLS_BASE
@@ -82,6 +88,7 @@ PORT_AUTH=$((TLS_BASE + 5))
 PORT_DRIB=$((TLS_BASE + 6))
 PORT_T12=$((TLS_BASE + 7))
 PORT_WDRIB=$((TLS_BASE + 8))
+PORT_TDRIB=$((TLS_BASE + 9))
 B64=$(printf %s 'pglogtap:s3cret' | base64 | tr -d '\n') # phase 9's Basic credentials
 
 # The receiver's address as seen from the pg container: the docker network
@@ -122,7 +129,7 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" PORT_T12="$PORT_T12" PORT_WDRIB="$PORT_WDRIB" python3 - <<'PYEOF' &
+DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" PORT_T12="$PORT_T12" PORT_WDRIB="$PORT_WDRIB" PORT_TDRIB="$PORT_TDRIB" python3 - <<'PYEOF' &
 import base64
 import gzip
 import os
@@ -315,6 +322,35 @@ def dribble_write(port):
             pass
 
 threading.Thread(target=dribble_write, args=(int(os.environ["PORT_WDRIB"]),), daemon=True).start()
+# Phase 14's TLS write-dribbler: the phase-13 drain wrapped in a COMPLETED
+# handshake — the write-side twin of phase 10. The handshake answers
+# normally, then the receiver reads ONE decrypted byte per second with the
+# same tiny receive buffer: every TLS record write the worker makes
+# succeeds inside its SO_SNDTIMEO, and a 64 KB chunk spans several records,
+# so only the per-write re-arm of the absolute deadline can fail the send.
+# One listener serves the https and tcps sub-cases — neither ever reaches
+# a status read. The bytes are discarded.
+def dribble_write_tls(port, ctx):
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        try:
+            tls = ctx.wrap_socket(conn, server_side=True)
+            while True:
+                tls.recv(1)
+                time.sleep(1)
+        except OSError:
+            pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+threading.Thread(target=dribble_write_tls, args=(int(os.environ["PORT_TDRIB"]), ctx), daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
@@ -322,7 +358,7 @@ PYEOF
 RECV=$!
 trap 'kill $RECV 2>/dev/null' EXIT INT TERM
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1); socket.create_connection(('127.0.0.1', $PORT_T12), 1); socket.create_connection(('127.0.0.1', $PORT_WDRIB), 1)" 2>/dev/null; do
+until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1); socket.create_connection(('127.0.0.1', $PORT_T12), 1); socket.create_connection(('127.0.0.1', $PORT_WDRIB), 1); socket.create_connection(('127.0.0.1', $PORT_TDRIB), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
@@ -645,5 +681,41 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
 wait_for p13wd 500 "$OUT" 60
 echo "phase 13 ok: dribbled plain-http body write ended by the absolute deadline ($((WDRIB1 - WDRIB0)) failed cycles), all 500 replayed once repointed"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT")"
+# --- phase 14: the TLS write-dribbler — phase 13's drain over TLS, both
+# encrypted schemes. The handshake completes normally; the receiver then
+# drains ONE decrypted byte per second. Every TLS record write succeeds
+# inside its per-write SO_SNDTIMEO, and a 64 KB chunk spans several
+# records — arming at the chunk boundary alone would let one chunk stretch
+# to a small multiple of the timeout, so only the per-write re-arm of the
+# absolute deadline can fail the send. https first, then tcps on the same
+# listener; both bodies replay to the repointed https sink.
+TMOUT2=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_timeout_ms")
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_TDRIB/insert/jsonline'" \
+  "pg_logtap.export_timeout_ms = '3000'"
+TDRIB0=$(statf send_cycles_failed)
+gen p14h 500
+n=0
+while [ "$n" -lt 15 ]; do
+  TDRIB1=$(statf send_cycles_failed)
+  [ "$TDRIB1" -ge $((TDRIB0 + 2)) ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "${TDRIB1:-0}" -ge $((TDRIB0 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 14 https expected failed cycles against the TLS write dribbler, got ${TDRIB1:-none} (was $TDRIB0) — the encrypted body write outlived the absolute deadline"; exit 1; }
+set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TDRIB'"
+TDRIB2=$(statf send_cycles_failed)
+gen p14t 500
+n=0
+while [ "$n" -lt 15 ]; do
+  TDRIB3=$(statf send_cycles_failed)
+  [ "$TDRIB3" -ge $((TDRIB2 + 2)) ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "${TDRIB3:-0}" -ge $((TDRIB2 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 14 tcps expected failed cycles against the TLS write dribbler, got ${TDRIB3:-none} (was $TDRIB2) — the encrypted body write outlived the absolute deadline"; exit 1; }
+set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
+  "pg_logtap.export_timeout_ms = '$TMOUT2'"
+wait_for p14h 500 "$OUT" 60
+wait_for p14t 500 "$OUT" 60
+echo "phase 14 ok: dribbled TLS body writes (https, then tcps) ended by the per-write absolute deadline ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles), all 1000 replayed once repointed"
+
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

@@ -1,10 +1,11 @@
 //! TLS transport for https:// and tcps:// export: std.crypto.tls.Client
 //! (TLS 1.2/1.3) over the ALREADY-DIALED socket fd — dialTcp owns DNS,
 //! connect and the initial SO_SNDTIMEO/SO_RCVTIMEO budgets; this owns the
-//! handshake and the encrypted read/write, with every socket READ re-armed
-//! to the attempt's absolute deadline (DeadlineReader below), so the
-//! unbounded std handshake loop cannot outlive the send budget. One
-//! handshake per send, matching the transports' connect-per-batch shape.
+//! handshake and the encrypted read/write, with every socket read AND
+//! write re-armed to the attempt's absolute deadline (DeadlineReader /
+//! DeadlineWriter below), so the unbounded std handshake loop and a
+//! read-dribbling or write-stalling peer cannot outlive the send budget.
+//! One handshake per send, matching the transports' connect-per-batch shape.
 //! Deliberately pgzx-free: failures surface through `last_error`, which the
 //! worker folds into its usual failSend transition log — no logging here, so
 //! the file stays linkable in pure unit-test builds.
@@ -45,7 +46,7 @@ pub const Options = struct {
 
 pub const Conn = struct {
     deadline_reader: DeadlineReader,
-    stream_writer: std.Io.net.Stream.Writer,
+    deadline_writer: DeadlineWriter,
     client: tls.Client,
     entropy: [tls.Client.Options.entropy_len]u8,
     socket_read_buf: [buf_len]u8 = undefined,
@@ -54,9 +55,9 @@ pub const Conn = struct {
     app_write_buf: [buf_len]u8 = undefined,
 
     /// Encrypt and send. false = failure (reason in last_error). The caller
-    /// chunks large bodies with its own abort checks between calls — each
-    /// call may drain several socket writes, each already bounded by
-    /// SO_SNDTIMEO.
+    /// chunks large bodies with its own abort checks between calls; inside a
+    /// call every socket write is one armed writev — the DeadlineWriter
+    /// re-arms SO_SNDTIMEO to the attempt's remaining budget before each.
     pub fn write(c: *Conn, bytes: []const u8) bool {
         c.client.writer.writeAll(bytes) catch |e| {
             fail("tls write: {s}", .{@errorName(e)});
@@ -70,8 +71,8 @@ pub const Conn = struct {
         // Writer's buffer — draining that buffer into the fd is the owner's
         // job (std.http.Client flushes it at request completion; without
         // this the body sits unsent, the receiver waits, and the status read
-        // runs out its SO_RCVTIMEO).
-        c.stream_writer.interface.flush() catch |e| {
+        // runs out its SO_RCVTIMEO). Each drain inside is one armed writev.
+        c.deadline_writer.interface.flush() catch |e| {
             fail("tls send: {s}", .{@errorName(e)});
             return false;
         };
@@ -96,7 +97,7 @@ pub const Conn = struct {
     /// close is the backstop there, same as the plain transports.
     pub fn end(c: *Conn) void {
         c.client.end() catch {};
-        c.stream_writer.interface.flush() catch {}; // drain the close_notify record too
+        c.deadline_writer.interface.flush() catch {}; // drain the close_notify record too — armed like every write
     }
 };
 
@@ -171,6 +172,74 @@ const DeadlineReader = struct {
     }
 };
 
+/// Socket writer giving the WRITE side the same absolute-deadline discipline
+/// the reader has. A drain is one netWrite (writev) to the fd, and each is
+/// preceded by an SO_SNDTIMEO re-arm to the remaining budget: without it a
+/// 64 KB body chunk's several TLS records each inherited the timeout set at
+/// the chunk boundary, and a receiver reading just under that interval per
+/// record stretched one chunk to a small multiple of the whole budget.
+/// net.Stream.Writer's shape (drain is the syscall site) with the arm
+/// prepended; defaultFlush drains through drain, so every flush path —
+/// the body, the handshake's records, close_notify — is armed per write.
+const DeadlineWriter = struct {
+    io_ctx: std.Io,
+    interface: std.Io.Writer,
+    sock_fd: c_int,
+    /// Same absolute end as the reader's — one budget per send attempt.
+    deadline_us: i64,
+    err: ?std.Io.net.Stream.Writer.Error = null,
+
+    /// Re-arm SO_SNDTIMEO to the remaining budget; false (reason in
+    /// last_error) when it is spent. Mirrors DeadlineReader.arm — same
+    /// clock, same socket, the other direction.
+    fn arm(self: *DeadlineWriter) bool {
+        const now_us: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(self.io_ctx, .real).nanoseconds, 1000));
+        const remain_us = self.deadline_us - now_us;
+        if (remain_us < 1000) {
+            fail("tls budget: the attempt outlived export_timeout_ms", .{});
+            return false;
+        }
+        const sock_tv = std.posix.timeval{ .sec = @divTrunc(remain_us, 1_000_000), .usec = @mod(remain_us, 1_000_000) };
+        std.posix.setsockopt(self.sock_fd, 1, 21, std.mem.asBytes(&sock_tv)) catch |e| { // SOL_SOCKET, SO_SNDTIMEO
+            fail("tls setsockopt SO_SNDTIMEO: {s}", .{@errorName(e)});
+            return false;
+        };
+        return true;
+    }
+
+    fn init(io_ctx: std.Io, buffer: []u8, sock_fd: c_int, deadline_us: i64) DeadlineWriter {
+        return .{
+            .io_ctx = io_ctx,
+            .interface = .{
+                .vtable = &.{ .drain = drain, .sendFile = sendFile },
+                .buffer = buffer,
+            },
+            .sock_fd = sock_fd,
+            .deadline_us = deadline_us,
+        };
+    }
+
+    /// net.Stream.Writer's drain verbatim, with the arm prepended: consume
+    /// the buffer plus as much of `data` as one writev takes.
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *DeadlineWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        if (!self.arm()) return error.WriteFailed;
+        const buffered = io_w.buffered();
+        const written = self.io_ctx.vtable.netWrite(self.io_ctx.userdata, self.sock_fd, buffered, data, splat) catch |err| {
+            self.err = err;
+            return error.WriteFailed;
+        };
+        return io_w.consume(written);
+    }
+
+    fn sendFile(io_w: *std.Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+        _ = io_w;
+        _ = file_reader;
+        _ = limit;
+        return error.Unimplemented; // same as net.Stream.Writer's — TLS sends no files
+    }
+};
+
 var ca_bundle: std.crypto.Certificate.Bundle = .empty;
 var ca_lock: std.Io.RwLock = .init;
 
@@ -226,19 +295,18 @@ fn bundleReady(ca_path: []const u8) bool {
 
 /// Handshake over a connected fd. `remaining_us` is what is left of the
 /// send attempt's absolute budget (worker's net_deadline_us clock); every
-/// socket read inside the handshake — and every record read of the session
-/// after it — is re-armed to that deadline, so a dribbling peer cannot
-/// stretch the stage past it. null = failure, reason in last_error.
+/// socket read AND write — inside the handshake and in the session after
+/// it — is re-armed to that deadline, so a peer dribbling fragments or
+/// stalling reads cannot stretch the stage past it on either side.
+/// null = failure, reason in last_error.
 /// The caller owns the fd (worker's send_conn_fd / closeSendFd discipline —
 /// a second SIGTERM close(2) punches the blocked handshake read the same way
 /// it punches a plain one).
 pub fn connect(fd: c_int, url_host: []const u8, opts: Options, remaining_us: i64) ?*Conn {
     const c = &conn_storage;
     const io_ref = io();
-    // The address field is unused by the read/write paths (dialTcp already
-    // connected the fd); it just needs a valid value.
-    const stream = std.Io.net.Stream{ .socket = .{ .handle = fd, .address = .{ .ip4 = .unspecified(0) } } };
     const now_us: i64 = @intCast(@divTrunc(std.Io.Timestamp.now(io_ref, .real).nanoseconds, 1000));
+    const deadline_us = now_us + remaining_us;
     c.deadline_reader = .{
         .io_ctx = io_ref,
         .interface = .{
@@ -248,9 +316,9 @@ pub fn connect(fd: c_int, url_host: []const u8, opts: Options, remaining_us: i64
             .end = 0,
         },
         .sock_fd = fd,
-        .deadline_us = now_us + remaining_us,
+        .deadline_us = deadline_us,
     };
-    c.stream_writer = stream.writer(io_ref, &c.socket_write_buf);
+    c.deadline_writer = DeadlineWriter.init(io_ref, &c.socket_write_buf, fd, deadline_us);
     io_ref.random(&c.entropy);
     var client_opts: tls.Client.Options = .{
         .host = .no_verification,
@@ -269,7 +337,7 @@ pub fn connect(fd: c_int, url_host: []const u8, opts: Options, remaining_us: i64
         client_opts.host = .{ .explicit = host };
         client_opts.ca = .{ .bundle = .{ .gpa = alloc, .io = io_ref, .lock = &ca_lock, .bundle = &ca_bundle } };
     }
-    c.client = tls.Client.init(&c.deadline_reader.interface, &c.stream_writer.interface, client_opts) catch |e| {
+    c.client = tls.Client.init(&c.deadline_reader.interface, &c.deadline_writer.interface, client_opts) catch |e| {
         // The error name alone is a riddle for the three misconfigurations
         // that dominate real setups; append the GUC that fixes each. String
         // compares (not a switch) so an error outside this set still formats.

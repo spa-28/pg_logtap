@@ -171,7 +171,7 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path. Enforced as one absolute deadline per send attempt at the worker's stage boundaries, and every socket read inside a TLS handshake or session is re-armed to that deadline — a peer dribbling TLS fragments cannot stretch a stage past it. The residual multiple is on the write side only: a stage with several TLS writes can stretch to a small multiple when the peer stops reading, each write bounded by this.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomIntVariable("pg_logtap.export_timeout_ms", "connect/send/receive timeout in milliseconds on export sockets. A receiver that accepts the connection but never answers fails the send after this instead of hanging the worker; the batch then retries via the usual backlog/fallback path. Enforced as one absolute deadline per send attempt at the worker's stage boundaries, and every socket read and write inside a TLS handshake or session is re-armed to that deadline — a peer dribbling TLS fragments or stalling reads cannot stretch a stage past it.", null, &guc_export_timeout_ms, 5000, 100, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_slow_ms", "A live send that answers but takes at least this many milliseconds means the receiver cannot keep up with capture; while it stays this slow, live batches park on the export_fallback_file (RAM backlog would trim them) until a fast send on the drain path clears the flag. 0 = off (slow receivers lose events per the RAM bound, as before 0.2.1).", null, &guc_export_slow_ms, 250, 0, 600_000, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.export_backlog_max", "Events the RAM backlog may hold before the oldest are trimmed (lost). Absorbs throughput spikes while batches park on the fallback file; sustained parking matches capture, so trimming at this depth means real capacity shortfall, not noise. Ceiling cost ≈ depth × ring slot size (~3.4KB) of RAM, touched only when parking falls behind; released once the backlog drains. Values below the ring capacity are clamped up to it.", null, &guc_export_backlog_max, 65_536, 8192, 16_777_216, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.metrics_port", "TCP port for Prometheus /metrics and /healthz; 0 = off. Applied on reload.", null, &guc_metrics_port, 0, 0, 65535, pg.PGC_SIGHUP, 0, null, null, null);
@@ -850,9 +850,11 @@ fn tlsFail() bool {
     return false;
 }
 
-/// Abort-aware body write over TLS: one tls chunk may drain several socket
-/// writes (each bounded by SO_SNDTIMEO), so the shutdown/cycle budget is
-/// checked between chunks instead of between syscalls.
+/// Abort-aware body write over TLS: the shutdown/cycle budget is checked
+/// between chunks; inside a chunk tls.zig's DeadlineWriter re-arms the
+/// deadline's remainder before every socket write, so the arm here is
+/// belt-and-braces (a writer swap back to a plain Stream.Writer would
+/// still leave each chunk bounded).
 fn tlsWriteBody(tls_conn: *tls_mod.Conn, head: []const u8, body: []const u8) bool {
     if (!tls_conn.write(head)) return tlsFail();
     var off: usize = 0;
@@ -967,8 +969,9 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
 /// the page cache) while its durability is unknown. Same edge-triggered
 /// shape as fb_sync_warned: a dying disk would otherwise bury the log.
 var file_sync_warned = false;
-var file_rollback_warned = false; // same shape: a torn write whose rollback failed
+var file_rollback_warned = false; // same shape: a torn write whose rollback failed or is not durable
 var sink_alias_warned = false; // same shape: a sink fd sharing the queue's inode
+var sink_perm_warned = false; // same shape: a pre-existing sink left more-readable than 0600
 
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
@@ -982,8 +985,12 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     defer _ = c.close(conn_fd);
     // 0600 above applies at creation only — pull a pre-existing file (an
     // operator may have made it world-readable) down to it. Best-effort: a
-    // chmod failing here means a filesystem that would fail the writes too.
-    _ = c.fchmod(conn_fd, @as(c_uint, 0o600));
+    // chmod failing here means a filesystem that would fail the writes too,
+    // so the send proceeds — but the left-open window says so, once.
+    if (c.fchmod(conn_fd, @as(c_uint, 0o600)) != 0 and !sink_perm_warned) {
+        sink_perm_warned = true;
+        elog.Warning(@src(), "pg_logtap file:// sink permissions could not be tightened to 0600 (errno={d}): local users may read the log stream in {s}", .{ std.c._errno().*, path });
+    }
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
     // Inode-level alias with the fallback queue (see fdAliasesFallback):
@@ -1009,8 +1016,12 @@ fn sendFile(path: []const u8, body: []const u8) bool {
             // failed-sync rollback below closes: an unsynced truncate lets
             // an OS crash bring the torn tail back, and the retried batch
             // would append a whole copy after it. Best-effort; a sync that
-            // fails too keeps the retry (at-least-once), the trade below.
-            _ = c.fdatasync(conn_fd);
+            // fails too keeps the retry (at-least-once), the trade below —
+            // but the non-durable rollback is named, once.
+            if (c.fdatasync(conn_fd) != 0 and !file_rollback_warned) {
+                file_rollback_warned = true;
+                elog.Warning(@src(), "pg_logtap file:// rollback of a torn write is not durable (fdatasync errno={d}): an OS crash can resurrect the torn line in {s} before the retry", .{ std.c._errno().*, path });
+            }
         } else if (!file_rollback_warned) {
             file_rollback_warned = true;
             elog.Warning(@src(), "pg_logtap file:// rollback of a torn write failed (errno={d}): a torn line stays in {s} and the next batch appends after it", .{ std.c._errno().*, path });
@@ -1031,8 +1042,12 @@ fn sendFile(path: []const u8, body: []const u8) bool {
             // truncate can resurrect them after an OS crash — the retried
             // batch parks on the fallback queue and would replay a second
             // copy after the resurrected one. A sync that fails too keeps
-            // the retry (at-least-once), the same trade as below.
-            _ = c.fdatasync(conn_fd);
+            // the retry (at-least-once), the same trade as below — named
+            // once, like the torn-write path above.
+            if (c.fdatasync(conn_fd) != 0 and !file_rollback_warned) {
+                file_rollback_warned = true;
+                elog.Warning(@src(), "pg_logtap file:// rollback after a failed fdatasync is not durable (fdatasync errno={d}): an OS crash can resurrect the batch in {s} and the retry duplicates it", .{ std.c._errno().*, path });
+            }
             return false;
         }
         if (!file_sync_warned) {
@@ -1046,6 +1061,7 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     file_sync_warned = false;
     file_rollback_warned = false;
     sink_alias_warned = false;
+    sink_perm_warned = false;
     return true;
 }
 

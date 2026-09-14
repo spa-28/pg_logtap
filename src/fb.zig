@@ -186,6 +186,12 @@ pub fn aliasesQueueInode(st: worker.FileStat) bool {
     return st.dev == qst.dev and st.ino == qst.ino;
 }
 
+/// Warned-once latch for a pre-existing queue whose permissions could not
+/// be pulled down to 0600 — the compressed log stream stays readable by
+/// whoever the operator's mode left in. Same edge-triggered shape as
+/// dir_sync_warned: a successful tighten re-arms it.
+var perm_warned = false;
+
 fn fbOpen() ?c_int {
     if (path() == null) return null;
     // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
@@ -206,8 +212,17 @@ fn fbOpen() ?c_int {
         // a symlink) just fails the open: the caller parks in RAM instead.
         file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | fb_no_follow, @as(c_uint, 0o600));
         // The mode argument only covers creation; a pre-existing queue may
-        // sit wider (operator-made 0644). Best-effort tighten — see sendFile.
-        if (file_fd >= 0) _ = c.fchmod(file_fd, @as(c_uint, 0o600));
+        // sit wider (operator-made 0644). Best-effort tighten — see sendFile;
+        // a tighten that fails leaves the queue readable and says so, once
+        // per streak.
+        if (file_fd >= 0) {
+            if (c.fchmod(file_fd, @as(c_uint, 0o600)) == 0) {
+                perm_warned = false;
+            } else if (!perm_warned) {
+                perm_warned = true;
+                elog.Warning(@src(), "pg_logtap fallback queue permissions could not be tightened to 0600 (errno={d}): local users may read the compressed log stream in {s}", .{ std.c._errno().*, path() orelse "" });
+            }
+        }
     }
     // Any other errno (EACCES, EROFS, ENOTDIR, …) fails as is — a retrying
     // open would only mask the real reason. An unopenable queue is as
