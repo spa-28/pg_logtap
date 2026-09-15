@@ -53,7 +53,8 @@
 #            completes, then the receiver drains one decrypted byte per
 #            second — every TLS record write succeeds inside its per-write
 #            SO_SNDTIMEO and a 64 KB chunk spans several records, so only
-#            the per-write re-arm of the absolute deadline fails the send
+#            the per-write re-arm of the absolute deadline fails the send,
+#            and the first failure's TIMING proves it (≈budget, not ~4-5×)
 #            (https first, then tcps; both bodies replay once repointed)
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
@@ -693,14 +694,24 @@ TMOUT2=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_timeo
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_TDRIB/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '3000'"
 TDRIB0=$(statf send_cycles_failed)
+T0=$(date +%s)
 gen p14h 500
 n=0
+nfirst=0
 while [ "$n" -lt 15 ]; do
   TDRIB1=$(statf send_cycles_failed)
-  [ "$TDRIB1" -ge $((TDRIB0 + 2)) ] && break
+  if [ "$nfirst" = 0 ] && [ "${TDRIB1:-0}" -ge $((TDRIB0 + 1)) ]; then nfirst=$(date +%s); fi
+  [ "${TDRIB1:-0}" -ge $((TDRIB0 + 2)) ] && break
   n=$((n + 1)); sleep 1
 done
 [ "${TDRIB1:-0}" -ge $((TDRIB0 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 14 https expected failed cycles against the TLS write dribbler, got ${TDRIB1:-none} (was $TDRIB0) — the encrypted body write outlived the absolute deadline"; exit 1; }
+# The timing discriminates per-write from per-chunk arming: per-write fails
+# the attempt at the budget (first failed cycle ≈ flush interval + 3 s);
+# a chunk-boundary-only arm lets one 64 KB chunk's ~4 TLS records each wait
+# a full SO_SNDTIMEO — the first failure lands ~4-5× later. The waits are
+# kernel wall-clock socket timeouts, so runner speed is not in the margin.
+[ "$nfirst" -gt 0 ] && [ $((nfirst - T0)) -le 9 ] \
+  || { echo "e2e-tls: phase 14 https first failed cycle at $((nfirst - T0))s — not the per-write deadline shape (budget 3s, expected ≤9s)"; exit 1; }
 set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TDRIB'"
 TDRIB2=$(statf send_cycles_failed)
 gen p14t 500
@@ -715,7 +726,7 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '$TMOUT2'"
 wait_for p14h 500 "$OUT" 60
 wait_for p14t 500 "$OUT" 60
-echo "phase 14 ok: dribbled TLS body writes (https, then tcps) ended by the per-write absolute deadline ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles), all 1000 replayed once repointed"
+echo "phase 14 ok: dribbled TLS body writes (https, then tcps) ended by the per-write absolute deadline ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles, first https failure in $((nfirst - T0))s), all 1000 replayed once repointed"
 
 echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

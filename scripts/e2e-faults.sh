@@ -6,7 +6,10 @@
 # The stand is not touched: the shim needs container env set at create time,
 # so this brings up its own pglogtap-faults container and removes it at exit.
 #   sink-sync-fail    : file:// sink fdatasync fails -> batch rolled back,
-#                       retried whole, exactly one copy of every event
+#                       retried whole, exactly one copy of every event; the
+#                       rollback's own sync fails too (COUNT=2: both EIOs
+#                       land on the sink) -> the not-durable window is
+#                       named in the log, warned once
 #   fallback-sync-fail: queue fdatasync fails -> member stays (not durable),
 #                       no duplicate member, fb_sync_failures counts it, replay
 #                       delivers every event once
@@ -92,7 +95,12 @@ gen "sink1-$SUF" 20; sleep 3 # cycles 1-2: EIO -> ftruncate -> retry; then clean
 [ "$(sink_dups sink)" = 0 ] \
   || fail "sink sync-fail: duplicate seqs — failed-sync retry double-wrote the batch"
 [ "$(statf events_lost)" = 0 ] || fail "sink sync-fail: lost>0"
-ok "20/20 in the sink, 0 duplicate seqs (failed sync rolled back and retried whole)"
+# The rollback's own sync failed too (the shim's second EIO): the window
+# where an OS crash resurrects the truncated batch must be NAMED, not
+# silent — the warn-once latch's regression assert.
+[ "$(docker logs "$CT" 2>&1 | grep -c 'rollback after a failed fdatasync is not durable')" -ge 1 ] \
+  || fail "sink sync-fail: the failed rollback sync was not warned (not-durable window silent)"
+ok "20/20 in the sink, 0 duplicate seqs (failed sync rolled back and retried whole), failed rollback sync warned"
 
 echo "== fallback queue: fdatasync fails -> member kept, not duplicated, counted =="
 docker exec "$CT" sh -c "rm -f '$PGDATA_C/$FB_REL' /tmp/sink.log"

@@ -104,7 +104,9 @@ fails the reload (at boot it is fatal).
   retry (at-least-once), the same trade the rollback-failed path documents,
   and warns once — the resurrection window it failed to close is named
   (the torn line after a torn write, the whole batch after a failed first
-  sync), and a clean batch re-arms the latch.
+  sync), and a clean batch re-arms the latch. e2e-faults drives the
+  double-EIO shape (batch sync and rollback sync both fail) and asserts
+  the warning.
   The rollback after a torn write mid-batch syncs the same way: the
   truncation itself is a durability event there too, not only when the
   sync failed first.
@@ -315,7 +317,10 @@ fails the reload (at boot it is fatal).
   decrypted byte per second — every TLS record write succeeds inside its
   per-write `SO_SNDTIMEO` and a 64 KB chunk spans several records, so the
   phase proves the per-write re-arm of the absolute deadline is what fails
-  the send (https first, then tcps on the same listener); both bodies
+  the send — by the failed cycles growing AND by the first failure's
+  timing (≈ the budget; a chunk-boundary-only arm would fail ~4–5× later —
+  kernel socket timeouts are wall-clock, so runner speed is not in the
+  margin) (https first, then tcps on the same listener); both bodies
   replay whole once repointed.
 - delivery.md states the compaction duplicate window: the rewrite's rename
   is made durable by a directory fsync, and its failure (already warned
