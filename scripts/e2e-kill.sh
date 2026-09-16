@@ -28,6 +28,10 @@
 #                        the sink refuses to send (queue framing stays
 #                        intact), the queue latches broken (the live sink
 #                        keeps delivering pure NDJSON)
+#   perms-tighten      : a pre-existing 0644 queue is pulled to 0600 on open;
+#                        a root-owned 0666 queue/sink opens but cannot be
+#                        chmodded by the worker (fchmod EPERM) — warned once,
+#                        the mode stands, delivery is unaffected
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -428,6 +432,54 @@ wait_for perm 20
 docker exec "$PG_CT" sh -c "rm -f '$FB3'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "pre-existing 0644 queue tightened to 0600 on open, 20/20 queued and replayed"
+
+echo "== pre-existing queue at 0666, root-owned: tighten refused and warned =="
+# The failure twin of the phase above, with no fault shim: a queue file root
+# left world-WRITABLE opens fine for the worker (0666 grants the write) but
+# cannot be chmodded by it — fchmod(2) wants ownership or CAP_FOWNER — so
+# the tighten fails EPERM. The branch's whole contract: one WARNING names
+# the left-open window, the mode stands, delivery is unaffected (the queue
+# still parks and replays).
+FB4_REL=pg_logtap-fallback4.bin
+FB4="$FB_DIR/$FB4_REL"
+docker exec "$PG_CT" sh -c "rm -f '$FB4'; : > '$FB4'; chmod 0666 '$FB4'"
+w0=$(docker logs "$PG_CT" 2>&1 | grep -c 'fallback queue permissions could not be tightened')
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB4_REL"; reload; sleep 2
+q0=$(statf events_queued)
+gen tightq 20; sleep 3
+mode=$(docker exec "$PG_CT" stat -c %a "$FB4")
+[ "$mode" = 666 ] || fail "queue tighten-refused: mode=$mode, want 666 — the worker must keep using the queue it cannot chmod"
+[ "$(( $(docker logs "$PG_CT" 2>&1 | grep -c 'fallback queue permissions could not be tightened') - w0 ))" = 1 ] \
+  || fail "queue tighten-refused: the EPERM tighten was not warned exactly once"
+[ "$(statf events_queued)" -gt "$q0" ] || fail "queue tighten-refused: events did not park through the 0666 queue"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for tightq 20
+[ "$(received tightq)" = 20 ] || fail "queue tighten-refused: replay did not drain ($(received tightq)/20)"
+docker exec "$PG_CT" sh -c "rm -f '$FB4'"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+ok "0666 root-owned queue: tighten refused (EPERM), warned once, still parked 20/20 and replayed"
+
+echo "== file:// sink at 0666, root-owned: tighten refused and warned =="
+# The sink-side twin: sendFile opens the world-writable file and cannot pull
+# it to 0600 — same EPERM, same one WARNING naming the window, and the
+# events still append (delivery outranks the mode). Repoint before the rm:
+# a file:// worker re-creates a vanished sink (O_CREAT) and would "deliver"
+# the backlog into the fresh file.
+SINK6=$FB_DIR/logtap-sink-0666.log
+docker exec "$PG_CT" sh -c "rm -f '$SINK6'; : > '$SINK6'; chmod 0666 '$SINK6'"
+w1=$(docker logs "$PG_CT" 2>&1 | grep -c 'file:// sink permissions could not be tightened')
+setguc pg_logtap.export_url "file://$SINK6"; reload; sleep 2
+gen tights 20; sleep 3
+[ "$(( $(docker logs "$PG_CT" 2>&1 | grep -c 'file:// sink permissions could not be tightened') - w1 ))" = 1 ] \
+  || fail "sink tighten-refused: the EPERM tighten was not warned exactly once"
+nh=$(docker exec "$PG_CT" sh -c "grep -oE 'logtap $E2E_TAG tights$E2E_SUF [0-9]+' '$SINK6' 2>/dev/null" | sort -u | wc -l)
+[ "$nh" = 20 ] || fail "sink tighten-refused: $nh/20 events in the 0666 sink"
+mode=$(docker exec "$PG_CT" stat -c %a "$SINK6")
+[ "$mode" = 666 ] || fail "sink tighten-refused: mode=$mode, want 666"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+docker exec "$PG_CT" sh -c "rm -f '$SINK6'"
+ok "0666 root-owned sink: tighten refused (EPERM), warned once, 20/20 still delivered"
 
 echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
 # The SET-time check compares PATH STRINGS; a symlink names the same inode

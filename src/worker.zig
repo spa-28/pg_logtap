@@ -986,10 +986,18 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     // 0600 above applies at creation only — pull a pre-existing file (an
     // operator may have made it world-readable) down to it. Best-effort: a
     // chmod failing here means a filesystem that would fail the writes too,
-    // so the send proceeds — but the left-open window says so, once.
-    if (c.fchmod(conn_fd, @as(c_uint, 0o600)) != 0 and !sink_perm_warned) {
-        sink_perm_warned = true;
-        elog.Warning(@src(), "pg_logtap file:// sink permissions could not be tightened to 0600 (errno={d}): local users may read the log stream in {s}", .{ std.c._errno().*, path });
+    // so the send proceeds — but the left-open window says so, once. The
+    // latch re-arms only on a SUCCESSFUL tighten (like fbOpen's), never on a
+    // clean batch: an un-tightenable but working sink sends fine, and a
+    // per-batch re-arm would warn per send — each warning itself an event,
+    // the stream would feed itself.
+    if (c.fchmod(conn_fd, @as(c_uint, 0o600)) != 0) {
+        if (!sink_perm_warned) {
+            sink_perm_warned = true;
+            elog.Warning(@src(), "pg_logtap file:// sink permissions could not be tightened to 0600 (errno={d}): local users may read the log stream in {s}", .{ std.c._errno().*, path });
+        }
+    } else {
+        sink_perm_warned = false;
     }
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
@@ -1057,11 +1065,13 @@ fn sendFile(path: []const u8, body: []const u8) bool {
         return true;
     }
     // A clean batch clears the warned-once latches so the NEXT independent
-    // failure is visible again (edge-triggered, re-armed by success).
+    // failure is visible again (edge-triggered, re-armed by success). Not
+    // sink_perm_warned: its failure condition (the file's ownership) does
+    // not heal between batches — only a successful tighten re-arms that one,
+    // at the fchmod above.
     file_sync_warned = false;
     file_rollback_warned = false;
     sink_alias_warned = false;
-    sink_perm_warned = false;
     return true;
 }
 

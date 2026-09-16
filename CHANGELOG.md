@@ -237,9 +237,16 @@ fails the reload (at boot it is fatal).
   so a file an operator left world-readable stayed that way while the
   queue's compressed log stream accumulated in it. A tighten that fails
   warns once instead of passing silently — the sink keeps working, but the
-  left-open window (local users may read the stream) is named; a
-  successful tighten or a clean batch re-arms the warning. e2e-kill
-  pre-creates a 0644 queue and asserts the mode after the first open.
+  left-open window (local users may read the stream) is named. The latch
+  re-arms only on a successful tighten, never on a clean batch: a working
+  sink whose mode will not come down would otherwise warn once per batch,
+  and the worker exports its own warnings — the stream would feed itself.
+  e2e-kill pre-creates a 0644 queue and asserts the mode after the first
+  open, and drives the refused tighten on both sides without any fault
+  shim: a root-owned 0666 file is openable by the worker but not
+  chmoddable by it (`fchmod` EPERM), so the suite asserts the warning,
+  the unchanged mode and unaffected delivery for the queue and the
+  `file://` sink alike.
 - A failed parent-directory fsync at queue creation warns once (it was
   silent): the queue's data is still fdatasynced, but until the kernel
   writes the directory back an OS crash may drop the queue's name — that
