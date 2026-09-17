@@ -481,6 +481,35 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 docker exec "$PG_CT" sh -c "rm -f '$SINK6'"
 ok "0666 root-owned sink: tighten refused (EPERM), warned once, 20/20 still delivered"
 
+echo "== a 900KB control-byte message at message_max=1MB: parked and replayed whole =="
+# JSON escaping turns a control byte into six bytes (\u00XX): one wide
+# control-byte event serializes past the raw-width replay bound the queue
+# once had — the member was written (control bytes compress ~1000:1, so the
+# framing check passed) and then skipped on replay as if it were a
+# decompression bomb: an event the system captured and counted as queued,
+# lost. Boot the widest slot to drive it; the ring shrinks to keep shmem
+# sane. Counters are read after the restart — shmem dies with the postmaster.
+FB5_REL=pg_logtap-fallback5.bin
+setguc pg_logtap.message_max 1048576
+setguc pg_logtap.ring_capacity 64
+docker restart "$PG_CT" >/dev/null; wait_ready
+q0=$(statf events_queued); sk0=$(statf warn_fallback_skipped); l0=$(statf events_lost)
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB5_REL"; reload; sleep 2
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE WARNING 'logtap $E2E_TAG ctrlmsg$E2E_SUF 1 %', repeat(chr(1), 900000); END \$\$" >/dev/null
+sleep 3
+[ "$(statf events_queued)" -gt "$q0" ] || fail "ctrl-byte message: never parked on the wide-slot queue"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+wait_for ctrlmsg 1
+[ "$(received ctrlmsg)" = 1 ] || fail "ctrl-byte message: not replayed whole ($(received ctrlmsg)/1)"
+[ "$(statf warn_fallback_skipped)" = "$sk0" ] || fail "ctrl-byte message: the member was skipped as unreadable (warn_fallback_skipped grew)"
+[ "$(statf events_lost)" = "$l0" ] || fail "ctrl-byte message: events lost"
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM RESET pg_logtap.message_max" >/dev/null
+docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM RESET pg_logtap.ring_capacity" >/dev/null
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+docker restart "$PG_CT" >/dev/null; wait_ready
+ok "control-byte message at message_max=1MB: parked, replayed 1/1, nothing skipped or lost"
+
 echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
 # The SET-time check compares PATH STRINGS; a symlink names the same inode
 # under a different string, so the pair loads. The open-time inode check is

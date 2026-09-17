@@ -15,6 +15,7 @@ const pg = @import("pgzx").c;
 const elog = @import("pgzx").elog;
 const worker = @import("worker.zig");
 const ring = @import("ring.zig");
+const jsonl = @import("jsonl.zig");
 const capture = @import("capture.zig");
 const gzip = @import("gzip.zig");
 
@@ -48,8 +49,12 @@ pub const body_cap = 4 << 20;
 /// Framing sanity bound, shared by the compressed-size check (nextMember,
 /// compact) and the inflated-output check below it: a member this build (or
 /// 0.3.x, ≤ ~371KB) writes can never exceed body_cap + one serialized event,
-/// and gzip does not inflate its input beyond that +64K of slack.
-const member_max = body_cap + ring.max_message + 65536;
+/// and gzip does not inflate its input beyond that +64K of slack. The
+/// serialized-event term is jsonl's worst case, not the raw message width:
+/// JSON escaping turns a control byte into six (`\u00XX`), so at
+/// message_max = 1 MiB one event serializes to ~6 MiB — a raw-width bound
+/// here let the queue write members its own replay buffer could not hold.
+const member_max = body_cap + jsonl.worst_serialized_entry + 65536;
 
 const fb_magic = "PGLTFB01";
 const fb_magic_len = 8;
@@ -284,9 +289,25 @@ fn fbSize(fd: c_int) ?u64 {
     return if (end >= 0) @intCast(end) else null;
 }
 
-/// One pread; a regular file returns the full request unless EOF/EINTR-short.
-fn fbPread(fd: c_int, buf: []u8, offset_v: u64) isize {
-    return c.pread(fd, buf.ptr, buf.len, @intCast(offset_v));
+const ReadResult = enum { full, eof, err };
+
+/// Exact fill: loops until the buffer is complete. A single pread can return
+/// a partial count — a signal after some bytes moved (this worker's SIGUSR1
+/// latch pokes are dense exactly while events flow), which is not EOF;
+/// callers once read that as a torn tail and truncated members the queue
+/// had fully written.
+fn fbPread(fd: c_int, buf: []u8, offset_v: u64) ReadResult {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const nread = c.pread(fd, buf.ptr + got, buf.len - got, @intCast(offset_v + got));
+        if (nread == 0) return .eof;
+        if (nread > 0) {
+            got += @intCast(nread);
+        } else if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) {
+            return .err;
+        }
+    }
+    return .full;
 }
 
 /// True while the fallback file holds undelivered events — flushAll then
@@ -346,7 +367,7 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
         }
     } else {
         var magic: [fb_magic_len]u8 = undefined;
-        if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+        if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) {
             broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
             return .failed;
@@ -450,7 +471,7 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
     if (offset == 0) {
         if (size <= fb_magic_len) return null;
         var magic: [fb_magic_len]u8 = undefined;
-        if (fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) {
+        if (fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) {
             broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
             return null;
@@ -459,7 +480,7 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
     }
     if (offset >= size) return null;
     var len_buf: [4]u8 = undefined;
-    if (fbPread(file_fd, &len_buf, offset) != 4) return null;
+    if (fbPread(file_fd, &len_buf, offset) != .full) return null;
     const mlen = std.mem.readInt(u32, &len_buf, .little);
     if (mlen == 0 or mlen > member_max) {
         broken = true;
@@ -467,7 +488,15 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
         return null;
     }
     const comp = alloc.alloc(u8, mlen) catch return null;
-    if (fbPread(file_fd, comp, offset + 4) != mlen) { // torn tail
+    const body_read = fbPread(file_fd, comp, offset + 4);
+    if (body_read == .err) {
+        // An I/O error says nothing about the framing — leave the member in
+        // place and retry next cycle; truncating here would destroy fully
+        // valid members on a transient disk fault.
+        alloc.free(comp);
+        return null;
+    }
+    if (body_read == .eof) { // torn tail: EOF before the declared length
         alloc.free(comp);
         // The truncation is what lets the next append land on a member edge;
         // if it fails the framing after offset is lost until a human
@@ -506,7 +535,8 @@ pub fn nextMember(alloc: std.mem.Allocator) ?Member {
     };
     // member_max itself: buildBody admits the event that crosses body_cap,
     // so a member this build writes is ≤ body_cap + one serialized event
-    // (≤ ring.max_message + overhead); the +64K on top also admits members
+    // (jsonl.worst_serialized_entry — 6× the raw widths, see its comment);
+    // the +64K on top also admits members
     // from 0.3.x binaries (≤ ~371KB) read before an upgrade drains the
     // queue. Compile-time max, not the live GUC: queued members can outlive
     // a restart that lowers message_max. A byte bound, not a ratio: a wide
@@ -532,7 +562,7 @@ pub fn truncate() void {
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
     var magic: [fb_magic_len]u8 = undefined;
-    if (fbPread(file_fd, &magic, 0) != fb_magic_len or !std.mem.eql(u8, &magic, fb_magic)) return;
+    if (fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) return;
     if (c.ftruncate(file_fd, 0) == 0) {
         offset = 0;
         _ = fbDatasync(file_fd, false);
@@ -599,7 +629,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     while (off + 4 <= size) {
         if (worker.compactAborted()) return;
         var len_buf: [4]u8 = undefined;
-        if (fbPread(file_fd, &len_buf, off) != 4) return;
+        if (fbPread(file_fd, &len_buf, off) != .full) return;
         const mlen = std.mem.readInt(u32, &len_buf, .little);
         if (mlen == 0 or mlen > member_max) return;
         const end = off + 4 + mlen;
@@ -608,7 +638,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
         if (off >= offset) { // undelivered: count its events before dropping
             const comp = alloc.alloc(u8, mlen) catch return;
             defer alloc.free(comp);
-            if (fbPread(file_fd, comp, off + 4) != mlen) return;
+            if (fbPread(file_fd, comp, off + 4) != .full) return;
             if (fb_dec == null) fb_dec = .{
                 .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return,
                 .body_buf = alloc.alloc(u8, member_max) catch return,
@@ -662,13 +692,12 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
             break;
         }
         const want: usize = @intCast(@min(@as(u64, copy_buf.len), size - pos));
-        const got = fbPread(file_fd, copy_buf[0..want], pos);
-        if (got <= 0) { // 0 = EOF; -1 = read error — both abort the rewrite
+        if (fbPread(file_fd, copy_buf[0..want], pos) != .full) { // EOF/read error — abort the rewrite
             copied_ok = false;
             break;
         }
-        copied_ok = worker.writeAll(tmp_fd, copy_buf[0..@intCast(got)], true, null);
-        pos += @intCast(got);
+        copied_ok = worker.writeAll(tmp_fd, copy_buf[0..want], true, null);
+        pos += want;
     }
     if (copied_ok) copied_ok = fbDatasync(tmp_fd, true);
     _ = c.close(tmp_fd);

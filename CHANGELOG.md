@@ -93,6 +93,29 @@ fails the reload (at boot it is fatal).
   the previously-open port/address re-opens the listener instead of
   matching the early-return guard, and turning metrics off re-arms the
   failure log for a later streak.
+- A fallback member built from wide control-byte messages is replayable
+  again. The replay/framing bound sized one serialized event at its raw
+  message width, but JSON escaping turns a control byte into six
+  (`\u00XX`), so at `message_max` = 1 MiB one event serializes to ~6 MiB —
+  past the old ~5 MiB bound. The member was written (control bytes
+  compress ~1000:1, the compressed-size framing check passed) and then
+  skipped on replay as if it were a decompression bomb: an event captured
+  and counted as queued, lost. The bound now derives from the serializer's
+  worst-case serialized entry (one constant in jsonl.zig, so the two
+  cannot drift apart), every variable part counted at 6× its input width;
+  `pg_logtap.cluster_name` — the one source-identity input with no natural
+  bound of its own — is cut at 256 bytes, a label not data. e2e-kill boots
+  `message_max` = 1 MB and drives a 900 KB control-byte message through
+  park and replay whole; a unit test walks the real serializer through the
+  widest legal event and holds it inside the constant.
+- A short `pread` of a fallback member no longer reads as a torn tail.
+  A single `pread` can return a partial count — a signal after some bytes
+  moved, and this worker's SIGUSR1 latch pokes are dense exactly while
+  events flow — which is not EOF; the old one-shot read treated it as one
+  and `ftruncate`d away fully-written members. Reads are exact-fill loops
+  now: the torn-tail truncate fires only on a true EOF before the declared
+  length, and an I/O error leaves the member in place for the next cycle
+  instead of destroying it.
 
 ### Hardening
 

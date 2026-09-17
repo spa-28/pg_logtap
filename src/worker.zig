@@ -163,7 +163,7 @@ pub fn compactAborted() bool {
 
 pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default).", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default). Values longer than 256 bytes are cut — a label, not data.", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
@@ -725,6 +725,10 @@ fn refreshSourceId() void {
     // setOwned dupes each span before the next GetConfigOption call.
     var cluster = gucStrRaw("pg_logtap.cluster_name");
     if (cluster.len == 0) cluster = gucStrRaw("cluster_name");
+    // Cut at 256: a label, not data — and jsonl.worst_serialized_entry (the
+    // fallback queue's replay ceiling derives from it) counts on this bound.
+    // The one source-identity input with no natural limit of its own.
+    if (cluster.len > 256) cluster = cluster[0..256];
     setOwned(&owned_cluster, &jsonl.source_cluster, cluster);
     const pgdata = gucStrRaw("data_directory");
     setOwned(&owned_pgdata, &jsonl.source_pgdata, pgdata);
