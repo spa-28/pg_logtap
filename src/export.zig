@@ -28,11 +28,11 @@ pub const Dest = union(enum) {
 pub fn headerValid(val: []const u8) bool {
     var rest = val;
     while (rest.len > 0) {
-        const eol = std.mem.indexOf(u8, rest, "\\n") orelse rest.len;
+        const eol = std.mem.find(u8, rest, "\\n") orelse rest.len;
         const line = rest[0..eol];
-        if (std.mem.indexOfAny(u8, line, "\r\n") != null) return false; // raw CR/LF byte
+        if (std.mem.findAny(u8, line, "\r\n") != null) return false; // raw CR/LF byte
         if (line.len == 0) return false; // empty line ends the header section early
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false; // "Name: value" — no colon is not a header
+        const colon = std.mem.findScalar(u8, line, ':') orelse return false; // "Name: value" — no colon is not a header
         const name = line[0..colon];
         // The name must be a real RFC 7230 token: non-empty, tchar bytes
         // only. "Content-Length : 5" or "Host\t: x" (OWS inside the name)
@@ -40,7 +40,7 @@ pub fn headerValid(val: []const u8) bool {
         // one, so whitespace must not bypass the denylist below.
         if (name.len == 0) return false; // ": value" has no name at all
         for (name) |ch| {
-            if (!std.ascii.isAlphanumeric(ch) and std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", ch) == null) return false;
+            if (!std.ascii.isAlphanumeric(ch) and std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", ch) == null) return false;
         }
         // Field values carry visible ASCII, SP and HTAB only — any other
         // control byte (or raw high byte) would corrupt the wire form
@@ -71,7 +71,7 @@ pub fn headerValid(val: []const u8) bool {
 pub fn writeHeaderLines(w: anytype, val: []const u8) !void {
     var rest = val;
     while (rest.len > 0) {
-        const eol = std.mem.indexOf(u8, rest, "\\n") orelse rest.len;
+        const eol = std.mem.find(u8, rest, "\\n") orelse rest.len;
         try w.writeAll(rest[0..eol]);
         try w.writeAll("\r\n");
         if (eol == rest.len) return;

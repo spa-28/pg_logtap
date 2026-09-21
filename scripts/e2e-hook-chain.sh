@@ -1,8 +1,7 @@
 #!/bin/sh
-# emit_log_hook interop: pg_logtap must chain to a previously-installed hook,
-# not silently replace it (PROBLEMS.md B1). hookchain.c (companion extension)
-# is preloaded BEFORE pg_logtap, which makes it pg_logtap's prev_hook — every
-# event must reach it first AND still be captured by pg_logtap.
+# PostgreSQL hook interop: pg_logtap must chain to previously-installed
+# emit_log, shmem-request and shmem-startup hooks, not silently replace them
+# (PROBLEMS.md B1). hookchain.c is preloaded BEFORE pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
 set -u
 . "$(dirname "$0")/e2e-common.sh"
@@ -21,13 +20,16 @@ if command -v pg_config >/dev/null 2>&1; then # CI: server-dev for this major
   # -Wno-ignored-attributes: PG headers mark printf functions gnu_printf,
   # which zig cc's clang does not accept — header noise, not our code.
   zig cc -shared -fPIC -Wno-ignored-attributes -I"$(pg_config --includedir-server)" \
-    tests/e2e/hookchain.c -o "$OUT/hookchain.so"
+    tests/e2e/hookchain.c -o "$OUT/hookchain.so" \
+    || fail "could not build hookchain.so for PostgreSQL $MAJ"
 else # local: the pgzx-build container has server-dev 15-18
   INC=$(docker exec pgzx-build "/usr/lib/postgresql/$MAJ/bin/pg_config" --includedir-server)
   docker cp tests/e2e/hookchain.c "pgzx-build:/tmp/hookchain-$PG_CT.c"
   docker exec pgzx-build /opt/zig016/files/zig cc -shared -fPIC -Wno-ignored-attributes -I"$INC" \
-    /tmp/hookchain-"$PG_CT".c -o /tmp/hookchain-"$PG_CT".so
-  docker cp "pgzx-build:/tmp/hookchain-$PG_CT.so" "$OUT/hookchain.so"
+    /tmp/hookchain-"$PG_CT".c -o /tmp/hookchain-"$PG_CT".so \
+    || fail "could not build hookchain.so for PostgreSQL $MAJ"
+  docker cp "pgzx-build:/tmp/hookchain-$PG_CT.so" "$OUT/hookchain.so" \
+    || fail "docker cp of built hookchain.so for PostgreSQL $MAJ failed"
 fi
 docker cp "$OUT/hookchain.so" "$PG_CT:$LIBDIR/"
 
@@ -49,9 +51,16 @@ trap restore EXIT INT TERM
 psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = 'hookchain', 'pg_logtap'" >/dev/null
 docker restart "$PG_CT" >/dev/null; wait_ready
 
-# SQL-visible counter; reads the session's process-local hook_calls.
-psql_ct -qc "CREATE OR REPLACE FUNCTION public.hookchain_count() RETURNS integer
-  AS '\$libdir/hookchain', 'hookchain_count' LANGUAGE C STRICT" >/dev/null
+# SQL-visible probes: one process-local emit-hook counter and one inherited
+# pointer/magic check proving both shmem hooks ran before backend fork.
+psql_ct \
+  -qc "CREATE OR REPLACE FUNCTION public.hookchain_count() RETURNS integer
+    AS '\$libdir/hookchain', 'hookchain_count' LANGUAGE C STRICT" \
+  -qc "CREATE OR REPLACE FUNCTION public.hookchain_shmem_ready() RETURNS boolean
+    AS '\$libdir/hookchain', 'hookchain_shmem_ready' LANGUAGE C STRICT" >/dev/null
+SHMEM_READY=$(psql_ct -Atc "SELECT hookchain_shmem_ready()")
+[ "$SHMEM_READY" = t ] || fail "previous shmem hooks were not both chained"
+ok "previous shmem request/startup hooks initialized their shared state"
 
 # Mute the exporter for the check below: a live export_url drains the ring
 # between the DO and the dump, and the marker events would never be IN it.

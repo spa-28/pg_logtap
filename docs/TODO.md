@@ -15,12 +15,14 @@ from scratch when the need becomes real.
   linear. A pattern-length/input-length guard, or a linear-time matcher,
   would make pathological patterns safe to accept. Until then the pattern
   GUC docs carry the warning.
-- **Persist the fallback replay offset in the file header**: removes the
-  full-file scan at worker startup and makes `events_replayed ≤
-  events_queued` hold across soft worker restarts structurally (see the
-  counter-glossary note in delivery.md). Requires a framing format bump
-  (`PGLTFB01` → `02`); pick up when a queue large enough for the startup
-  scan to matter is seen in the wild (642 MB scanned in ~1 s today).
+- **Persist the fallback replay cursor on disk**: soft worker restarts already
+  resume from a device/inode-validated shared-memory cursor and publish it
+  atomically with replay/loss counters. On-disk persistence would instead
+  remove the full-file scan and byte-zero replay after a postmaster restart.
+  `PGLTFB02` already uses its header revision for per-frame event counts, so
+  persistence needs another format revision; pick up when a queue large enough
+  for the startup scan to matter is seen in the wild (642 MB scanned in ~1 s
+  today).
 - **IPv6 literal addresses** in `export_url` (bracket parsing in
   export.zig); hostnames with AAAA records already work.
 - **mTLS / client certificates on the export hop**: server verification

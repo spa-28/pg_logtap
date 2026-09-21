@@ -32,10 +32,10 @@
 #            cycles, nothing accepted) and delivers with the plain
 #            multi-line bearer form (bare \n between lines — normalized on
 #            the wire) and with Basic credentials
-#   phase 10 the dribbling peer: one handshake-record byte every 2s — each
-#            read succeeds inside its SO_RCVTIMEO, so only the absolute
-#            per-attempt deadline ends the handshake (failed cycles grow,
-#            nothing delivered, worker alive after repointing)
+#   phase 10 the dribbling peer: one handshake-record byte every 2s while a
+#            repeated worker-SIGHUP storm interrupts readv — every EINTR retry
+#            must re-arm from the absolute deadline, so the first failed cycle
+#            lands near the original budget while the longer storm still runs
 #   phase 11 rapid trust rotation through SIGHUP: ca/name/url alternated
 #            across reloads, two rounds of verified → cleared-ca fail →
 #            root-pinned chain → name-mismatch fail — the per-handshake
@@ -51,11 +51,10 @@
 #            the send (failed cycles grow, the body replays once repointed)
 #   phase 14 the TLS write-dribbler, both encrypted schemes: the handshake
 #            completes, then the receiver drains one decrypted byte per
-#            second — every TLS record write succeeds inside its per-write
-#            SO_SNDTIMEO and a 64 KB chunk spans several records, so only
-#            the per-write re-arm of the absolute deadline fails the send,
-#            and the first failure's TIMING proves it (≈budget, not ~4-5×)
-#            (https first, then tcps; both bodies replay once repointed)
+#            second. During https, repeated SIGHUP interrupts sendmsg; each
+#            retry must re-arm from the absolute deadline. First-failure
+#            timing proves it lands before the longer storm ends; tcps then
+#            covers the same writer without the signal harness
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
@@ -364,6 +363,11 @@ until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HT
   sleep 1
 done
 
+start_hup_storm() { # worker-pid, 100ms signal count; sets HUP_STORM_PID
+  docker exec "$PG_CT" sh -c "i=0; while [ \$i -lt $2 ]; do kill -HUP '$1' 2>/dev/null || true; i=\$((i + 1)); sleep 0.1; done" >/dev/null 2>&1 &
+  HUP_STORM_PID=$!
+}
+
 set_gucs() { # each ALTER SYSTEM its own -c: a multi-statement -c silently fails the batch
   for g in "$@"; do
     docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET $g" >/dev/null
@@ -593,7 +597,32 @@ TMOUT0=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_timeo
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_DRIB/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '3000'"
 DRIB0=$(statf send_cycles_failed)
+DRIB_WPID=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+[ -n "$DRIB_WPID" ] || fail "e2e-tls: phase 10 worker not found"
+DRIB_T0=$(date +%s%3N)
 gen p10drib "$N"
+sleep 0.2
+start_hup_storm "$DRIB_WPID" 100
+DRIB_FIRST=0
+DRIB_STORM_ACTIVE=0
+n=0
+while [ "$n" -lt 80 ]; do
+  DRIB1=$(statf send_cycles_failed)
+  if [ "$DRIB1" -ge $((DRIB0 + 1)) ]; then
+    DRIB_FIRST=$(date +%s%3N)
+    kill -0 "$HUP_STORM_PID" 2>/dev/null && DRIB_STORM_ACTIVE=1
+    break
+  fi
+  n=$((n + 1)); sleep 0.1
+done
+wait "$HUP_STORM_PID"
+[ "$DRIB_FIRST" -gt 0 ] || fail "e2e-tls: phase 10 no failed cycle within 8s under repeated SIGHUP"
+DRIB_FIRST_MS=$((DRIB_FIRST - DRIB_T0))
+[ "$DRIB_STORM_ACTIVE" = 1 ] \
+  || fail "e2e-tls: phase 10 first failure appeared only after the SIGHUP storm ended (${DRIB_FIRST_MS}ms)"
+[ "$DRIB_FIRST_MS" -le 6000 ] \
+  || fail "e2e-tls: phase 10 first failure took ${DRIB_FIRST_MS}ms with a 3000ms attempt budget"
 n=0
 while [ "$n" -lt 15 ]; do
   DRIB1=$(statf send_cycles_failed)
@@ -604,7 +633,7 @@ done
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '$TMOUT0'"
 wait_for p10drib "$N" "$OUT"
-echo "phase 10 ok: dribbled handshake ended by the absolute deadline ($((DRIB1 - DRIB0)) failed cycles), all $N replayed once repointed"
+echo "phase 10 ok: SIGHUP-interrupted TLS reads failed in ${DRIB_FIRST_MS}ms while the storm ran ($((DRIB1 - DRIB0)) failed cycles), all $N replayed once repointed"
 
 # --- phase 11: rapid trust rotation through SIGHUP. The CA bundle is
 # rebuilt per handshake; alternating ca/name/url across reloads must land
@@ -684,34 +713,49 @@ echo "phase 13 ok: dribbled plain-http body write ended by the absolute deadline
 
 # --- phase 14: the TLS write-dribbler — phase 13's drain over TLS, both
 # encrypted schemes. The handshake completes normally; the receiver then
-# drains ONE decrypted byte per second. Every TLS record write succeeds
-# inside its per-write SO_SNDTIMEO, and a 64 KB chunk spans several
-# records — arming at the chunk boundary alone would let one chunk stretch
-# to a small multiple of the timeout, so only the per-write re-arm of the
-# absolute deadline can fail the send. https first, then tcps on the same
-# listener; both bodies replay to the repointed https sink.
+# drains ONE decrypted byte per second. The https attempt also takes repeated
+# SIGHUP while blocked in sendmsg: each EINTR must return through arm(), not
+# restart the stale relative SO_SNDTIMEO. The first failure must land under
+# the original absolute budget while the longer signal storm is still alive.
+# tcps then covers the same writer without the harness; both bodies replay to
+# the repointed https sink.
 TMOUT2=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_timeout_ms")
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_TDRIB/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '3000'"
 TDRIB0=$(statf send_cycles_failed)
-T0=$(date +%s)
+TDRIB_WPID=$(docker exec "$PG_CT" psql -U postgres -Atc \
+  "SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+[ -n "$TDRIB_WPID" ] || fail "e2e-tls: phase 14 worker not found"
+TDRIB_T0=$(date +%s%3N)
 gen p14h 500
+sleep 0.2
+start_hup_storm "$TDRIB_WPID" 100
+TDRIB_FIRST=0
+TDRIB_STORM_ACTIVE=0
 n=0
-nfirst=0
+while [ "$n" -lt 90 ]; do
+  TDRIB1=$(statf send_cycles_failed)
+  if [ "$TDRIB1" -ge $((TDRIB0 + 1)) ]; then
+    TDRIB_FIRST=$(date +%s%3N)
+    kill -0 "$HUP_STORM_PID" 2>/dev/null && TDRIB_STORM_ACTIVE=1
+    break
+  fi
+  n=$((n + 1)); sleep 0.1
+done
+wait "$HUP_STORM_PID"
+[ "$TDRIB_FIRST" -gt 0 ] || fail "e2e-tls: phase 14 https had no failed cycle within 9s under repeated SIGHUP"
+TDRIB_FIRST_MS=$((TDRIB_FIRST - TDRIB_T0))
+[ "$TDRIB_STORM_ACTIVE" = 1 ] \
+  || fail "e2e-tls: phase 14 https first failure appeared only after the SIGHUP storm ended (${TDRIB_FIRST_MS}ms)"
+[ "$TDRIB_FIRST_MS" -le 8000 ] \
+  || fail "e2e-tls: phase 14 https first failure took ${TDRIB_FIRST_MS}ms with a 3000ms attempt budget"
+n=0
 while [ "$n" -lt 15 ]; do
   TDRIB1=$(statf send_cycles_failed)
-  if [ "$nfirst" = 0 ] && [ "${TDRIB1:-0}" -ge $((TDRIB0 + 1)) ]; then nfirst=$(date +%s); fi
-  [ "${TDRIB1:-0}" -ge $((TDRIB0 + 2)) ] && break
+  [ "$TDRIB1" -ge $((TDRIB0 + 2)) ] && break
   n=$((n + 1)); sleep 1
 done
 [ "${TDRIB1:-0}" -ge $((TDRIB0 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 14 https expected failed cycles against the TLS write dribbler, got ${TDRIB1:-none} (was $TDRIB0) — the encrypted body write outlived the absolute deadline"; exit 1; }
-# The timing discriminates per-write from per-chunk arming: per-write fails
-# the attempt at the budget (first failed cycle ≈ flush interval + 3 s);
-# a chunk-boundary-only arm lets one 64 KB chunk's ~4 TLS records each wait
-# a full SO_SNDTIMEO — the first failure lands ~4-5× later. The waits are
-# kernel wall-clock socket timeouts, so runner speed is not in the margin.
-[ "$nfirst" -gt 0 ] && [ $((nfirst - T0)) -le 9 ] \
-  || { echo "e2e-tls: phase 14 https first failed cycle at $((nfirst - T0))s — not the per-write deadline shape (budget 3s, expected ≤9s)"; exit 1; }
 set_gucs "pg_logtap.export_url = 'tcps://$GW:$PORT_TDRIB'"
 TDRIB2=$(statf send_cycles_failed)
 gen p14t 500
@@ -726,7 +770,7 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '$TMOUT2'"
 wait_for p14h 500 "$OUT" 60
 wait_for p14t 500 "$OUT" 60
-echo "phase 14 ok: dribbled TLS body writes (https, then tcps) ended by the per-write absolute deadline ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles, first https failure in $((nfirst - T0))s), all 1000 replayed once repointed"
+echo "phase 14 ok: SIGHUP-interrupted https sendmsg failed in ${TDRIB_FIRST_MS}ms; https+tcps stayed deadline-bounded ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles), all 1000 replayed once repointed"
 
 echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

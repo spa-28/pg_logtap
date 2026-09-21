@@ -117,9 +117,9 @@ GUCs and restart again.
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
 | `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
-| `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). Keep it on local disk, like `export_tls_ca`: appends and the final shutdown parking have no timeout, and a hung network filesystem would block the worker outright. See [docs/delivery.md](docs/delivery.md). |
+| `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. New counted frames retain an exact fallback count when a gzip payload is unreadable; when the payload is readable, its NDJSON line count wins over damaged count metadata. Clean legacy queues remain replayable. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). Keep it on local disk, like `export_tls_ca`: appends and the final shutdown parking have no timeout, and a hung network filesystem would block the worker outright. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
-| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One absolute deadline per send attempt: enforced at the worker's stage boundaries, checked between the plain transports' body-write syscalls, and re-armed before every socket read and write inside a TLS handshake or session — a peer dribbling TLS fragments or stalling reads cannot stretch a stage past it. |
+| `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One monotonic absolute deadline per send attempt: every resolved connect address and later stage gets only the remaining budget; plain body writes check it between syscalls, and TLS re-arms it before every socket read/write, so dribbling fragments, stalled reads, EINTR retries, or wall-clock changes cannot stretch the attempt. DNS resolution itself remains blocking, but consumes the budget before connect. |
 | `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
@@ -430,8 +430,8 @@ monitoring user needs it. The counters (`pg_logtap_stats()`,
 
 Event counters — same names in `pg_logtap_stats()` text, the
 `pg_logtap_delivery` view and the Prometheus exposition (each event counted
-once per lifecycle stage it passes; stuck in the fallback queue right now =
-`events_queued - events_replayed - events_compacted`):
+once per lifecycle stage it passes; the SQL view's `queue_backlog` removes
+replayed, cap-trimmed and unreadable skipped events from `events_queued`):
 
 | counter | unit | grows when |
 |---|---|---|
@@ -441,17 +441,17 @@ once per lifecycle stage it passes; stuck in the fallback queue right now =
 | `events_queued` | events | appended to the fallback file (a lifecycle stage, not a durability claim — see `fb_sync_failures`) |
 | `events_replayed` | events | delivered out of the fallback file after recovery |
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while still undelivered (also counted in `events_lost`, never in `delivered`) |
-| `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable queue member, or the `fallback_max_mb` cap trimming undelivered members |
+| `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable counted queue member skipped by its stored event count, or the `fallback_max_mb` cap trimming undelivered members; a readable counted member uses its actual NDJSON line count even if count metadata differs |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life) — https/tcps is shipping unauthenticated |
 | `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` also goes 1) |
-| `warn_fallback_skipped` | **lines** | an unreadable queue member was skipped and counted in `events_lost` |
+| `warn_fallback_skipped` | **lines** | an unreadable counted queue member was skipped; its stored event count enters `events_lost` and leaves `queue_backlog` |
 | `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) queue |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
-The view adds two derived columns: `queue_backlog` (`events_queued −
-events_replayed − events_compacted`, stuck in the file right now) and
+The view adds two derived columns: `queue_backlog` (events still physically
+pending after replay, cap trimming and exact-count unreadable-frame skips) and
 `delivered` (`events_sent + events_replayed`, everything handed to a
 receiver).
 
@@ -506,7 +506,7 @@ scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
 scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
 scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
 scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
-scripts/e2e-hook-chain.sh pglogtap-e2e       # another emit_log_hook extension: chained, not replaced
+scripts/e2e-hook-chain.sh pglogtap-e2e       # another extension's emit-log + shmem hooks: chained, not replaced
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery

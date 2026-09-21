@@ -86,6 +86,16 @@ pub const ShmState = extern struct {
     /// what keeps delivered = sent + replayed honest and queue_backlog
     /// correct.
     compacted: u64 = 0,
+    /// Events removed by skipping unreadable v2 frames. Internal backlog
+    /// accounting only; loss magnitude is already public as export_lost.
+    queue_discarded: u64 = 0,
+    /// Soft worker restarts keep the replay cursor in shmem. The file itself
+    /// remains the durability boundary: a postmaster restart zeros these and
+    /// replays from byte zero under the normal at-least-once contract.
+    fallback_dev: i64 = 0,
+    fallback_ino: u64 = 0,
+    fallback_offset: u64 = 0,
+    fallback_cursor_valid: u8 = 0,
     send_failed: u64 = 0,
     export_lost: u64 = 0,
     /// Consecutive failed getaddrinfo lookups in the export worker; 0 after
@@ -148,6 +158,7 @@ pub const Stats = struct {
     queued: u64,
     replayed: u64,
     compacted: u64,
+    queue_discarded: u64,
     send_failed: u64,
     export_lost: u64,
     dns_fail_streak: u32,
@@ -223,6 +234,7 @@ pub fn snapshot(r: Ring) Stats {
         .queued = r.state.queued,
         .replayed = r.state.replayed,
         .compacted = r.state.compacted,
+        .queue_discarded = r.state.queue_discarded,
         .send_failed = r.state.send_failed,
         .export_lost = r.state.export_lost,
         .dns_fail_streak = r.state.dns_fail_streak,

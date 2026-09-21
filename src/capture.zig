@@ -20,8 +20,10 @@ var entries_base: [*]u8 = undefined;
 var ready = false;
 var tranche_id: c_int = 0;
 
-/// Previous hook, called first (PROBLEMS.md B1: never swallow other hooks).
+/// Previous hooks, called first (PROBLEMS.md B1: never swallow other hooks).
 var prev_hook: pg.emit_log_hook_type = null;
+var prev_shmem_request_hook: @TypeOf(pg.shmem_request_hook) = null;
+var prev_shmem_startup_hook: @TypeOf(pg.shmem_startup_hook) = null;
 /// Reentrancy guard: our own ereport inside the hook must not loop.
 var in_hook = false;
 
@@ -73,7 +75,9 @@ pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.message_max", "Width in bytes of each event's message field; longer messages are cut at a UTF-8 character boundary and named in truncated. Other fields stay 256 bytes. Shared memory cost is ring_capacity × (message_max + ~2.4 KB); restart required. Default keeps the slot byte-identical to 0.3.x (3.4 KB).", null, &guc_message_max, 1024, @intCast(ring.default_message), @intCast(ring.max_message), pg.PGC_POSTMASTER, 0, null, null, null);
 
+    prev_shmem_request_hook = pg.shmem_request_hook;
     pg.shmem_request_hook = shmemRequestHook;
+    prev_shmem_startup_hook = pg.shmem_startup_hook;
     pg.shmem_startup_hook = shmemStartupHook;
     prev_hook = pg.emit_log_hook;
     pg.emit_log_hook = emitLogHook;
@@ -132,11 +136,13 @@ fn rebuildFilter() void {
 // --- shared memory -----------------------------------------------------------
 
 fn shmemRequestHook() callconv(.c) void {
+    if (prev_shmem_request_hook) |hook| hook();
     const cap: usize = @intCast(guc_ring_capacity);
     pg.RequestAddinShmemSpace(@sizeOf(ring.ShmState) + @as(usize, ring.strideFor(@intCast(guc_message_max))) * cap);
 }
 
 fn shmemStartupHook() callconv(.c) void {
+    if (prev_shmem_startup_hook) |hook| hook();
     // PG18: the tranche counter lives in shared memory; allocating it anywhere
     // before shmem exists (request hook, _PG_init) segfaults.
     tranche_id = pg.LWLockNewTrancheId();
@@ -347,21 +353,68 @@ pub fn setWorkerLatch() void {
 }
 
 /// Lifecycle counters — one event is counted exactly once per stage it
-/// passes through: sent (live send), queued (fallback-file append),
-/// replayed (queue member delivered after recovery), compacted (dropped by
-/// the fallback cap trim while undelivered — also counted lost, never
-/// delivered). Stuck in the queue right now = queued - replayed -
-/// compacted. failed counts CYCLES, not events.
-pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64, compacted: u64) void {
-    if (!ready) return;
-    lockRing();
+/// passes through: sent (live send), queued (fallback-file append), replayed
+/// (queue member delivered after recovery), compacted (dropped by the cap),
+/// queue_discarded (unreadable v2 frame skipped). The last is internal because
+/// lost already exposes its magnitude. failed counts CYCLES, not events.
+fn bumpExportLocked(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64, compacted: u64, queue_discarded: u64) void {
     state.sent += sent;
     state.queued += queued;
     state.replayed += replayed;
     state.send_failed += failed;
     state.export_lost += lost;
     state.compacted += compacted;
+    state.queue_discarded += queue_discarded;
+}
+
+pub fn bumpExport(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64, compacted: u64, queue_discarded: u64) void {
+    if (!ready) return;
+    lockRing();
+    bumpExportLocked(sent, queued, replayed, failed, lost, compacted, queue_discarded);
     unlockRing();
+}
+
+pub const FallbackCursor = struct { dev: i64, ino: u64, offset: u64 };
+
+/// Publish one flush cycle's queue counters and replay cursor under the same
+/// lock. If the worker dies before this point, both stay old and the next
+/// worker safely replays the member; if it dies after, both stay advanced.
+pub fn bumpExportCursor(sent: u64, queued: u64, replayed: u64, failed: u64, lost: u64, compacted: u64, queue_discarded: u64, cursor: ?FallbackCursor) void {
+    if (!ready) return;
+    lockRing();
+    bumpExportLocked(sent, queued, replayed, failed, lost, compacted, queue_discarded);
+    if (cursor) |value| {
+        state.fallback_dev = value.dev;
+        state.fallback_ino = value.ino;
+        state.fallback_offset = value.offset;
+        state.fallback_cursor_valid = 1;
+    }
+    unlockRing();
+}
+
+/// A successful drain reuses the inode after truncation, so its old EOF must
+/// stop being a resumable boundary before that inode can hold a new queue.
+pub fn invalidateFallbackCursor() void {
+    if (!ready) return;
+    lockRing();
+    state.fallback_cursor_valid = 0;
+    unlockRing();
+}
+
+/// Resume only when the same queue inode still exists and the saved boundary
+/// fits it. A postmaster restart starts with an invalid zeroed cursor; a
+/// truncate or replacement makes the saved offset/identity fail closed to 0.
+pub fn fallbackOffset(dev: i64, ino: u64, size: u64) u64 {
+    if (!ready) return 0;
+    lockRing();
+    const saved = if (state.fallback_cursor_valid != 0 and
+        state.fallback_dev == dev and state.fallback_ino == ino and
+        state.fallback_offset <= size)
+        state.fallback_offset
+    else
+        0;
+    unlockRing();
+    return saved;
 }
 
 /// Worker-owned gauges, republished every flush cycle: the worker-local
@@ -486,7 +539,7 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.queued,
         snap.replayed,
         snap.compacted,
-        snap.queued -| snap.replayed -| snap.compacted,
+        snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded,
         snap.sent +| snap.replayed,
         snap.export_lost,
         snap.send_failed,

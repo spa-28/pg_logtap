@@ -8,12 +8,18 @@
 #                        → dedup-by-seq spans restarts)
 #   fallback-queue     : receiver dead + export_fallback_file set → zero
 #                        lost, every event in the file
-#   torn-queue-tail    : a member header claiming more bytes than the file
-#                        holds (crash mid-append) is cut at the member
-#                        boundary at the next read; appends resume there,
-#                        replay stays on
-#   corrupt-member     : a damaged gzip member mid-queue (framing intact) is
-#                        skipped and counted lost; later members still replay
+#   torn-queue-tail    : a partial frame header or a header claiming more body
+#                        bytes than the file holds is cut at the member boundary;
+#                        appends resume there and replay stays on
+#   legacy-queue       : clean PGLTFB01 frames replay and accept later v1
+#                        appends; an unreadable v1 frame breaks rather than
+#                        publishing a fabricated event count
+#   corrupt-member     : a damaged counted member (framing intact) is skipped
+#                        by its exact event count; later members still replay
+#   count-metadata     : readable NDJSON outranks a damaged v2 event_count in
+#                        replay and cap-compaction accounting
+#   soft-worker-restart: the shmem replay cursor prevents re-skip/replay drift
+#                        while the postmaster and its counters stay alive
 #   bomb-member        : a member under the compressed bound that inflates
 #                        far past it (gzip bomb) is skipped like a damaged
 #                        one; the worker's memory stays flat, later members
@@ -89,7 +95,7 @@ if ! { [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ]; }; the
     wait_for outage3 100; wait_for outage4 20
   fi
 fi
-dups=$(grep 'logtap kill' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+dups=$(grep -E "logtap kill (outage1|outage3|outage4)$SUF [0-9]+" "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
 [ "$(received outage1)" = 20 ] && [ "$(received outage3)" = 100 ] && [ "$(received outage4)" = 20 ] \
   || fail "receiver outage: loss (outage1=$(received outage1) outage3=$(received outage3) outage4=$(received outage4))"
 [ "$dups" = 0 ] || fail "receiver outage: $dups duplicate seqs — dedup-by-seq contract broken"
@@ -127,6 +133,14 @@ echo "== fallback queue: compressed append + replay =="
 FB_REL=pg_logtap-fallback.bin # relative: must resolve against PGDATA
 FB_DIR=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory")
 FB="$FB_DIR/$FB_REL"
+write_v1_queue() { # write_v1_queue <full marker text> <partial-header bytes>
+  python3 - "$1" "$2" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "cat > '$FB'"
+import gzip, json, struct, sys
+body = (json.dumps({"seq": 1, "message": sys.argv[1]}, separators=(",", ":")) + "\n").encode()
+compressed = gzip.compress(body, mtime=0)
+sys.stdout.buffer.write(b"PGLTFB01" + struct.pack("<I", len(compressed)) + compressed + b"\0" * int(sys.argv[2]))
+PY
+}
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
@@ -142,9 +156,9 @@ n=0; while [ "$n" -lt 20 ] && [ "$(docker exec "$PG_CT" psql -U postgres -Atc "S
   n=$((n + 1)); sleep 1
 done
 sleep 1 # one flush cycle for the worker to apply the landed config
-gen queue1 2600; sleep 3 # >2 members at chunk_max=1024: multi-member replay
+gen queue1 2600; sleep 3 # >10 members at chunk_max=256: multi-member replay
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
-docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 || fail "fallback queue: no queue magic in $FB"
+docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB02 || fail "fallback queue: no counted queue magic in $FB"
 docker exec "$PG_CT" grep -q "logtap kill queue1" "$FB" 2>/dev/null && fail "fallback queue: file is plain text, not compressed"
 [ "$(statf events_lost)" = 0 ] || fail "fallback queue: lost>0 despite the fallback file"
 warns=$(( $(statf warn_fallback_unbounded) - warns0 ))
@@ -164,71 +178,262 @@ setguc pg_logtap.fallback_max_mb 512 # back to the default for later scenarios
 ok "restart + receiver back → 2600/2600 replayed, queue truncated, 0 duplicate seqs"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 
-echo "== torn queue tail: crash mid-append =="
-# The exact shape a crash mid-append leaves: magic, a member header claiming
-# 1000 bytes, then only 100. The worker's next read (its boot-time queue
-# walk) must cut the file back to the member boundary and append there —
-# not disable replay, not misparse the framing (fallback_broken stays 0).
+echo "== torn queue body: crash mid-append =="
+# Counted magic, a complete [len,count] header claiming 1000 body bytes, then
+# only 100. The boot scan cuts at the frame boundary; a later append must land
+# there rather than behind the stale body.
 corr0=$(statf fallback_broken)
-# Write the template while the fallback is still off (export_fallback_file=''
-# since the previous scenario) — the worker does not open the file at all.
-# Writing it after the reload instead raced the worker's own appends: parking
-# had already started (receiver pointed at a dead port), and the interleaved
-# writes left garbage at offset 8, which the boot walk then rightfully reported
-# as framing corrupt instead of cutting the torn member (seen on pg16).
-docker exec "$PG_CT" sh -c "printf 'PGLTFB01' > '$FB'; printf '\350\003\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
+docker exec -u postgres "$PG_CT" sh -c "printf 'PGLTFB02' > '$FB'; printf '\350\003\000\000\001\000\000\000' >> '$FB'; head -c 100 /dev/zero >> '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
-setguc pg_logtap.export_fallback_file "$FB_REL"; reload
+setguc pg_logtap.export_fallback_file "$FB_REL"
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
-sleep 2 # boot queue walk reads the file and truncates the torn tail
-gen torn1 20; sleep 3 # parks at the member boundary the walk left
+sleep 2
+gen torn1 20; sleep 3
 sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
-[ "$sz" -gt 112 ] || fail "torn queue tail: nothing appended after the cut (size $sz)"
+[ "$sz" -gt 16 ] || fail "torn queue body: nothing appended after the cut (size $sz)"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for torn1 20
-[ "$(received torn1)" = 20 ] || fail "torn queue tail: replay broken (torn1=$(received torn1)/20)"
-[ "$(statf fallback_broken)" = "$corr0" ] || fail "torn queue tail: misparsed as corrupt instead of cut (fallback_broken=$(statf fallback_broken))"
-ok "torn tail cut at the member boundary, appends resumed, 20/20 replayed"
+[ "$(received torn1)" = 20 ] || fail "torn queue body: replay broken (torn1=$(received torn1)/20)"
+[ "$(statf fallback_broken)" = "$corr0" ] || fail "torn queue body: misparsed as corrupt instead of cut (fallback_broken=$(statf fallback_broken))"
+ok "torn counted body cut at the frame boundary, appends resumed, 20/20 replayed"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+
+
+echo "== legacy queue: partial 1/2/3-byte frame headers are repaired =="
+# Each file has one clean v1 frame plus a partial next length. The boot-time
+# credit scan must repair the tail before any new event exists; the old frame
+# then stays readable and a new failed-send batch appends in v1 without mixing
+# formats. This is also the clean PGLTFB01 compatibility check.
+tail_n=1
+while [ "$tail_n" -le 3 ]; do
+  docker exec "$PG_CT" sh -c "rm -f '$FB'"
+  write_v1_queue "logtap $E2E_TAG v1tail$tail_n$E2E_SUF 0" "$tail_n" || fail "legacy partial header $tail_n: could not write fixture"
+  with_tail=$(docker exec "$PG_CT" stat -c %s "$FB")
+  clean=$((with_tail - tail_n))
+  setguc pg_logtap.export_url "http://127.0.0.1:1"
+  setguc pg_logtap.export_fallback_file "$FB_REL"
+  # Do not reload into the old worker: a real crash tail is first seen by the
+  # restarted worker's boot scan, before its startup events can append.
+  docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
+  sleep 2
+  # Startup itself emits capturable lines, so after boot the repaired file may
+  # already have valid appends behind the fixture. Walk every v1 frame: leaving
+  # the stale 1..3 bytes would shift the next header/payload and fail this.
+  repaired=$(docker exec "$PG_CT" stat -c %s "$FB")
+  [ "$repaired" -ge "$clean" ] || fail "legacy partial header $tail_n: repair cut into the valid frame"
+  off=8
+  while [ "$off" -lt "$repaired" ]; do
+    len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
+    [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "legacy partial header $tail_n: bad frame length at $off"
+    end=$((off + 4 + len)); [ "$end" -le "$repaired" ] || fail "legacy partial header $tail_n: torn frame after boot"
+    docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -t" \
+      || fail "legacy partial header $tail_n: stale prefix shifted the appended gzip payload"
+    off=$end
+  done
+  [ "$off" = "$repaired" ] || fail "legacy partial header $tail_n: frame walk ended at $off, size $repaired"
+  gen "v1new$tail_n" 10; sleep 3
+  docker exec "$PG_CT" head -c 8 "$FB" | grep -q PGLTFB01 \
+    || fail "legacy partial header $tail_n: append mixed/replaced the v1 format"
+  [ "$(docker exec "$PG_CT" stat -c %s "$FB")" -gt "$repaired" ] \
+    || fail "legacy partial header $tail_n: no frame appended after repair"
+  setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+  wait_for "v1tail$tail_n" 1; wait_for "v1new$tail_n" 10
+  [ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
+    || fail "legacy partial header $tail_n: queue not truncated after replay"
+  [ "$(statf fallback_broken)" = 0 ] || fail "legacy partial header $tail_n: queue marked broken"
+  setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+  tail_n=$((tail_n + 1))
+done
+ok "all partial v1 headers repaired before append; clean v1 frames and later v1 appends replayed"
+
+
+echo "== legacy corrupt member: stop instead of inventing a count =="
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+write_v1_queue "logtap $E2E_TAG v1bad$E2E_SUF 0" 0 || fail "legacy corrupt member: could not write fixture"
+docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=12 count=16 conv=notrunc" >/dev/null 2>&1
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload
+docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
+sleep 2
+[ "$(statf fallback_broken)" = 1 ] || fail "legacy corrupt member: unreadable v1 frame did not break the queue"
+[ "$(statf events_lost)" = 0 ] || fail "legacy corrupt member: fabricated events_lost=$(statf events_lost)"
+[ "$(statf warn_fallback_skipped)" = 0 ] || fail "legacy corrupt member: claimed an unknown-count frame was skipped"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB")" -gt 12 ] || fail "legacy corrupt member: frame was removed"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+docker restart "$PG_CT" >/dev/null; wait_ready
+ok "unreadable v1 frame left in place, fallback_broken=1, no fabricated loss count"
+
+
+echo "== counted metadata mismatch: readable payload is authoritative =="
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+python3 - "$E2E_TAG" "$SUF" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "cat > '$FB'"
+import gzip, json, struct, sys
+
+tag, suffix = sys.argv[1:]
+out = bytearray(b"PGLTFB02")
+for frame, stored in enumerate((0, 257, 9)):
+    body = b"".join(
+        (json.dumps({"seq": 700000 + frame * 10 + i, "message": f"logtap {tag} countmeta{suffix} {frame * 10 + i}"}, separators=(",", ":")) + "\n").encode()
+        for i in range(10)
+    )
+    compressed = gzip.compress(body, mtime=0)
+    out += struct.pack("<II", len(compressed), stored) + compressed
+sys.stdout.buffer.write(out)
+PY
+setguc pg_logtap.level_min 23
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file "$FB_REL"
+docker restart "$PG_CT" >/dev/null; wait_ready
+wait_for countmeta 30
+[ "$(statf events_lost)" = 0 ] || fail "count metadata: readable payloads counted lost ($(statf events_lost))"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] \
+  || fail "count metadata: backlog did not drain"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "count metadata: queue not truncated after readable mismatch"
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.level_min 15; reload; sleep 1
+ok "stored counts 0/257/9 vs 10 readable lines each: replayed 30, lost=0, backlog=0"
+
+
+echo "== counted metadata mismatch: compaction counts readable lines =="
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+python3 - "$E2E_TAG" "$SUF" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "cat > '$FB'"
+import base64, gzip, json, random, struct, sys
+
+tag, suffix = sys.argv[1:]
+out = bytearray(b"PGLTFB02")
+for frame in range(4):
+    pad = base64.b64encode(random.Random(8100 + frame).randbytes(600000)).decode()
+    lines = []
+    for i in range(10):
+        row = {"seq": 710000 + frame * 10 + i, "message": f"logtap {tag} compactmeta{suffix} {frame * 10 + i}"}
+        if i == 0:
+            row["pad"] = pad
+        lines.append(json.dumps(row, separators=(",", ":")) + "\n")
+    compressed = gzip.compress("".join(lines).encode(), mtime=0)
+    out += struct.pack("<II", len(compressed), 9 if frame == 0 else 10) + compressed
+sys.stdout.buffer.write(out)
+PY
+fixture_size=$(docker exec "$PG_CT" stat -c %s "$FB")
+[ "$fixture_size" -gt 2000000 ] || fail "count metadata compaction: fixture only ${fixture_size}B"
+setguc pg_logtap.level_min 23
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB_REL"
+setguc pg_logtap.fallback_max_mb 1
+docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
+setguc pg_logtap.level_min 15; reload; sleep 1
+gen compacttrigger 1
+n=0; while [ "$n" -lt 20 ] && [ "$(statf events_compacted)" -eq 0 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(statf events_compacted)" = 30 ] \
+  || fail "count metadata compaction: compacted=$(statf events_compacted), want 30 readable events (not stored 29)"
+[ "$(statf events_lost)" = 30 ] \
+  || fail "count metadata compaction: lost=$(statf events_lost), want 30"
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512; reload; sleep 1
+docker exec "$PG_CT" sh -c "rm -f '$FB'"
+ok "cap trim used readable line counts: compacted=lost=30, not corrupt stored total 29"
+
+
+echo "== soft worker restart: replay cursor survives in shmem =="
+python3 - "$E2E_TAG" "$SUF" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "cat > '$FB'"
+import gzip, json, struct, sys
+
+tag, suffix = sys.argv[1:]
+out = bytearray(b"PGLTFB02")
+bad = b"not-a-gzip-member-not-a-gzip-member"
+out += struct.pack("<II", len(bad), 10) + bad
+for i in range(70):
+    body = (json.dumps({"seq": 720000 + i, "message": f"logtap {tag} cursor{suffix} {i}"}, separators=(",", ":")) + "\n").encode()
+    compressed = gzip.compress(body, mtime=0)
+    out += struct.pack("<II", len(compressed), 1) + compressed
+sys.stdout.buffer.write(out)
+PY
+setguc pg_logtap.level_min 23
+setguc pg_logtap.flush_interval 30000
+setguc pg_logtap.export_url "http://127.0.0.1:1"
+setguc pg_logtap.export_fallback_file "$FB_REL"
+docker restart "$PG_CT" >/dev/null; wait_ready
+n=0; while [ "$n" -lt 20 ] && [ "$(statf events_lost)" -lt 10 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(statf events_lost)" = 10 ] || fail "soft cursor: initial corrupt frame loss=$(statf events_lost), want 10"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 70 ] \
+  || fail "soft cursor: initial backlog not 70"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+n=0; while [ "$n" -lt 20 ] && [ "$(received cursor)" -lt 64 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(received cursor)" = 64 ] || fail "soft cursor: first bounded replay delivered $(received cursor), want 64"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 6 ] \
+  || fail "soft cursor: backlog after first 64 is not 6"
+lost_before=$(statf events_lost)
+skip_before=$(statf warn_fallback_skipped)
+failed_before=$(statf send_cycles_failed)
+setguc pg_logtap.export_url "http://127.0.0.1:1"; reload
+n=0; while [ "$n" -lt 20 ] && [ "$(statf send_cycles_failed)" -le "$failed_before" ]; do
+  n=$((n + 1)); sleep 1
+done
+wpid=$(worker_pid)
+[ -n "$wpid" ] || fail "soft cursor: worker not found"
+docker exec "$PG_CT" kill -TERM "$wpid"
+n=0; new_wpid=$wpid
+while [ "$n" -lt 20 ] && [ "$new_wpid" = "$wpid" ]; do
+  n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
+done
+[ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] || fail "soft cursor: worker did not restart"
+sleep 2
+[ "$(statf events_lost)" = "$lost_before" ] \
+  || fail "soft cursor: corrupt frame counted lost again ($(statf events_lost) vs $lost_before)"
+[ "$(statf warn_fallback_skipped)" = "$skip_before" ] \
+  || fail "soft cursor: replacement worker rescanned the corrupt prefix"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 6 ] \
+  || fail "soft cursor: replacement worker drifted backlog from 6"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for cursor 70 "" 40
+cursor_dups=$(seqs_of cursor | sort -n | uniq -d | wc -l)
+[ "$cursor_dups" = 0 ] || fail "soft cursor: replay resent $cursor_dups already-delivered events"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] \
+  || fail "soft cursor: final backlog did not reach 0"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "soft cursor: queue not truncated after final replay"
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.flush_interval 1000
+setguc pg_logtap.level_min 15; reload; sleep 1
+ok "soft restart resumed after the published frame boundary: lost stayed 10, backlog 6→0, duplicates=0"
+
 
 echo "== corrupt member mid-queue: skipped, later members still replay =="
 # A/CORRUPT/B/C: park four marker batches with the receiver dead, smash
-# every member holding cmX (gzip payload, framing [len] intact), restart,
-# revive the receiver. The walk must skip exactly the damaged members
-# (counted lost), credit and replay the rest — and NOT escalate to
-# "replay disabled", which a framing-level corruption would cause.
+# every member holding cmX (gzip payload, counted framing intact), restart,
+# revive the receiver. The walk must skip the exact event_count stored in each
+# damaged frame, credit and replay the rest, and leave no phantom backlog.
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
 gen cmA 10; sleep 1; gen cmX 10; sleep 1; gen cmB 10; sleep 1; gen cmC 10; sleep 2
-# Find EVERY member holding cmX by walking the framing ([len:4][gzip
-# payload] per member after the 8-byte magic) and inflating each candidate
-# on the spot. Two reasons a marker is not "one member": noise events
-# (scenario-switch traffic) park ahead of or between the markers, and a
-# flush-cycle boundary mid-burst splits one gen across members (a 10-event
-# gen parks 1+9). Smash them all; each [len] framing around them survives.
+# Find EVERY member holding cmX by walking [compressed_len,event_count,gzip]
+# and inflating each candidate. A flush boundary may split one gen across
+# frames, so the expected loss is the sum of their stored counts, not the
+# number of frames.
 sz=$(docker exec "$PG_CT" stat -c %s "$FB")
-off=8; hits=""; nhits=0
+off=8; hits=""; nhits=0; lost_want=0
 while [ "$off" -lt "$sz" ]; do
   len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
-  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "corrupt member: framing unreadable at $off (len='$len')"
-  end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
-  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
+  count=$(docker exec "$PG_CT" od -An -tu4 -j$((off + 4)) -N4 "$FB" | tr -d ' \n')
+  [ -n "$len" ] && [ "$len" -gt 0 ] && [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null \
+    || fail "corrupt member: framing unreadable at $off (len='$len' count='$count')"
+  end=$((off + 8 + len)); [ "$end" -le "$sz" ] || fail "corrupt member: torn member at $off (end=$end sz=$sz)"
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 8)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
   case "$body" in
     *"logtap kill cmX"*)
-      # A member holding cmX AND another marker means a flush-cycle stall
-      # merged two gens: smashing it would eat intact events and every assert
-      # below would point at the wrong thing. Scenario arithmetic broke, not
-      # the product — say so instead of failing cryptically.
       echo "$body" | grep -qE "logtap kill cm[ABC]" \
         && fail "corrupt member: cmX shares its member with A/B/C (flush stall merged the gens) — rerun the scenario"
-      hits="$hits $off"; nhits=$((nhits + 1)) ;;
+      hits="$hits $off"; nhits=$((nhits + 1)); lost_want=$((lost_want + count)) ;;
   esac
   off=$end
 done
 [ "$nhits" -ge 1 ] || fail "corrupt member: no cmX member found in the queue"
 for h in $hits; do
-  docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=$((h + 4)) count=16 conv=notrunc" >/dev/null 2>&1
+  docker exec "$PG_CT" sh -c "dd if=/dev/zero of='$FB' bs=1 seek=$((h + 8)) count=16 conv=notrunc" >/dev/null 2>&1
 done
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
@@ -236,51 +441,54 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 [ "$(received cmA)" = 10 ] && [ "$(received cmB)" = 10 ] && [ "$(received cmC)" = 10 ] \
   || fail "corrupt member: intact members not replayed (cmA=$(received cmA) cmB=$(received cmB) cmC=$(received cmC))"
 [ "$(received cmX)" = 0 ] || fail "corrupt member: damaged member delivered $(received cmX) events"
-# Fresh shmem at the restart: the skips are the only thing that touched
-# lost — one per damaged member (the member, not its events, is the loss
-# unit)
-[ "$(statf events_lost)" = "$nhits" ] || fail "corrupt member: events_lost=$(statf events_lost), want $nhits"
+# Fresh shmem at the restart: exact stored counts are the only losses.
+[ "$(statf events_lost)" = "$lost_want" ] \
+  || fail "corrupt member: events_lost=$(statf events_lost), want stored count $lost_want"
 skip=$(statf warn_fallback_skipped)
-# twice per member by design: the boot walk that credits the backlog counts
-# it, then the drain's own read of the damaged member counts it again
+# Twice per frame by design: boot credit scan, then the real drain.
 [ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
 [ "$(statf fallback_broken)" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
+backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$backlog" = 0 ] || fail "corrupt member: queue_backlog=$backlog after physical drain"
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
 [ "$fb_sz" = 0 ] || fail "corrupt member: queue not truncated after replay ($fb_sz bytes left)"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
-ok "$nhits damaged member(s) skipped (lost=$(statf events_lost)), A/B/C replayed 30/30, framing held"
+ok "$nhits damaged frame(s) skipped by exact count ($lost_want), backlog=0, A/B/C replayed 30/30"
 
 echo "== decompression-bomb member: inflate bounded, member skipped not inflated =="
-# A member whose COMPRESSED length passes the framing bound but which
-# inflates far past member_max: the fixed inflate buffer is the ceiling —
-# the member is skipped as unreadable exactly like a damaged one, the
-# worker's memory stays flat, and later members replay. An unbounded
-# inflate would have taken 512MB of RSS before a post-hoc size check.
+# A final member whose compressed length passes the framing bound but inflates
+# far past member_max: the fixed buffer is the ceiling. Keeping the bomb last
+# also exercises the drain-only cleanup of a skipped final frame.
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
-gen bombX 10; sleep 1; gen bombA 10; sleep 2
+gen bombA 10; sleep 1; gen bombX 10; sleep 2
 # The bomb: 512MB of zeros gzip-9s to well under the ~5.2MB framing bound
 # and inflates a hundredfold past it. Built in-container — dd and gzip are
 # the same tools the walk above uses.
 docker exec "$PG_CT" sh -c "dd if=/dev/zero bs=1048576 count=512 2>/dev/null | gzip -9 -c > /tmp/bomb.gz"
 blen=$(docker exec "$PG_CT" stat -c %s /tmp/bomb.gz)
 [ "$blen" -lt 5000000 ] 2>/dev/null || fail "bomb member: compressed $blen not under the framing bound — scenario broken"
-# Replace every bombX member's gzip payload with the bomb (framing [len]
-# rewritten to the bomb's length) — same walk as the corrupt-member phase.
+# Replace every bombX payload while retaining its stored event_count.
 sz=$(docker exec "$PG_CT" stat -c %s "$FB")
-off=8; segs=""; nb=0
+off=8; segs=""; nb=0; bomb_lost=0; bomb_end=0
 while [ "$off" -lt "$sz" ]; do
   len=$(docker exec "$PG_CT" od -An -tu4 -j"$off" -N4 "$FB" | tr -d ' \n')
-  [ -n "$len" ] && [ "$len" -gt 0 ] 2>/dev/null || fail "bomb member: framing unreadable at $off (len='$len')"
-  end=$((off + 4 + len)); [ "$end" -le "$sz" ] || fail "bomb member: torn member at $off (end=$end sz=$sz)"
-  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 4)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
+  count=$(docker exec "$PG_CT" od -An -tu4 -j$((off + 4)) -N4 "$FB" | tr -d ' \n')
+  [ -n "$len" ] && [ "$len" -gt 0 ] && [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null \
+    || fail "bomb member: framing unreadable at $off (len='$len' count='$count')"
+  end=$((off + 8 + len)); [ "$end" -le "$sz" ] || fail "bomb member: torn member at $off (end=$end sz=$sz)"
+  body=$(docker exec "$PG_CT" sh -c "dd if='$FB' bs=1 skip=$((off + 8)) count=$len 2>/dev/null | gzip -dc" 2>/dev/null)
   case "$body" in
-    *"logtap kill bombX"*) segs="$segs $off:$end"; nb=$((nb + 1)) ;;
+    *"logtap kill bombX"*)
+      echo "$body" | grep -q "logtap kill bombA" \
+        && fail "bomb member: bombX shares its frame with bombA — rerun the scenario"
+      segs="$segs $off:$end"; nb=$((nb + 1)); bomb_lost=$((bomb_lost + count)); bomb_end=$end ;;
   esac
   off=$end
 done
 [ "$nb" -ge 1 ] || fail "bomb member: no bombX member found in the queue"
+[ "$bomb_end" = "$sz" ] || fail "bomb member: bombX is not the final frame (end=$bomb_end size=$sz)"
 # Splice in ONE docker exec ending in an atomic mv: a worker cycle landing
 # mid-rebuild sees either the old or the new file, never a torn one.
 b0=$((blen & 255)); b1=$(((blen >> 8) & 255)); b2=$(((blen >> 16) & 255)); b3=$(((blen >> 24) & 255))
@@ -292,6 +500,7 @@ docker exec "$PG_CT" sh -c "
     o=\${s%:*}; e=\${s#*:}
     tail -c +\$((prev + 1)) '$FB' | head -c \$((o - prev)) >> /tmp/fb.new
     printf '$lesc' >> /tmp/fb.new
+    dd if='$FB' bs=1 skip=\$((o + 4)) count=4 2>/dev/null >> /tmp/fb.new
     cat /tmp/bomb.gz >> /tmp/fb.new
     prev=\$e
   done
@@ -305,21 +514,23 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for bombA 10
 [ "$(received bombA)" = 10 ] || fail "bomb member: later members not replayed (bombA=$(received bombA)/10)"
 [ "$(received bombX)" = 0 ] || fail "bomb member: bomb content delivered?? (bombX=$(received bombX))"
-# Fresh shmem at the restart, so absolutes: one loss per bomb member (the
-# member, not its events), two skips per member (boot walk + drain), and
-# the skip must never escalate to a framing error.
-[ "$(statf events_lost)" = "$nb" ] || fail "bomb member: events_lost=$(statf events_lost), want $nb"
+# Fresh shmem at restart: exact stored counts are lost; boot scan + drain each
+# observe every bomb frame, and the final drain observation truncates the file.
+[ "$(statf events_lost)" = "$bomb_lost" ] \
+  || fail "bomb member: events_lost=$(statf events_lost), want stored count $bomb_lost"
 [ "$(statf warn_fallback_skipped)" = $((2 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((2 * nb))"
 [ "$(statf fallback_broken)" = 0 ] || fail "bomb member: overflow escalated to a framing error"
+backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$backlog" = 0 ] || fail "bomb member: queue_backlog=$backlog after final-frame skip"
 fb_sz=$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)
-[ "$fb_sz" = 0 ] || fail "bomb member: queue not truncated after replay ($fb_sz bytes left)"
+[ "$fb_sz" = 0 ] || fail "bomb member: skipped final frame did not truncate the queue ($fb_sz bytes left)"
 [ -n "$hwm" ] && [ "$hwm" -lt 200000 ] 2>/dev/null \
   || fail "bomb member: worker peak RSS ${hwm:-unreadable}kB — the 512MB bomb was inflated, not bounded"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
-ok "$nb bomb member(s) skipped, worker peak RSS ${hwm}kB bounded, bombA replayed 10/10"
+ok "$nb final bomb frame(s) skipped by exact count ($bomb_lost), backlog=0, peak RSS ${hwm}kB"
 
 echo "== file:// url == fallback path: the pair is rejected at SET =="
-# The NDJSON sink and the PGLTFB01 queue framing cannot share a file; the
+# The NDJSON sink and the fallback queue framing cannot share a file; the
 # SET-time check rejects whichever GUC lands second. A reload between the
 # two ALTER SYSTEMs is load-bearing: the check hook in a fresh session
 # reads the peer GUC as the postmaster last parsed it, and ALTER SYSTEM
@@ -491,7 +702,7 @@ echo "== a 900KB control-byte message at message_max=1MB: parked and replayed wh
 # sane. Counters are read after the restart — shmem dies with the postmaster.
 FB5_REL=pg_logtap-fallback5.bin
 setguc pg_logtap.message_max 1048576
-setguc pg_logtap.ring_capacity 64
+setguc pg_logtap.ring_capacity 128
 docker restart "$PG_CT" >/dev/null; wait_ready
 q0=$(statf events_queued); sk0=$(statf warn_fallback_skipped); l0=$(statf events_lost)
 setguc pg_logtap.export_url "http://127.0.0.1:1"
@@ -515,7 +726,7 @@ echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
 # under a different string, so the pair loads. The open-time inode check is
 # what catches it — and it is symmetric (each side stats the other's file),
 # so BOTH refuse: no send lands raw NDJSON in the queue's framing, the queue
-# never appends PGLTFB01 into the sink, and the RAM backlog carries the
+# never appends queue framing into the sink, and the RAM backlog carries the
 # events until the GUC is repointed. A FRESH queue name on purpose: the
 # symlink phase left the old string broken-latched, and path() re-checks
 # only on a string change — fbOpen must actually run to create the file
@@ -751,7 +962,7 @@ setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.fallback_max_mb
 setguc pg_logtap.export_backlog_max 65536; reload
 n=0; while [ "$n" -lt 30 ]; do
   sleep 1; n=$((n + 1))
-  backlog=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
+  backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
   [ "$(received cap1)" -gt 0 ] && [ "$backlog" -le 0 ] && break
 done
 R=$(received cap1)

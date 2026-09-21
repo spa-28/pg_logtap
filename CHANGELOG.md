@@ -116,6 +116,26 @@ fails the reload (at boot it is fatal).
   now: the torn-tail truncate fires only on a true EOF before the declared
   length, and an I/O error leaves the member in place for the next cycle
   instead of destroying it.
+- New fallback files use counted `PGLTFB02` frames: compressed length, exact
+  event count, then gzip. A framed but unreadable member now contributes its
+  stored count to `events_lost` and is removed from `queue_backlog`, so a
+  damaged multi-event batch cannot leave a permanent phantom backlog or be
+  reported as one lost event. When gzip is readable, its NDJSON line count is
+  authoritative over damaged count metadata during replay and cap compaction.
+  Clean `PGLTFB01` files remain readable and append-compatible until drained;
+  an unreadable v1 member stops replay with `fallback_broken=1` because its
+  event count cannot be recovered honestly.
+- Soft export-worker restarts resume the fallback queue from a shared-memory
+  cursor validated against the queue device, inode and size. Each cycle
+  publishes replay/loss counters and that cursor under one lock, so a
+  replacement neither redelivers already-published members nor counts the same
+  unreadable member twice. The cursor is invalidated before a drained inode is
+  truncated and reused, so a refilled queue cannot inherit the previous
+  generation's EOF; a postmaster restart retains byte-zero at-least-once replay.
+- A crash leaving only part of the next fallback frame header is repaired at
+  the last complete member boundary and synced, just like a torn body. Later
+  appends no longer land behind the stale 1–7 bytes and shift all subsequent
+  framing.
 
 ### Hardening
 
@@ -133,16 +153,23 @@ fails the reload (at boot it is fatal).
   The rollback after a torn write mid-batch syncs the same way: the
   truncation itself is a durability event there too, not only when the
   sync failed first.
-- A send attempt runs on one absolute budget. Each socket syscall was
-  already bounded by `export_timeout_ms`, but the stages were not: a
-  stalled resolver could spend seconds before a connect that bought its
-  own full timeout, then a write, then a status read — several budgets in
-  one attempt. The timeout is armed as a deadline at send start and
-  re-armed on the socket at every stage boundary and loop iteration
-  (post-dial, TLS handshake, body chunks, status reads); an attempt past
-  its budget fails as an ordinary send and the batch takes the usual
-  retry/fallback path. DNS stays outside the budget, as before and as the
-  GUC table documents (getaddrinfo has no timeout knob).
+- A send attempt runs on one monotonic absolute budget. Each socket syscall
+  was already bounded by `export_timeout_ms`, but the stages were not: a
+  stalled resolver could spend seconds before each resolved address bought a
+  fresh connect timeout, then a write, then a status read — several budgets in
+  one attempt. The deadline is re-armed on the socket at every stage boundary
+  and loop iteration (connect addresses, TLS handshake, body chunks, status
+  reads); an attempt past it fails as an ordinary send and the batch takes the
+  usual retry/fallback path. DNS remains an uninterruptible blocking call
+  (`getaddrinfo` has no timeout knob), but its elapsed time consumes the budget
+  before connect. Plain and TLS reads preserve the helper/syscall deadline or
+  abort reason instead of overwriting it with a stale EOF, `errno`,
+  `ReadFailed`, or `WriteFailed` label. Linux TLS socket-timeout `EAGAIN` and a
+  deliberate-close `EBADF` are ordinary timeout/abort paths, not debug panics.
+- Shared-memory hook installation now chains previously registered
+  `shmem_request_hook` and `shmem_startup_hook`, matching the existing
+  `emit_log_hook` interop. Extensions preloaded before pg_logtap keep their
+  shared-memory request and initialization callbacks.
 - `export_http_extra_headers` cannot malform a request: a raw CR/LF byte and
   an embedded empty line are rejected at SET (each would end the header
   section early), and everything else about line endings is normalized on
@@ -188,6 +215,10 @@ fails the reload (at boot it is fatal).
   like any other sync failure: a landed compaction is one of the queue's
   documented durability points, so its failed sync belongs in the counter
   (safety unchanged — the rewrite is abandoned, the original queue stands).
+- Compaction removes a stale `.compact` object only when its exclusive open
+  failed with `EEXIST`. An unrelated failure such as `EACCES` now leaves the
+  existing path untouched instead of unlinking an object the worker did not
+  establish was blocking the create.
 - Every queue-side truncate is a durability event and syncs like one: the
   rollback of a torn queue header, the rollback of a torn member
   mid-append and the torn-tail repair in replay all `ftruncate` and then
@@ -195,7 +226,7 @@ fails the reload (at boot it is fatal).
   tail, and the next append would land after garbage and shift the
   framing of everything past it.
 - A `file://` export_url and `export_fallback_file` cannot resolve to the
-  same file: the NDJSON sink and the `PGLTFB01` framing corrupt each other.
+  same file: the NDJSON sink and the fallback queue framing corrupt each other.
   Whichever GUC lands second is rejected at SET/`ALTER SYSTEM`. The docs
   now state the fallback queue's scope for what it already was — every
   transport parks there, `file://` included — and the same-reload
@@ -231,6 +262,12 @@ fails the reload (at boot it is fatal).
   one full extra timeout past the budget. With no remainder left it is
   skipped (the fd close is the backstop). e2e-tls phase
   10 drives a one-byte-per-2s dribbler and asserts failed cycles grow.
+- A signal interrupting a blocked network syscall cannot extend one send
+  attempt by restarting the old relative socket timeout. Plain HTTP status
+  reads, TLS `readv`, and TLS `sendmsg(MSG_NOSIGNAL)` retry only after
+  re-checking and re-arming the absolute `export_timeout_ms` deadline; repeated
+  SIGHUP therefore consumes the original attempt budget instead of granting a
+  fresh timeout on every `EINTR`.
 - The network `export_url` schemes reject a host or path carrying a control
   byte, a raw space, DEL or any non-ASCII byte at SET: the host and path
   ride the HTTP request line verbatim, so such a value could split or

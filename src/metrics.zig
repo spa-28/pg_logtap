@@ -54,7 +54,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_events_sent_total Events delivered by a live send to the export URL.
         \\# TYPE pg_logtap_events_sent_total counter
         \\pg_logtap_events_sent_total {d}
-        \\# HELP pg_logtap_events_queued_total Events appended to the fallback file — a lifecycle stage, not a durability claim (fb_sync_failures names the cycles that are not durable). Stuck in the queue right now = events_queued - events_replayed - events_compacted.
+        \\# HELP pg_logtap_events_queued_total Events appended to the fallback file — a lifecycle stage, not a durability claim (fb_sync_failures names the cycles that are not durable). SQL queue_backlog subtracts replayed, cap-trimmed, and unreadable skipped events.
         \\# TYPE pg_logtap_events_queued_total counter
         \\pg_logtap_events_queued_total {d}
         \\# HELP pg_logtap_events_replayed_total Events delivered out of the fallback file after the receiver recovered.
@@ -66,7 +66,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_send_cycles_failed_total Failed send attempts — one per flush cycle whose send failed, NOT events. The events are safe (fallback queue / backlog); this is the receiver-down signal.
         \\# TYPE pg_logtap_send_cycles_failed_total counter
         \\pg_logtap_send_cycles_failed_total {d}
-        \\# HELP pg_logtap_events_lost_total Events permanently lost: RAM backlog overflow with no fallback file, the fallback_max_mb cap trimming undelivered members (also in events_compacted), or an unreadable fallback member skipped.
+        \\# HELP pg_logtap_events_lost_total Events permanently lost: RAM backlog overflow with no fallback file, the fallback_max_mb cap trimming undelivered members (also in events_compacted), or an unreadable counted fallback member skipped by its stored fallback count; readable payloads use their NDJSON line count.
         \\# TYPE pg_logtap_events_lost_total counter
         \\pg_logtap_events_lost_total {d}
         \\# HELP pg_logtap_ring_events Events currently waiting in the ring.

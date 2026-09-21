@@ -3,7 +3,8 @@
 //! export_fallback_file is set, batches are appended here and drained to the
 //! receiver once it answers — the RAM backlog then only covers what parking
 //! cannot take.
-//! Internal framing, one batch per member: [8-byte magic][u32 LE len][gzip]…
+//! Internal framing, one batch per member: v1 [magic][u32 len][gzip],
+//! v2 [magic][u32 len][u32 event count][gzip].
 //! A crash mid-append leaves a torn tail member — detected by the short read,
 //! truncated, appends resume at the member boundary. A crash mid-replay loses
 //! only the in-memory offset: replay restarts from byte 0, so the receiver may
@@ -14,7 +15,6 @@ const std = @import("std");
 const pg = @import("pgzx").c;
 const elog = @import("pgzx").elog;
 const worker = @import("worker.zig");
-const ring = @import("ring.zig");
 const jsonl = @import("jsonl.zig");
 const capture = @import("capture.zig");
 const gzip = @import("gzip.zig");
@@ -31,6 +31,7 @@ const c = struct {
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn pread(fd: c_int, buf: [*]u8, count: usize, offset: i64) isize;
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
+    extern "c" fn fstat(fd: c_int, buf: *worker.FileStat) c_int;
     extern "c" fn stat(path: [*:0]const u8, buf: *worker.FileStat) c_int;
 };
 
@@ -56,8 +57,28 @@ pub const body_cap = 4 << 20;
 /// here let the queue write members its own replay buffer could not hold.
 const member_max = body_cap + jsonl.worst_serialized_entry + 65536;
 
-const fb_magic = "PGLTFB01";
+const fb_magic_v1 = "PGLTFB01";
+const fb_magic_v2 = "PGLTFB02";
 const fb_magic_len = 8;
+
+const FrameFormat = enum {
+    legacy,
+    counted,
+
+    fn magic(format: FrameFormat) []const u8 {
+        return switch (format) {
+            .legacy => fb_magic_v1,
+            .counted => fb_magic_v2,
+        };
+    }
+
+    fn headerLen(format: FrameFormat) u64 {
+        return switch (format) {
+            .legacy => 4,
+            .counted => 8,
+        };
+    }
+};
 
 /// Linux O_NOFOLLOW (0o400000) as a raw flag value: std.os.linux.O is a
 /// packed bool struct, unusable with the extern open. Every open of the
@@ -83,9 +104,17 @@ pub var sync_failures: u64 = 0;
 /// streak means queued events nobody knows are not durable. Cleared by the
 /// first success, so a flapping disk is heard each time it starts failing.
 var fb_sync_warned = false;
-/// Members skipped as unreadable (framing intact, gzip damaged) — folded into
-/// `lost` by the flush cycle that read them.
+/// Events in unreadable v2 members — folded into `lost` by the flush cycle
+/// that read them. A corrupt v1 member has no trustworthy count and breaks the
+/// queue instead of inventing one.
 pub var lost: u64 = 0;
+/// Same skipped-v2 events, removed from the physical queue without replay.
+/// Kept separate from `compacted`, whose public contract is cap trimming.
+pub var discarded: u64 = 0;
+
+var queue_dev: i64 = 0;
+var queue_ino: u64 = 0;
+var queue_identity_valid = false;
 
 var fb_path_buf: [4096]u8 = undefined;
 var fb_path_len: usize = 0;
@@ -166,17 +195,24 @@ fn path() ?[]const u8 {
         @memcpy(fb_path_buf[0..full.len], full);
         fb_path_buf[full.len] = 0;
         offset = 0;
+        queue_identity_valid = false;
         broken = false;
     }
     return fb_path_buf[0..fb_path_len];
 }
 
-/// Worker start: remove a crashed compaction's litter, then credit this
-/// epoch's counters with whatever the file already holds (below).
+/// Worker start: remove a crashed compaction's litter, restore the cursor a
+/// previous worker published in shmem, then credit any uncounted suffix.
 pub fn boot(alloc: std.mem.Allocator) void {
-    if (path() != null) {
-        var tmp_buf: [4096]u8 = undefined;
-        if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    if (path() == null) return;
+    var tmp_buf: [4096]u8 = undefined;
+    if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    if (fbOpen()) |file_fd| {
+        defer _ = c.close(file_fd);
+        if (fbSize(file_fd)) |size| {
+            if (queue_identity_valid)
+                offset = capture.fallbackOffset(queue_dev, queue_ino, size);
+        }
     }
     creditBacklog(alloc);
 }
@@ -250,6 +286,18 @@ fn fbOpen() ?c_int {
         elog.Warning(@src(), "pg_logtap fallback queue and the file:// export_url name one file (symlink/hardlink alias): fallback disabled: {s}", .{path() orelse ""});
         return null;
     }
+    var file_stat: worker.FileStat = undefined;
+    if (c.fstat(file_fd, &file_stat) != 0) {
+        _ = c.close(file_fd);
+        broken = true;
+        capture.noteWarn(.fallback_open);
+        elog.Warning(@src(), "pg_logtap fallback queue identity could not be read (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, path() orelse "" });
+        return null;
+    }
+    if (queue_identity_valid and (queue_dev != file_stat.dev or queue_ino != file_stat.ino)) offset = 0;
+    queue_dev = file_stat.dev;
+    queue_ino = file_stat.ino;
+    queue_identity_valid = true;
     return file_fd;
 }
 
@@ -310,6 +358,60 @@ fn fbPread(fd: c_int, buf: []u8, offset_v: u64) ReadResult {
     return .full;
 }
 
+fn readFormat(file_fd: c_int) ?FrameFormat {
+    var magic: [fb_magic_len]u8 = undefined;
+    if (fbPread(file_fd, &magic, 0) != .full) return null;
+    if (std.mem.eql(u8, &magic, fb_magic_v1)) return .legacy;
+    if (std.mem.eql(u8, &magic, fb_magic_v2)) return .counted;
+    return null;
+}
+
+const FrameHeader = struct {
+    compressed_len: u32,
+    event_count: ?u32,
+    len: u64,
+};
+
+const HeaderResult = union(enum) {
+    full: FrameHeader,
+    torn,
+    err,
+    corrupt,
+};
+
+fn readFrameHeader(file_fd: c_int, format: FrameFormat, at: u64, size: u64) HeaderResult {
+    const header_len = format.headerLen();
+    if (size -| at < header_len) return .torn;
+    var buf: [8]u8 = undefined;
+    switch (fbPread(file_fd, buf[0..@intCast(header_len)], at)) {
+        .full => {},
+        .eof => return .torn,
+        .err => return .err,
+    }
+    const compressed_len = std.mem.readInt(u32, buf[0..4], .little);
+    if (compressed_len == 0 or compressed_len > member_max) return .corrupt;
+    const event_count: ?u32 = if (format == .counted) std.mem.readInt(u32, buf[4..8], .little) else null;
+    return .{ .full = .{ .compressed_len = compressed_len, .event_count = event_count, .len = header_len } };
+}
+
+fn storedEventCount(event_count: ?u32) ?u32 {
+    const count = event_count orelse return null;
+    return if (count > 0 and count <= chunk_max) count else null;
+}
+
+/// A short frame header/body after a valid magic is ours and is safe to cut.
+/// Sync the repair so an OS crash cannot resurrect the torn bytes behind a
+/// later append.
+fn repairTail(file_fd: c_int, at: u64) bool {
+    if (c.ftruncate(file_fd, @intCast(at)) == 0) {
+        _ = fbDatasync(file_fd, false);
+        return true;
+    }
+    broken = true;
+    elog.Warning(@src(), "pg_logtap fallback torn tail at offset {d} could not be truncated (errno={d}), replay disabled: {s}", .{ at, std.c._errno().*, path() orelse "" });
+    return false;
+}
+
 /// True while the fallback file holds undelivered events — flushAll then
 /// routes everything through it to keep global order.
 pub fn queued() bool {
@@ -322,6 +424,11 @@ pub fn queued() bool {
     defer _ = c.close(file_fd);
     const size = fbSize(file_fd) orelse return false;
     return if (offset == 0) size > fb_magic_len else size > offset;
+}
+
+pub fn cursor() ?capture.FallbackCursor {
+    if (!queue_identity_valid) return null;
+    return .{ .dev = queue_dev, .ino = queue_ino, .offset = offset };
 }
 
 /// Outcome of appending one batch. `failed` = nothing of it is in the file
@@ -339,13 +446,18 @@ pub const Outcome = enum { failed, appended, not_durable };
 /// WAL-shared disk stall the worker past the ring's drain window (measured:
 /// 5k dropped in a 16-client storm). Success = the events left pg_logtap
 /// (page cache survives postmaster death; an OS crash loses the unsynced tail).
-pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
-    if (broken) return .failed;
+pub fn append(alloc: std.mem.Allocator, body: []const u8, events: usize, sync: bool) Outcome {
+    if (broken or events == 0 or events > chunk_max) return .failed;
     const file_fd = fbOpen() orelse return .failed;
     defer _ = c.close(file_fd);
     const size = fbSize(file_fd) orelse return .failed;
+    const format: FrameFormat = if (size == 0) .counted else readFormat(file_fd) orelse {
+        broken = true;
+        elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
+        return .failed;
+    };
     if (size == 0) {
-        if (!worker.writeAll(file_fd, fb_magic, false, null)) {
+        if (!worker.writeAll(file_fd, format.magic(), false, null)) {
             // Roll the fresh file back to empty. A short write can stop
             // mid-magic, and a 1..7-byte file is "foreign content" to the
             // next open — fallback disabled over a torn header. The file
@@ -365,28 +477,21 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
             }
             return .failed;
         }
-    } else {
-        var magic: [fb_magic_len]u8 = undefined;
-        if (size < fb_magic_len or fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) {
-            broken = true;
-            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
-            return .failed;
-        }
     }
     const comp = gzip.compress(alloc, body) catch return .failed; // compression failed → RAM backlog retries
     defer alloc.free(comp);
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, @intCast(comp.len), .little);
-    if (!worker.writeAll(file_fd, &len_buf, false, null) or !worker.writeAll(file_fd, comp, false, null)) {
-        // Roll the partial member back. A torn [len][half-member] left in
-        // place shifts the framing of every later append — the next member
-        // lands mid-garbage and the whole tail reads as "gzip damaged"
-        // instead of just this batch retrying from RAM.
+    var header: [8]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], @intCast(comp.len), .little);
+    if (format == .counted) std.mem.writeInt(u32, header[4..8], @intCast(events), .little);
+    const header_len: usize = @intCast(format.headerLen());
+    if (!worker.writeAll(file_fd, header[0..header_len], false, null) or !worker.writeAll(file_fd, comp, false, null)) {
+        // Roll the partial member back. A torn header/body left in place
+        // shifts the framing of every later append — the next member lands
+        // mid-garbage instead of just this batch retrying from RAM.
         if (c.ftruncate(file_fd, @intCast(size)) == 0) {
-            // Sync the rollback, same window as the header rollback above:
-            // an unsynced truncate can resurrect the torn [len][half-member]
-            // after an OS crash, and an append landing after the resurrected
-            // tail shifts the framing of everything past it.
+            // Sync the rollback, same window as the magic rollback above:
+            // an unsynced truncate can resurrect the torn member after an OS
+            // crash, and an append would then land behind it.
             _ = fbDatasync(file_fd, false);
         } else {
             broken = true;
@@ -402,11 +507,7 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, sync: bool) Outcome {
     // compaction is tmp+rename where every failure leaves the original
     // file untouched, so it can only enforce the cap — never worsen the
     // not-durable state or drop a member the failed sync left in place.
-    // The fd and the post-append size are already in hand — the
-    // cap check costs no syscall, and only a file past the cap pays for the
-    // rewrite. A fresh file (size 0) also gained the framing magic with
-    // this member.
-    compact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + 4 + comp.len);
+    compact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + format.headerLen() + comp.len, format);
     return if (durable) .appended else .not_durable;
 }
 
@@ -445,10 +546,18 @@ pub fn fsync() void {
     _ = fbDatasync(file_fd, false);
 }
 
-/// One queued batch: decompressed NDJSON, the byte size at read time, and how
-/// far offset advances past it. body borrows the reused inflate buffer —
-/// valid until the next nextMember.
-pub const Member = struct { body: []const u8, size: u64, advance: u64 };
+/// One queued batch: decompressed NDJSON, event count, the byte size at read
+/// time, and how far offset advances past it. body borrows the reused inflate
+/// buffer — valid until the next nextMember.
+pub const Member = struct { body: []const u8, events: u32, size: u64, advance: u64 };
+
+pub const Skipped = struct { events: u32, final: bool };
+
+pub const Next = union(enum) {
+    none,
+    member: Member,
+    skipped: Skipped,
+};
 
 // Reused inflate state: the 32K window and the ≤ member_max decompressed
 // member sit above glibc's mmap threshold — same story as the gzip pool.
@@ -459,90 +568,105 @@ pub const Member = struct { body: []const u8, size: u64, advance: u64 };
 // exactly like a gzip-damaged one. ~5MB, allocated once on first replay.
 var fb_dec: ?struct { window: []u8, body_buf: []u8 } = null;
 
-/// Read the member at offset. null = nothing replayable right now (drained,
-/// torn tail truncated away, unreadable member skipped, or the file is not
-/// ours). Torn tail: crash mid-append left a short member — truncated so
-/// appends resume at a member boundary.
-pub fn nextMember(alloc: std.mem.Allocator) ?Member {
-    if (broken) return null;
-    const file_fd = fbOpen() orelse return null;
+fn unreadableMember(format: FrameFormat, at: u64, size: u64, advance: u64, event_count: ?u32) Next {
+    if (format == .legacy) {
+        // v1 stores no count outside gzip. Skipping it as one event makes both
+        // events_lost and queue_backlog lie; stop and require operator action.
+        broken = true;
+        elog.Warning(@src(), "pg_logtap legacy fallback member at offset {d} is unreadable and its event count is unknown, replay disabled: {s}", .{ at, path() orelse "" });
+        return .none;
+    }
+    const events = storedEventCount(event_count) orelse {
+        broken = true;
+        elog.Warning(@src(), "pg_logtap fallback member at offset {d} is unreadable and its stored event_count={d} is outside 1..{d}, replay disabled: {s}", .{ at, event_count.?, chunk_max, path() orelse "" });
+        return .none;
+    };
+    offset += advance;
+    lost += events;
+    discarded += events;
+    capture.noteWarn(.fallback_skipped);
+    elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable (gzip damaged or inflates past the {d}-byte bound), {d} events skipped", .{ at, member_max, events });
+    return .{ .skipped = .{ .events = events, .final = offset >= size } };
+}
+
+/// Read the member at offset. An explicit skipped result lets the drain remove
+/// a final corrupt v2 frame without making the boot-time credit scan delete
+/// valid members it has only inspected. Torn tails are repaired at the current
+/// member boundary so later appends cannot land behind stale framing bytes.
+pub fn nextMember(alloc: std.mem.Allocator) Next {
+    if (broken) return .none;
+    const file_fd = fbOpen() orelse return .none;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return null;
+    const size = fbSize(file_fd) orelse return .none;
     if (offset == 0) {
-        if (size <= fb_magic_len) return null;
-        var magic: [fb_magic_len]u8 = undefined;
-        if (fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) {
+        if (size <= fb_magic_len) return .none;
+        if (readFormat(file_fd) == null) {
             broken = true;
             elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
-            return null;
+            return .none;
         }
         offset = fb_magic_len;
     }
-    if (offset >= size) return null;
-    var len_buf: [4]u8 = undefined;
-    if (fbPread(file_fd, &len_buf, offset) != .full) return null;
-    const mlen = std.mem.readInt(u32, &len_buf, .little);
-    if (mlen == 0 or mlen > member_max) {
+    if (offset >= size) return .none;
+    const format = readFormat(file_fd) orelse {
         broken = true;
-        elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{offset});
-        return null;
+        elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
+        return .none;
+    };
+    const header = switch (readFrameHeader(file_fd, format, offset, size)) {
+        .full => |h| h,
+        .torn => {
+            _ = repairTail(file_fd, offset);
+            return .none;
+        },
+        .err => return .none,
+        .corrupt => {
+            broken = true;
+            elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{offset});
+            return .none;
+        },
+    };
+    const advance = header.len + @as(u64, header.compressed_len);
+    if (size -| offset < advance) {
+        _ = repairTail(file_fd, offset);
+        return .none;
     }
-    const comp = alloc.alloc(u8, mlen) catch return null;
-    const body_read = fbPread(file_fd, comp, offset + 4);
+    const comp = alloc.alloc(u8, header.compressed_len) catch return .none;
+    const body_read = fbPread(file_fd, comp, offset + header.len);
     if (body_read == .err) {
         // An I/O error says nothing about the framing — leave the member in
         // place and retry next cycle; truncating here would destroy fully
         // valid members on a transient disk fault.
         alloc.free(comp);
-        return null;
+        return .none;
     }
-    if (body_read == .eof) { // torn tail: EOF before the declared length
+    if (body_read == .eof) {
         alloc.free(comp);
-        // The truncation is what lets the next append land on a member edge;
-        // if it fails the framing after offset is lost until a human
-        // looks — replaying garbage is worse than stopping.
-        if (c.ftruncate(file_fd, @intCast(offset)) == 0) {
-            // The repair restores the framing invariant for every future
-            // append, so it is a durability point like the drain's truncate:
-            // unsynced, an OS crash can resurrect the torn tail the next
-            // append would then land after.
-            _ = fbDatasync(file_fd, false);
-        } else {
-            broken = true;
-            elog.Warning(@src(), "pg_logtap fallback torn tail at offset {d} could not be truncated (errno={d}), replay disabled: {s}", .{ offset, std.c._errno().*, path() orelse "" });
-        }
-        return null;
+        _ = repairTail(file_fd, offset);
+        return .none;
     }
     defer alloc.free(comp);
     if (fb_dec == null) fb_dec = .{
-        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return null,
-        .body_buf = alloc.alloc(u8, member_max) catch return null,
+        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return .none,
+        .body_buf = alloc.alloc(u8, member_max) catch return .none,
     };
     const dec_state = &fb_dec.?;
     var src: std.Io.Reader = .fixed(comp);
     var dec = std.compress.flate.Decompress.init(&src, .gzip, dec_state.window);
     var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
-    // Overflow past member_max fails the write (WriteFailed) like gzip damage
-    // fails the stream — both mean "this member is not coming back whole";
-    // framing is intact, so skip past it and count the loss.
-    _ = dec.reader.streamRemaining(&body) catch {
-        const skip_at = offset;
-        offset += 4 + mlen;
-        lost += 1;
-        capture.noteWarn(.fallback_skipped);
-        elog.Log(@src(), "pg_logtap fallback member at offset {d} unreadable (gzip damaged or inflates past the {d}-byte bound), skipped", .{ skip_at, member_max });
-        return null;
-    };
+    _ = dec.reader.streamRemaining(&body) catch return unreadableMember(format, offset, size, advance, header.event_count);
+    const events: u32 = @intCast(std.mem.countScalar(u8, body.buffered(), '\n'));
+    if (events == 0)
+        return unreadableMember(format, offset, size, advance, header.event_count);
+    if (format == .counted and events != header.event_count.?)
+        elog.Warning(@src(), "pg_logtap fallback member at offset {d} stores event_count={d} but contains {d} readable NDJSON lines; replaying and accounting the readable payload", .{ offset, header.event_count.?, events });
     // member_max itself: buildBody admits the event that crosses body_cap,
     // so a member this build writes is ≤ body_cap + one serialized event
     // (jsonl.worst_serialized_entry — 6× the raw widths, see its comment);
-    // the +64K on top also admits members
-    // from 0.3.x binaries (≤ ~371KB) read before an upgrade drains the
-    // queue. Compile-time max, not the live GUC: queued members can outlive
-    // a restart that lowers message_max. A byte bound, not a ratio: a wide
-    // repetitive body legitimately inflates past 64:1 and a ratio bound
-    // would flag it corrupt and lose it.
-    return .{ .body = body.buffered(), .size = size, .advance = 4 + @as(u64, mlen) };
+    // the +64K on top also admits members from 0.3.x binaries read before an
+    // upgrade drains the queue. A byte bound, not a ratio: a wide repetitive
+    // body legitimately inflates past 64:1 and a ratio bound would lose it.
+    return .{ .member = .{ .body = body.buffered(), .events = events, .size = size, .advance = advance } };
 }
 
 /// Queue fully delivered: zero it (the next append re-creates the magic) and
@@ -561,45 +685,64 @@ pub fn truncate() void {
     if (broken) return;
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
-    var magic: [fb_magic_len]u8 = undefined;
-    if (fbPread(file_fd, &magic, 0) != .full or !std.mem.eql(u8, &magic, fb_magic)) return;
+    if (readFormat(file_fd) == null) return;
+    // The next queue generation reuses this inode. Fail closed to replay from
+    // byte zero if the worker exits before publishing that generation's cursor.
+    capture.invalidateFallbackCursor();
     if (c.ftruncate(file_fd, 0) == 0) {
         offset = 0;
         _ = fbDatasync(file_fd, false);
     }
 }
 
-/// The fallback file can outlive the shmem counters: a postmaster restart
-/// zeroes queued/replayed/…, the disk queue does not. Credit this epoch's
-/// queued with what the file already holds so backlog (queued − replayed)
-/// stays a real number and replayed ≤ queued holds. One decompress pass at
-/// worker start; offset is restored afterwards — the drain replays from the
-/// top as before (at-least-once contract unchanged).
-/// A worker restart (postmaster alive, counters intact) must credit nothing:
-/// its predecessor already counted every append now in the file, and a
-/// re-credit would inflate backlog (queued − replayed) forever — the file
-/// draining does not repair a counter difference. Every append this epoch
-/// bumped queued, so `file events −| queued` is exactly the uncounted part:
-/// zero after a worker restart, the whole file after a postmaster restart.
+/// Credit queue events that are not represented by the current derived
+/// backlog. A postmaster restart has no saved cursor or counters, so the full
+/// file is credited. A soft worker restart resumes at the shmem cursor and
+/// normally credits zero; if the old worker died after an append but before
+/// publishing its cycle counters, only that uncounted suffix is credited.
 fn creditBacklog(alloc: std.mem.Allocator) void {
     const saved_offset = offset;
     const saved_lost = lost;
-    var lines: u64 = 0;
-    while (true) {
-        const before = offset;
-        const member = nextMember(alloc) orelse {
-            // null without advancing = drained, torn tail or foreign file;
-            // null WITH advancing = unreadable member skipped — keep walking
-            if (offset == before) break;
-            continue;
-        };
-        lines += std.mem.countScalar(u8, member.body, '\n');
-        offset += member.advance;
-    }
+    const saved_discarded = discarded;
+    var events: u64 = 0;
+    while (true) switch (nextMember(alloc)) {
+        .none => break,
+        .member => |member| {
+            events += member.events;
+            offset += member.advance;
+        },
+        // Count a corrupt v2 frame in queued for this fresh shmem epoch too;
+        // the real drain later folds its exact count into lost + discarded.
+        .skipped => |skip| events += skip.events,
+    };
     offset = saved_offset;
     lost = saved_lost;
-    const due = lines -| capture.snapshot().queued;
-    if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0);
+    discarded = saved_discarded;
+    const snap = capture.snapshot();
+    const backlog = snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded;
+    const due = events -| backlog;
+    if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0, 0);
+}
+
+fn countFrameEvents(alloc: std.mem.Allocator, file_fd: c_int, format: FrameFormat, off: u64, header: FrameHeader) ?u64 {
+    const stored: ?u64 = if (storedEventCount(header.event_count)) |events| events else null;
+    const comp = alloc.alloc(u8, header.compressed_len) catch return stored;
+    defer alloc.free(comp);
+    if (fbPread(file_fd, comp, off + header.len) != .full) return stored;
+    if (fb_dec == null) fb_dec = .{
+        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return stored,
+        .body_buf = alloc.alloc(u8, member_max) catch return stored,
+    };
+    const dec_state = &fb_dec.?;
+    var src_reader: std.Io.Reader = .fixed(comp);
+    var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
+    var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
+    _ = dec.reader.streamRemaining(&body) catch return stored;
+    const events: u64 = std.mem.countScalar(u8, body.buffered(), '\n');
+    if (events == 0) return stored;
+    if (format == .counted and events != header.event_count.?)
+        elog.Warning(@src(), "pg_logtap fallback member at offset {d} stores event_count={d} but contains {d} readable NDJSON lines; compaction accounts the readable payload", .{ off, header.event_count.?, events });
+    return events;
 }
 
 /// Enforce fallback_max_mb (0 = unlimited): once the file outgrew the cap,
@@ -607,8 +750,8 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
 /// then turns over cap/2 bytes per compaction instead of filling the disk.
 /// Members below offset were already delivered (dropping them is free);
 /// dropped undelivered members count into compacted AND lost: compacted
-/// keeps queue_backlog = queued − replayed − compacted truthful (they left
-/// the queue), lost records that they never arrived. Atomic (tmp + rename +
+/// removes them from queue_backlog, lost records that they never arrived.
+/// Atomic (tmp + rename +
 /// directory fsync); any failure leaves the file as it was — the next append
 /// past the cap retries. Ceiling: a cap smaller than one member bounds the
 /// file only at member granularity. Runs under the cycle's abort budget:
@@ -616,7 +759,7 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
 /// between syscalls — the flush cycle's own budget mid-cycle, send_deadline
 /// during shutdown — so neither ever waits out a cap/2 rewrite: the untouched
 /// original simply retries on the next append past the cap.
-fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
+fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFormat) void {
     const cap_bytes: u64 = @as(u64, @intCast(@max(guc_max_mb, 0))) << 20;
     if (cap_bytes == 0 or size <= cap_bytes) return;
     const keep_bytes = cap_bytes / 2;
@@ -626,37 +769,22 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     // misread stops the walk — nothing is dropped on a guess.
     var off: u64 = fb_magic_len;
     var lost_events: u64 = 0;
-    while (off + 4 <= size) {
+    while (off < size) {
         if (worker.compactAborted()) return;
-        var len_buf: [4]u8 = undefined;
-        if (fbPread(file_fd, &len_buf, off) != .full) return;
-        const mlen = std.mem.readInt(u32, &len_buf, .little);
-        if (mlen == 0 or mlen > member_max) return;
-        const end = off + 4 + mlen;
+        const header = switch (readFrameHeader(file_fd, format, off, size)) {
+            .full => |h| h,
+            .torn => break,
+            .err, .corrupt => return,
+        };
+        const end = off + header.len + header.compressed_len;
         if (end > size) break; // torn tail
         if (size - end < keep_bytes) break; // dropping would undercut the budget
         if (off >= offset) { // undelivered: count its events before dropping
-            const comp = alloc.alloc(u8, mlen) catch return;
-            defer alloc.free(comp);
-            if (fbPread(file_fd, comp, off + 4) != .full) return;
-            if (fb_dec == null) fb_dec = .{
-                .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return,
-                .body_buf = alloc.alloc(u8, member_max) catch return,
-            };
-            const dec_state = &fb_dec.?;
-            var src_reader: std.Io.Reader = .fixed(comp);
-            var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
-            var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
-            // a member that will not inflate (or inflates past the fixed
-            // bound, the same bomb case nextMember skips) has no countable
-            // events; replay counts it as one loss per member (nextMember's
-            // lost += 1) — match that here or events_lost undercounts the
-            // compaction drop
-            var readable = true;
-            _ = dec.reader.streamRemaining(&body) catch {
-                readable = false;
-            };
-            lost_events += if (readable) std.mem.countScalar(u8, body.buffered(), '\n') else 1;
+            // A readable gzip payload is authoritative: its CRC passed and its
+            // NDJSON line count survives a damaged v2 count word. If v2 itself
+            // is unreadable, the stored count remains the exact fallback; v1
+            // has no such metadata and must abort rather than invent a loss.
+            lost_events += countFrameEvents(alloc, file_fd, format, off, header) orelse return;
         }
         off = end;
     }
@@ -677,11 +805,13 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
     const tmp_flags = 2 | 64 | 128 | fb_no_follow; // O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW
     var tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
     if (tmp_fd < 0) {
+        const open_errno = std.c._errno().*;
+        if (open_errno != @intFromEnum(std.c.E.EXIST)) return;
         if (c.unlink(tmp_path) != 0) return;
         tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
         if (tmp_fd < 0) return;
     }
-    var copied_ok = worker.writeAll(tmp_fd, fb_magic, false, null);
+    var copied_ok = worker.writeAll(tmp_fd, format.magic(), false, null);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
     while (copied_ok and pos < size) {
@@ -700,14 +830,19 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64) void {
         pos += want;
     }
     if (copied_ok) copied_ok = fbDatasync(tmp_fd, true);
+    var tmp_st: worker.FileStat = undefined;
+    if (copied_ok and c.fstat(tmp_fd, &tmp_st) != 0) copied_ok = false;
     _ = c.close(tmp_fd);
     if (!copied_ok or c.rename(tmp_path, @ptrCast(fb_path_buf[0..fb_path_len :0].ptr)) != 0) {
         _ = c.unlink(tmp_path);
         return;
     }
     fsyncDirOf(fb_path_buf[0..fb_path_len]);
+    queue_dev = tmp_st.dev;
+    queue_ino = tmp_st.ino;
+    queue_identity_valid = true;
     offset = @max(fb_magic_len, offset -| dropped);
-    if (lost_events > 0) capture.bumpExport(0, 0, 0, 0, lost_events, lost_events);
+    if (lost_events > 0) capture.bumpExport(0, 0, 0, 0, lost_events, lost_events, 0);
     elog.Log(@src(), "pg_logtap fallback file compacted to the newest {d} of {d} bytes; {d} undelivered events counted lost (outage outlasted the queue cap)", .{ size - off, size, lost_events });
 }
 

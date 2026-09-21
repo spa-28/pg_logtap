@@ -265,8 +265,8 @@ phase_robust() { # <v>: robustness classes beyond the happy path — fields past
   scripts/e2e-robust.sh "pglogtap-mx$1"
 }
 
-phase_hook_chain() { # <v>: another emit_log_hook extension preloaded first:
-  # pg_logtap must chain to it, not replace it.
+phase_hook_chain() { # <v>: another hook extension preloaded first:
+  # pg_logtap must chain its emit-log and shared-memory hooks, not replace them.
   scripts/e2e-hook-chain.sh "pglogtap-mx$1"
 }
 

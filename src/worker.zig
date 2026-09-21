@@ -128,11 +128,18 @@ var compact_deadline_us: i64 = 0;
 /// knob; documented in the GUC table).
 var net_deadline_us: i64 = 0;
 
+/// Network attempt deadlines use CLOCK_MONOTONIC: a wall-clock correction must
+/// not lengthen or prematurely expire export_timeout_ms.
+fn netNowUs() i64 {
+    const timestamp = std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .awake);
+    return @intCast(@divTrunc(timestamp.nanoseconds, 1000));
+}
+
 /// Arm an EXPLICIT deadline's remainder on a socket — the per-syscall
 /// re-arm inside writeAll. netArmDeadline below is the stage-boundary
 /// version (the send attempt's global deadline).
 fn armDeadlineFrom(fd: c_int, deadline: i64) bool {
-    const remain_us = deadline - pg.GetCurrentTimestamp();
+    const remain_us = deadline - netNowUs();
     if (remain_us < 1000) return failSend("send deadline", 0);
     const timeval = timevalMs(@divTrunc(remain_us, 1000));
     if (net.setsockopt(fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
@@ -285,6 +292,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     var replayed: u64 = 0; // delivered out of the fallback file
     var failed: u64 = 0;
     var lost: u64 = 0;
+    var discarded: u64 = 0; // unreadable v2 events removed without replay
+    var truncate_queue = false; // only after counters + cursor publish together
     var members: usize = 0; // members sent this cycle — bounded so a long
     // catch-up still returns: counters bump, /metrics gets scraped, the latch
     // honors SIGHUP/TERM. 64 members ≈ 16k events per flush_interval.
@@ -338,7 +347,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 drained_total += drainInto(alloc, pending);
                 lost += trimBacklog(pending);
                 const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-                if (fbq.append(alloc, chunk.body, false) != .appended) { // disk full → RAM-backlog semantics for the rest (sync=false cannot be not_durable)
+                if (fbq.append(alloc, chunk.body, chunk.consumed, false) != .appended) { // disk full → RAM-backlog semantics for the rest (sync=false cannot be not_durable)
                     failed += 1;
                     break;
                 }
@@ -354,14 +363,27 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // park-only: fsync and hand the loop back to drainInto; members
             // resume once inflow quiets or it recovers.
             if (receiver_slow and drained_total > 0) continue;
-            const member = fbq.nextMember(alloc) orelse {
-                lost += fbq.lost;
-                fbq.lost = 0;
-                failed += @intFromBool(pending.len() > 0); // append failed above
-                break;
-            };
+            const next = fbq.nextMember(alloc);
             lost += fbq.lost;
             fbq.lost = 0;
+            discarded += fbq.discarded;
+            fbq.discarded = 0;
+            const member = switch (next) {
+                .none => {
+                    failed += @intFromBool(pending.len() > 0); // append failed above
+                    break;
+                },
+                .skipped => |skip| {
+                    // Publish the skip and its new cursor atomically before a
+                    // final truncate removes the only replay evidence.
+                    if (skip.final) {
+                        truncate_queue = true;
+                        break;
+                    }
+                    continue;
+                },
+                .member => |member| member,
+            };
             const gzipped = gzipPayload(alloc, dest, member.body, &gzip_buf);
             const m_sent_at = pg.GetCurrentTimestamp();
             if (send(dest, url, gzipped.payload, gzipped.enabled)) {
@@ -372,9 +394,15 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
                 fbq.logDivert(false);
                 // counted queued at append time; this is its delivery
-                replayed += std.mem.countScalar(u8, member.body, '\n');
+                replayed += member.events;
                 fbq.offset += member.advance;
-                if (fbq.offset >= member.size) fbq.truncate(); // fully delivered → back to direct sends
+                if (fbq.offset >= member.size) {
+                    // End this cycle before any live append can land behind the
+                    // consumed bytes. Counters + cursor publish first; only then
+                    // may truncate remove the file's replay evidence.
+                    truncate_queue = true;
+                    break;
+                }
                 members += 1;
                 if (members < 64) continue;
                 break; // hand the loop back: counters, metrics, latch
@@ -386,7 +414,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
 
         if (pending.len() == 0) break;
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (receiver_slow and guc_export_slow_ms > 0 and fbq.append(alloc, chunk.body, true) != .failed) {
+        if (receiver_slow and guc_export_slow_ms > 0 and fbq.append(alloc, chunk.body, chunk.consumed, true) != .failed) {
             // Slow-but-alive receiver (receiver_slow): park coming batches on
             // disk — left live, they pile up in the RAM backlog until trimmed.
             // Same as the failed-send divert below, minus failed: nothing
@@ -419,7 +447,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             failed += 1;
             parkAll(alloc, pending, names, &queued, &lost);
             break;
-        } else if (fbq.append(alloc, chunk.body, true) != .failed) {
+        } else if (fbq.append(alloc, chunk.body, chunk.consumed, true) != .failed) {
             fbq.logDivert(true);
             pending.dropFront(chunk.consumed);
             queued += chunk.consumed; // parked in the file (a failed fdatasync keeps the member — fbq.append); counted replayed on delivery
@@ -436,7 +464,8 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
         }
     }
 
-    capture.bumpExport(sent, queued, replayed, failed, lost, 0);
+    capture.bumpExportCursor(sent, queued, replayed, failed, lost, 0, discarded, fbq.cursor());
+    if (truncate_queue) fbq.truncate();
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
@@ -453,7 +482,7 @@ fn parkAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, queue
     var appended = false;
     while (pending.len() > 0) {
         const chunk = buildBody(bodyWriter(alloc), pending, names) orelse break;
-        if (fbq.append(alloc, chunk.body, false) != .appended) break;
+        if (fbq.append(alloc, chunk.body, chunk.consumed, false) != .appended) break;
         pending.dropFront(chunk.consumed);
         queued.* += chunk.consumed;
         appended = true;
@@ -510,7 +539,7 @@ fn drainInto(alloc: std.mem.Allocator, pending: *Backlog) usize {
     while (drained < 4096) {
         if (!capture.drainOne(&head, drain_msg)) return drained;
         pending.append(alloc, &head, drain_msg[0..head.message_len]) catch {
-            capture.bumpExport(0, 0, 0, 0, 1, 0);
+            capture.bumpExport(0, 0, 0, 0, 1, 0, 0);
             return drained;
         };
         drained += 1;
@@ -611,7 +640,7 @@ pub fn gucExportUrl() []const u8 {
 }
 
 /// True when a file:// export_url and the fallback GUC value resolve to the
-/// same file — the NDJSON sink and the PGLTFB01 queue framing must not share
+/// same file — the NDJSON sink and fallback queue framing must not share
 /// one (each corrupts the other's format; whichever opens second sees foreign
 /// content). Rejected at SET of either GUC, so whichever lands second loses.
 pub fn fileUrlAliasesFallback(url: []const u8, fb_raw: []const u8) bool {
@@ -817,7 +846,7 @@ fn gzipPayload(alloc: std.mem.Allocator, dest: dest_mod.Dest, body: []const u8, 
 
 fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) bool {
     _ = url;
-    net_deadline_us = pg.GetCurrentTimestamp() + @as(i64, guc_export_timeout_ms) * 1000;
+    net_deadline_us = netNowUs() + @as(i64, guc_export_timeout_ms) * 1000;
     return switch (dest) {
         .http => |h| sendHttp(h, body, gzipped),
         .tcp => |t| sendRaw(dialTcp(t.host, t.port), body, t),
@@ -879,10 +908,8 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     const conn_fd = dialTcp(h.host, h.port) orelse return false;
     send_conn_fd = conn_fd;
     defer closeSendFd(conn_fd);
-    // Arm the send budget post-dial: a wedged resolver can have spent most
-    // of it before the socket existed (handshake/writes/status read then
-    // run on what is left; dialAddr's own setsockopt gave connect the full
-    // timeout — one in-flight syscall, as documented on netArmDeadline).
+    // Re-arm post-dial: resolution and connect may have spent most of the
+    // attempt, so handshake/writes/status read run only on what remains.
     if (!netArmDeadline(conn_fd)) return false;
     // Fixed headers (method line, Host, content type/encoding/length) run
     // ~110 bytes; 2048 leaves room for any realistic path, host and auth
@@ -908,7 +935,7 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     var got: usize = 0;
     while (got < 12) {
         if (!netArmDeadline(conn_fd)) return false;
-        const nread = recvSome(conn_fd, status_buf[got..]);
+        const nread = recvSome(conn_fd, status_buf[got..], net_deadline_us) orelse return false;
         if (nread == 0) return failSend("status read", std.c._errno().*);
         got += nread;
     }
@@ -923,7 +950,7 @@ fn status2xx(status: []const u8) bool {
 }
 
 fn sendHttpTls(conn_fd: c_int, h: anytype, head: []const u8, body: []const u8) bool {
-    const tls_conn = tls_mod.connect(conn_fd, h.host, tlsOpts(), net_deadline_us - pg.GetCurrentTimestamp()) orelse return tlsFail();
+    const tls_conn = tls_mod.connect(conn_fd, h.host, tlsOpts(), net_deadline_us) orelse return tlsFail();
     if (!tlsWriteBody(tls_conn, head, body)) return false;
     // sendAborted between reads here: the plain path checks it inside
     // recvSome, but the TLS read goes through tls_mod's connection.
@@ -959,7 +986,7 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
     defer closeSendFd(conn_fd);
     if (!netArmDeadline(conn_fd)) return false;
     if (ep.tls) {
-        const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts(), net_deadline_us - pg.GetCurrentTimestamp()) orelse return tlsFail();
+        const tls_conn = tls_mod.connect(conn_fd, ep.host, tlsOpts(), net_deadline_us) orelse return tlsFail();
         if (!tlsWriteBody(tls_conn, "", body)) return false;
         if (netArmDeadline(conn_fd)) tls_conn.end(); // best-effort close_notify, re-armed to the remainder (see sendHttpTls)
         return true;
@@ -1196,29 +1223,20 @@ fn dialTcp(host: []const u8, port: u16) ?c_int {
     return null;
 }
 
-/// socket + connect for one resolved address, with the send timeouts from
-/// export_timeout_ms applied before connect (see below). Returns the
-/// connected fd or null after reporting the connect error via failSend.
+/// socket + connect for one resolved address, with the remaining send-attempt
+/// budget applied before connect. Returns the connected fd or null after
+/// reporting the connect error via failSend.
 fn dialAddr(addr: *const anyopaque, addrlen: u32, family: c_int) ?c_int {
     const conn_fd = c.socket(@intCast(family), 1, 0); // SOCK_STREAM, default protocol
     if (conn_fd < 0) return null;
     // A silent receiver (accepted connect, never answers; hung LB,
     // black-hole route) must not hang the single worker loop — with no
     // timeout, the status recv blocks forever: drain stops, the ring
-    // overflows, /metrics and SIGHUP go unserved. Set before connect:
-    // Linux honors SO_SNDTIMEO for connect(2) too. On expiry write/recv
-    // return EAGAIN, which flows into the ordinary failSend →
-    // retry/fallback path like any dead receiver.
-    const timeval = timevalMs(guc_export_timeout_ms);
-    if (net.setsockopt(conn_fd, 1, 20, &timeval, @sizeOf(Timeval)) != 0 // SOL_SOCKET, SO_RCVTIMEO
-    or net.setsockopt(conn_fd, 1, 21, &timeval, @sizeOf(Timeval)) != 0) { // SOL_SOCKET, SO_SNDTIMEO
-        // A socket the timeouts did not land on would block the single
-        // worker loop forever — the exact hang they exist to prevent. Cancel
-        // the attempt (the batch retries like any dead receiver) instead of
-        // proceeding without the guarantee.
-        const err = std.c._errno().*;
+    // overflows, /metrics and SIGHUP go unserved. Linux honors SO_SNDTIMEO
+    // for connect(2) too. Every resolved address gets only what remains of
+    // this send attempt, not a fresh export_timeout_ms.
+    if (!netArmDeadline(conn_fd)) {
         _ = c.close(conn_fd);
-        _ = failSend("setsockopt", err);
         return null;
     }
     if (net.connect(conn_fd, @ptrCast(@alignCast(addr)), addrlen) == 0) return conn_fd;
@@ -1276,7 +1294,7 @@ pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?
         // only — a local file write (fallback queue, file:// destination) is
         // bounded by disk speed, and exactly those writes carry the parked
         // backlog through shutdown.
-        if (abortable and (sendAborted() or (deadline_us != null and pg.GetCurrentTimestamp() >= deadline_us.?))) return failSend("write abort", 0);
+        if (abortable and (sendAborted() or (deadline_us != null and netNowUs() >= deadline_us.?))) return failSend("write abort", 0);
         // Re-arm to the REMAINDER before every write: the check above only
         // runs between syscalls, so a write started just inside the deadline
         // could otherwise block for one more full SO_SNDTIMEO past it.
@@ -1292,9 +1310,22 @@ pub fn writeAll(conn_fd: c_int, buf: []const u8, abortable: bool, deadline_us: ?
     return true;
 }
 
-fn recvSome(conn_fd: c_int, buf: []u8) usize {
+fn recvSome(conn_fd: c_int, buf: []u8, deadline_us: ?i64) ?usize {
     while (true) {
-        if (sendAborted()) return 0;
+        if (sendAborted()) {
+            _ = failSend("read abort", 0);
+            return null;
+        }
+        if (deadline_us != null and netNowUs() >= deadline_us.?) {
+            _ = failSend("send deadline", 0);
+            return null;
+        }
+        // A signal ends recv with EINTR and Linux leaves the old relative
+        // SO_RCVTIMEO intact. Re-arm from the absolute attempt deadline before
+        // every retry, or repeated SIGHUPs can restart that whole wait forever.
+        // Metrics passes null: its nonblocking socket keeps the independent
+        // poll deadline in serveOne rather than inheriting a stale send budget.
+        if (deadline_us != null and !armDeadlineFrom(conn_fd, deadline_us.?)) return null;
         const count = net.recv(conn_fd, buf.ptr, buf.len, 0);
         if (count > 0) return @intCast(count);
         // A signal (SIGUSR1 latch poke, SIGHUP) arriving mid-read is not a
@@ -1425,7 +1456,7 @@ fn serveOne(conn_fd: c_int) void {
     while (got < req_buf.len) {
         const left_ms: c_int = @intCast(@divTrunc(@max(0, deadline - pg.GetCurrentTimestamp()), 1000));
         if (net.poll(&poll_fds, 1, left_ms) <= 0) break;
-        const nread = recvSome(conn_fd, req_buf[got..]);
+        const nread = recvSome(conn_fd, req_buf[got..], null) orelse break;
         if (nread == 0) break;
         got += nread;
         if (std.mem.findScalar(u8, req_buf[0..got], '\n') != null) break; // line complete

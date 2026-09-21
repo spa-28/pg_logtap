@@ -21,15 +21,17 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
      events_captured — entered the ring
      events_dropped  — the ring was full at capture time
      events_sent     — delivered by a live send
-     events_queued   — durably appended to the fallback file
+     events_queued   — appended to the fallback file (fb_sync_failures names
+                       appends not yet durable)
      events_replayed — delivered out of the fallback file
      events_compacted — dropped by the fallback cap trim while undelivered
                        (also counted in events_lost; never in delivered)
-     queue_backlog   — stuck in the fallback file right now
-                       (queued − replayed − compacted)
+     queue_backlog   — stuck in the fallback file right now; replayed,
+                       cap-trimmed and unreadable skipped events are removed
      delivered       — sent + replayed, everything handed to a receiver
-     events_lost     — permanently lost (no fallback file / unreadable member /
-                       cap-trimmed while undelivered)
+     events_lost     — permanently lost (no fallback file / unreadable counted
+                       member using its stored fallback count / cap-trimmed while
+                       undelivered; readable payloads use their NDJSON line count)
    send_cycles_failed counts failed send CYCLES, not events (receiver down).
    ring_events/ring_capacity are gauges for capture-ring pressure.
    0.3.0 gauges: dns_fail_streak — consecutive failed DNS lookups for the
