@@ -86,6 +86,16 @@ pub const ShmState = extern struct {
     /// what keeps delivered = sent + replayed honest and queue_backlog
     /// correct.
     compacted: u64 = 0,
+    /// Events removed by skipping unreadable v2 frames. Internal backlog
+    /// accounting only; loss magnitude is already public as export_lost.
+    queue_discarded: u64 = 0,
+    /// Soft worker restarts keep the replay cursor in shmem. The file itself
+    /// remains the durability boundary: a postmaster restart zeros these and
+    /// replays from byte zero under the normal at-least-once contract.
+    fallback_dev: i64 = 0,
+    fallback_ino: u64 = 0,
+    fallback_offset: u64 = 0,
+    fallback_cursor_valid: u8 = 0,
     send_failed: u64 = 0,
     export_lost: u64 = 0,
     /// Consecutive failed getaddrinfo lookups in the export worker; 0 after
@@ -103,6 +113,15 @@ pub const ShmState = extern struct {
     /// 1 = pg_logtap.redact_pattern did not compile; that redaction layer is
     /// OFF (fail-open) until the pattern is fixed.
     redact_pattern_failed: u8 = 0,
+    /// Operator-facing WARNING/LOG lines the extension emitted, cumulative
+    /// per kind — the log lines are edge-triggered (once per worker life or
+    /// per transition), these are the queryable/alertable copy: verify=off
+    /// seen, fallback queue unopenable, unreadable member skipped, divert
+    /// into an unbounded (fallback_max_mb=0) queue.
+    warn_tls_no_verify: u64 = 0,
+    warn_fallback_open: u64 = 0,
+    warn_fallback_skipped: u64 = 0,
+    warn_fallback_unbounded: u64 = 0,
 };
 
 /// Byte stride of one slot: head + message region, rounded up so every slot
@@ -139,12 +158,17 @@ pub const Stats = struct {
     queued: u64,
     replayed: u64,
     compacted: u64,
+    queue_discarded: u64,
     send_failed: u64,
     export_lost: u64,
     dns_fail_streak: u32,
     fallback_broken: u8,
     fb_sync_failures: u64,
     redact_pattern_failed: u8,
+    warn_tls_no_verify: u64,
+    warn_fallback_open: u64,
+    warn_fallback_skipped: u64,
+    warn_fallback_unbounded: u64,
     count: u32,
     capacity: u32,
     seq_next: u64,
@@ -210,12 +234,17 @@ pub fn snapshot(r: Ring) Stats {
         .queued = r.state.queued,
         .replayed = r.state.replayed,
         .compacted = r.state.compacted,
+        .queue_discarded = r.state.queue_discarded,
         .send_failed = r.state.send_failed,
         .export_lost = r.state.export_lost,
         .dns_fail_streak = r.state.dns_fail_streak,
         .fallback_broken = r.state.fallback_broken,
         .fb_sync_failures = r.state.fb_sync_failures,
         .redact_pattern_failed = r.state.redact_pattern_failed,
+        .warn_tls_no_verify = r.state.warn_tls_no_verify,
+        .warn_fallback_open = r.state.warn_fallback_open,
+        .warn_fallback_skipped = r.state.warn_fallback_skipped,
+        .warn_fallback_unbounded = r.state.warn_fallback_unbounded,
         .count = r.state.count,
         .capacity = r.state.capacity,
         .seq_next = r.state.seq_next,

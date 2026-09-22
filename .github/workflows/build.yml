@@ -27,13 +27,9 @@ jobs:
           [ -f "sql/pg_logtap--$v.sql" ] || { echo "sql/pg_logtap--$v.sql missing"; exit 1; }
           grep -q "\"$v\"" build.zig.zon || { echo "build.zig.zon version != $v"; exit 1; }
           grep -q "\"$v\"" src/version.zig || { echo "src/version.zig version != $v"; exit 1; }
-      - run: zig build fmt --summary all
-      - run: zig build lint --summary all
-      - run: zig build test --summary all
-      # `zig build test` does not compile the library itself (only the test
-      # module) — broken src/ code has passed it. Compile the .so here too,
-      # in the fast job, instead of waiting for the four matrix jobs.
-      - run: zig build --summary all
+      # fmt + lint + unit tests + the .so compile (see the Makefile's check
+      # target — CI and local dev run the same targets).
+      - run: make check
 
   matrix:
     # Fast-fail: check (fmt/lint/test/version sync, ~2.5 min) gates the eight
@@ -76,10 +72,10 @@ jobs:
           sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev libkrb5-dev
       # The check job runs the unit tests on amd64 only; run them per arch
       # too — the regex shim and the ring layout are the arch-sensitive parts.
-      - run: zig build test --summary all
+      - run: make test
         env:
           PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
-      - run: scripts/test-matrix.sh 5 ${{ matrix.pg }}
+      - run: make e2e PGS=${{ matrix.pg }}
         env:
           PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
       - uses: actions/upload-artifact@v4

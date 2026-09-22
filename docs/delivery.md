@@ -16,9 +16,11 @@ view) restarts from zero on every restart.
 | Scheme | Semantics | ACK | Duplicate window |
 |---|---|---|---|
 | `http://` | **at-least-once**, batch granularity (≤ 256 events/chunk) | any HTTP 2xx status line | server persisted the body but the response was lost → whole chunk resent |
+| `https://` | same transport over TLS (see the TLS section below) | any HTTP 2xx status line | same as `http://` |
 | `tcp://` | **at-most-once** live; **at-least-once** once `export_fallback_file` is set — a failed send (including a partial write the receiver did see) parks the batch to the queue and it is retried | none — `write(2)` success counts as delivered | with the queue set: the receiver accepted the data but the send failed anyway (torn write, timeout) → the parked retry resends it. Without the queue there is no duplicate window — a receiver dying after accept loses silently; use `http://` for loss-sensitive receivers |
+| `tcps://` | same transport over TLS | none — `write(2)` success counts as delivered | same as `tcp://` |
 | `file://` | durable append (O_APPEND, 0600) + **fdatasync per batch** | the write itself | a failed partial write rolls the file back to the last full batch and retries it whole on the next cycle; a rollback that fails too is warned once — one torn line stays and the next batch appends after it (dying-disk signal) |
-| fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a crash mid-replay restarts from byte 0 → already-delivered members resent; the receiver may also have accepted the failed send that queued them |
+| fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a soft worker restart resumes the last atomically published cursor; a postmaster restart replays from byte 0 → already-delivered members may be resent. The receiver may also have accepted the failed send that queued them |
 
 Three honesty notes on those ACKs. `http://`: **any 2xx** counts as
 delivered — the standard semantics of HTTP log receivers (Vector,
@@ -29,7 +31,10 @@ line** mid-batch — the receiver's codec must tolerate or resync (a
 length-delimited codec does; a strict line parser will not). `file://`:
 the rollback above makes the file whole batches only — a receiver
 reading it concurrently may see a batch disappear for the length of
-the retry, then reappear complete.
+the retry, then reappear complete. The sink also assumes a single
+writer: the rollback truncates to the last full batch boundary, so
+another process appending concurrently loses whatever it landed after
+that point — keep the file pg_logtap's own.
 
 Measured end-to-end (v0.3.0, pg_logtap → Vector http → VictoriaLogs
 jsonline insert, docker stand, warning-size lines): a 1000-event batch
@@ -41,6 +46,60 @@ captures at ~12 k ev/s, above).
 
 Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
 effectively exactly-once.
+
+## TLS (`https://`, `tcps://`)
+
+Both network schemes have TLS twins — same transports, same ACKs and
+duplicate windows, encrypted with TLS 1.2/1.3 (std.crypto.tls; client
+certificates / mTLS are not supported). One handshake per batch, inside the
+existing `export_timeout_ms` and SIGTERM-abort discipline: a failed
+handshake is an ordinary failed send — the batch parks on the fallback file
+/ RAM backlog and retries. The timeout is a strict per-attempt budget measured
+on a monotonic clock: the absolute deadline is re-armed before **every** socket
+read and write attempt inside the handshake and the session after it —
+including retries after a signal interrupts the syscall — so a peer dribbling
+one TLS fragment or stalling its reads per just-under-timeout interval cannot
+stretch the stage. Each resolved connect address, fragment, partial write, or
+EINTR retry gets only what is left of the budget, and once it is spent the send
+fails. DNS resolution itself remains a blocking call with no cancellation knob;
+its elapsed time still consumes the budget before connect. The plain
+`http://`/`tcp://` body write holds the same deadline between its write
+syscalls (each partial write would otherwise reset the per-write wait).
+When a send has already consumed the budget, the
+worker skips its `close_notify` (the fd close is the backstop) rather than
+pay further socket waits on an already-successful send. Three SIGHUP GUCs
+control verification:
+
+- `export_tls_ca` — PEM file with the CA to verify the receiver against
+  (for a self-signed receiver, the receiver's own certificate). Empty = the
+  system CA roots; a set file **replaces** them. The file is re-read before
+  every handshake, so certificate rotation needs no restart. Keep it on
+  local disk: the read sits inside the send attempt, and a hung network
+  filesystem would stall the worker outside every timeout. Intermediate
+  chains are the normal PKI shape: the receiver presents leaf+intermediate
+  and you pin the **root** — the path is built through the server-sent
+  intermediate; pinning the intermediate itself works too, and the file may
+  hold several certificates.
+- `export_tls_verify` — `off` disables chain and name verification.
+  Development only: with it off, a man in the middle can read the logs.
+  The first TLS send with it off logs one WARNING per worker life, and
+  handshake failures carry the likely fix in the transition-log reason
+  (the `export_tls_server_name` / `export_tls_ca` hint, or "the receiver
+  may not be speaking TLS on this port" for an https:// URL at a
+  plain-http port).
+- `export_tls_server_name` — certificate name to verify and SNI to send when
+  it differs from the URL host. Two cases need it: IP-literal URLs (name
+  verification matches DNS `dNSName` SANs only — an `iPAddress` SAN never
+  matches an IP-literal host) and a TLS-terminating load balancer in front
+  of the receiver. Empty = the URL host.
+
+`export_http_extra_headers` (plain `http://` included) appends extra header
+line(s) to every http(s) request after the fixed headers — e.g.
+`'Authorization: Bearer <token>'` for VictoriaLogs. Multiple lines are
+separated by the two-character `\n` sequence — a GUC value cannot carry a
+real newline (ALTER SYSTEM rejects one outright), so the escape is the only
+multi-line form; each line is CRLF-terminated on send. SET rejects a raw
+`\r` or an empty line (either would malform every request).
 
 ## Ordering and identity
 
@@ -95,9 +154,12 @@ already delivered.
 
 ### Worker pinned in one send
 
-While the worker sits in a single blocked send — up to `export_timeout_ms`
-against a receiver that accepted the connection but never answers — backends
-keep capturing, and only the ring absorbs it. Capture drops start when
+While the worker sits in a single blocked send — up to
+`export_timeout_ms` against a receiver that accepted the connection but never
+answers — backends keep capturing, and only the ring absorbs it. The bound is
+one absolute attempt deadline across connect, plain/TLS reads and writes, and
+signal-interrupted retries; no TLS-record or EINTR multiplier is added. Capture
+drops start when
 
 ```
 r × export_timeout_ms > ring_capacity        (events/s × s > events)
@@ -109,6 +171,15 @@ cut `export_timeout_ms` to a few hundred ms. This is the structural reason a
 mute-but-accepting receiver is the worst case for capture, worse than a dead
 one (connection refused fails in milliseconds and the batch parks on the
 fallback file).
+
+The same arithmetic must cover the worker's longest **local** stall, not
+just the send: a `fallback_max_mb` compaction during an outage storm (the
+member walk plus the cap/2 copy) runs inside flush cycles, and on a slow
+disk it can hold drain for seconds — a 150k-event storm against a 1 MB cap
+was seen stalling drain past an 8192 ring on a CI runner (11k newest events
+refused at capture, accounted in `events_dropped`). When the cap is hit
+regularly on long outages, size `ring_capacity` for capture rate × (send
+timeout + the worst compaction walk), not for the send timeout alone.
 
 ### Receiver down for T minutes
 
@@ -144,6 +215,9 @@ parked to the fallback file in full — parking is local-disk work with no
 deadline by design: its fdatasync is the one deliberately non-abortable
 write in the flush (everything else checks the abort budget between
 syscalls), because that sync is the durability the crash contract rests on.
+The queue path is local disk by the same contract as `export_tls_ca`: on a
+hung NFS/FUSE mount the final parking — and every send-cycle append —
+blocks without a timeout, SIGTERM shutdown included.
 SIGKILL skips all of it.
 With `export_fallback_file` set, the queue is on disk and **survives the
 crash** — the restarted worker replays it; the exposure shrinks to roughly one
@@ -179,12 +253,15 @@ convention), so the file lives with your data by default; an absolute path
 works too. Keep it there — not in `/tmp` or `/var/log`: it is the durable copy
 and must survive reboots and log cleanup.
 
-When an `http://`/`tcp://` send fails and the path is set, the batch is
-appended to the queue — one **gzip member per batch** behind a length framing
-(`PGLTFB01` magic, 0600, fdatasynced once per flush cycle) — and counted as
-`events_queued`: it left pg_logtap durably, and is counted again as
-`events_replayed` when delivered. The queue is an internal format, not a
-tailable log.
+When a send fails — any transport, `http(s)://`, `tcp(s)://`, `file://` — and
+the path is set, the batch is appended to the queue — one **gzip member per
+batch** behind counted framing (`PGLTFB02`, `[compressed_len,event_count,gzip]`,
+0600, fdatasynced once per flush cycle) — and counted as `events_queued` (a
+lifecycle stage, not a durability claim — `fb_sync_failures` names the cycles
+that are not durable) and again as `events_replayed` when delivered. Clean
+legacy `PGLTFB01` queues (`[compressed_len,gzip]`) remain readable and accept
+v1 appends until they drain; formats are never mixed in one non-empty file.
+The queue is an internal format, not a tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
 step is involved. On restart the same replay happens automatically (the
@@ -192,25 +269,52 @@ step is involved. On restart the same replay happens automatically (the
 queue, receiver back after boot → all events delivered, queue empty, zero
 duplicate seqs).
 
-Crash windows: a crash mid-append leaves a torn trailing member — detected and
-truncated on the next read. A crash mid-replay loses only the in-memory
-offset: replay restarts from byte 0, so the receiver can see already-delivered
-members again — dedup by `(host, seq)` as above makes that harmless. Events
-may also appear twice because the failed send that queued them may have
-partially landed — same dedup.
+Crash windows: a crash mid-append leaves a partial frame header or body —
+detected, truncated and synced at the last complete member boundary before a
+later append. A readable frame's NDJSON line count is authoritative even when
+a v2 count word is damaged; an unreadable v2 member falls back to its stored
+count, enters `events_lost`, and leaves `queue_backlog`. A corrupt v1 member
+has no trustworthy fallback count, so it sets `fallback_broken=1` and stops
+replay instead of publishing fabricated loss/backlog values.
 
-The truncate-when-drained order (ftruncate first, then the consumer offset
-resets) was chosen over the reverse deliberately: the offset is worker-local
-state, so it dies with the process in every crash scenario that could land
-between the two statements — the reverse order would instead create a *live*
-window where a failed ftruncate leaves an empty-looking file that gets
-re-flooded by replay of the whole queue, doubling it on every attempt.
+A soft export-worker restart restores the last published replay boundary from
+shared memory when the queue device, inode and size still match. The worker
+publishes each cycle's counters and cursor under one lock: a death before that
+point leaves both old and safely replays the cycle; a death after it leaves
+both advanced and does not count or deliver those members again. A postmaster
+restart creates new shared memory and therefore replays the file from byte 0,
+so the receiver can still see already-delivered members — dedup by `(host,
+seq)` as above makes that harmless. Events may also appear twice because the
+failed send that queued them may have partially landed — same dedup.
+
+When the queue reaches its end, that cycle stops before accepting another
+append and publishes counters with the end cursor. Before truncating, it
+invalidates that cursor: the same inode may hold a new queue generation, and
+its old EOF must never skip a refilled prefix. A soft worker death before the
+invalidation can resume at the published end; after it, restart fails closed to
+byte 0 (possible duplicate replay, never a skipped prefix). A postmaster death
+retains the normal byte-zero at-least-once replay.
 
 Two clusters must never share one fallback file (or one absolute path on a
 shared volume): both writers share the framing magic, and their interleaved
 appends tear each other's members — both queues then read as corrupt and
 disable themselves. One file per cluster; `cluster_name` keeps the events
 apart downstream.
+
+A `file://` export_url and the fallback queue must not share one file either:
+the sink expects raw NDJSON, the queue's `PGLTFB02`/legacy framing — each corrupts the
+other's format. Whichever GUC lands second on the pair is rejected at
+SET/`ALTER SYSTEM` time. One residual: flipping both GUCs in a single reload
+lands the pair together (each check sees the other's old value), and the
+queue's own foreign-content latch then degrades it loudly
+(`fallback_broken=1`, RAM-backlog bound) — never silent corruption.
+
+Durability liveness, part of the contract: a failed `fdatasync` (or a
+deferred one never followed by a later append) is not retried on a timer —
+the next append, truncate or landing compaction provides the next sync
+point, and until one does the affected member sits in the OS-crash window
+that `fb_sync_failures` names. Events replay throughout either way; only
+crash-durability is at stake.
 
 ### Size cap: `fallback_max_mb`
 
@@ -226,11 +330,18 @@ retries it. Peak disk use is momentarily ≈1.5× the cap (the file plus the
 rewrite tmp on the same filesystem), so size the device's headroom for that.
 Delivered members at the head are dropped free; undelivered dropped
 members count into **both** `events_compacted` (they left the queue — keeps
-`queue_backlog = queued − replayed − compacted` truthful, and `delivered =
-sent + replayed` counts only events a receiver actually got) and
+`queue_backlog` truthful, and `delivered = sent + replayed` counts only events
+a receiver actually got) and
 `events_lost` (they never arrived — `PgLogtapEventsLost` fires, correctly
 reading "the outage outlasted the queue"). After recovery the newest ≈ cap/2
 of data is delivered in order.
+One duplicate window the at-least-once contract already covers: the
+compaction's rename is made durable by a directory fsync, and if that sync
+fails (warned once, like the queue's other sync failures) an OS crash can
+resurrect the pre-compaction members — events already counted as compacted
+replay again as duplicates. Delivery is the extension's job, so the
+receiver dedups on `(host, seq)` as the README recipe describes; nothing is
+lost in either outcome.
 A cap smaller than one member (~a hundred KB compressed) bounds the file
 only at member granularity. Fill rate measured (v0.3.0, one 16-core
 host, 8-client pgbench with every statement duration-logged into a dead
@@ -240,12 +351,15 @@ reached after ~10 minutes of that storm; ordinary production rates (tens
 to hundreds of events/s) fill it over hours to days.
 
 A file the worker cannot open at all (a symlink at the path, `EACCES`,
-`EROFS`), or did not write (foreign content, framing damaged past the
-readable), sets `fallback_broken=1` with one WARNING: the queue is disabled —
-neither appended to nor replayed — and durability degrades to the RAM-backlog
-bound until the GUC points at a **different** path or the worker restarts (the
-repoint re-checks the file; pointing back at the same bad path changes
-nothing).
+`EROFS`), did not write (foreign/corrupt framing), or cannot count exactly
+(an unreadable legacy v1 member), sets `fallback_broken=1` with one WARNING:
+the queue is disabled — neither appended to nor replayed — and durability
+degrades to the RAM-backlog bound until the GUC points at a **different** path
+or the worker restarts (the repoint re-checks the file; pointing back at the
+same bad path changes nothing). Unreadable v2 payloads do not break the queue:
+the stored count lets the worker skip them exactly and continue replay. If the
+payload remains readable but its count metadata differs, the payload's NDJSON
+line count is authoritative and all readable events are replayed.
 
 Placement caveat, measured (v0.2.0, one 16-core host, nvme, docker
 overlay; debug-level storm, 16 pgbench clients, duration logging on,
@@ -296,8 +410,9 @@ the ring during one sleep. The queue drains one gzip member per flush cycle
 so delivery resumes without a RAM-backlog loss path. A receiver that answers
 but is too slow to keep up (`export_slow_ms`) parks live batches on the same
 file losslessly instead of stalling the worker, so `events_lost` there too
-grows only on sustained capture past export capacity, a full disk, or an
-unreadable queue member (then the RAM-backlog semantics apply to the excess).
+grows only on sustained capture past export capacity, a full disk, cap
+trimming, or an unreadable counted member. An unreadable legacy member instead
+breaks the queue; later live events then take the RAM-backlog path.
 
 ## Alerting
 
@@ -317,19 +432,20 @@ natively as long as the Prometheus scrape interval is shorter than the restart.
 ## Counter glossary
 
 Each event is counted once per lifecycle stage it actually passes through.
-The delivery invariant is `events_captured ≈ events_sent +
-(events_queued - events_replayed) + events_dropped + events_lost +
-in-flight/ring`. Names are identical in `pg_logtap_stats()` text, the
-`pg_logtap_delivery` view and the Prometheus exposition; the view adds
-derived `queue_backlog` and `delivered`.
+The delivery invariant is `events_captured ≈ delivered + queue_backlog +
+events_dropped + events_lost + in-flight/ring`: `queue_backlog` removes
+replayed events, cap-trimmed events, and exact-count unreadable v2 frames, so
+none are double-counted with delivery or loss. Names are identical in
+`pg_logtap_stats()` text, the `pg_logtap_delivery` view and the Prometheus
+exposition; the view adds derived `queue_backlog` and `delivered`.
 
-One asymmetry: `events_replayed ≤ events_queued` holds within one worker
-life, but a soft worker exit resets the worker-local replay offset, and the
-restarted worker replays the queue from byte 0 — already-delivered members
-count as replayed again. At startup the offset is re-derived and the backlog
-credited (`fbCreditBacklog`), so `queue_backlog` stays truthful; only the
-cumulative `events_replayed` (and `delivered`) can exceed what that worker
-itself queued. Persisting the offset in the file header is on the roadmap.
+`events_replayed ≤ events_queued` remains stable across a soft export-worker
+restart: the replacement validates and restores the shared-memory replay
+cursor, while counters and cursor advance atomically. A postmaster restart
+zeros both the counters and cursor, credits the full physical queue, and
+replays it from byte 0 under the documented at-least-once contract. Persisting
+the cursor on disk would avoid that full-file scan and postmaster-restart
+replay; it is not required for truthful soft-restart accounting.
 
 | counter | unit | grows when |
 |---|---|---|
@@ -339,7 +455,11 @@ itself queued. Persisting the offset in the file header is on the roadmap.
 | `events_queued` | events | appended to the fallback file (a lifecycle stage, not a durability claim — see `fb_sync_failures`) |
 | `events_replayed` | events | delivered out of the fallback file after the receiver recovered |
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while undelivered (also in `events_lost`; never in `delivered`) |
-| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable queue member skipped, or a `fallback_max_mb` compaction dropping undelivered members |
+| `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable counted (v2) queue member skipped by its stored count, or a `fallback_max_mb` compaction dropping undelivered members; readable v2 payloads use their actual NDJSON line count even if count metadata differs |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
-| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth (`PgLogtapFbSyncFailing` uses `increase()`), not its level |
+| `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life): https/tcps is shipping unauthenticated. The server-log line is edge-triggered; this is its cumulative copy |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
+| `warn_fallback_skipped` | **lines** | an unreadable counted (v2) queue member was skipped (twice per member after a postmaster restart: the boot credit scan, then the drain; not repeated by a soft worker restart after cursor/accounting publication); its stored event count enters `events_lost` and leaves `queue_backlog` |
+| `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

@@ -6,55 +6,58 @@
 # The stand is not touched: the shim needs container env set at create time,
 # so this brings up its own pglogtap-faults container and removes it at exit.
 #   sink-sync-fail    : file:// sink fdatasync fails -> batch rolled back,
-#                       retried whole, exactly one copy of every event
+#                       retried whole, exactly one copy of every event; the
+#                       rollback's own sync fails too (COUNT=2: both EIOs
+#                       land on the sink) -> the not-durable window is
+#                       named in the log, warned once
 #   fallback-sync-fail: queue fdatasync fails -> member stays (not durable),
 #                       no duplicate member, fb_sync_failures counts it, replay
 #                       delivers every event once
-#   dev-full          : file:///dev/full write fails mid-batch -> torn line
+#   compact-open-fail  : a non-EEXIST temp open failure preserves an existing
+#                        .compact canary; after the fault clears, normal EEXIST
+#                        litter cleanup lets the cap land
+#   compact-sync-fail  : the compaction temp's fdatasync fails -> rewrite
+#                        abandoned (queue whole, nothing lost) and counted in
+#                        fb_sync_failures; the cap lands once syncs heal
+#   dev-full           : file:///dev/full write fails mid-batch -> torn line
 #                       rolled back, events held in the RAM backlog, delivered
 #                       whole on the next receiver
 # Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
-set -eu
+set -u
+. "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
-CT=pglogtap-faults
-OUT=/tmp/logtap-faults
+CT=pglogtap-faults-$V # per major: parallel matrix runs
+E2E_TAG=fault
+E2E_CT=$CT
+E2E_SUF= # throwaway container: fresh sinks each run, no per-run suffix needed
+OUT=/tmp/logtap-faults-$V
 SO=dist/pg$V/lib/pg_logtap.so
 [ -f "$SO" ] || { echo "e2e-faults: $SO missing — run the stand phase first" >&2; exit 2; }
 
-fail() {
-  echo "e2e-faults: FAILED: $*" >&2
-  docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" >&2 || true
-  echo "shim target: $(docker exec "$CT" cat /tmp/fsyncfail-target 2>/dev/null || echo '<unset>')" >&2
-  docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2 || true
-  docker exec "$CT" sh -c "ls -la '$PGDATA_C/$FB_REL' 2>/dev/null" >&2 || true
-  docker logs "$CT" 2>&1 | grep -iE "logtap.*(fdatasync|fallback|divert|failing)" | tail -5 >&2 || true
-  exit 1
+fail_extra() { # shim-specific post-mortem
+  echo "sync target: $(docker exec "$CT" cat /tmp/fsyncfail-target 2>/dev/null || echo '<unset>')" >&2
+  echo "open target: $(docker exec "$CT" cat /tmp/openfail-target 2>/dev/null || echo '<unset>')" >&2
+  docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2
+  docker exec "$CT" sh -c "ls -la '${PGDATA_C:-}/$FB_REL' '${PGDATA_C:-}/$FB_REL.compact' 2>/dev/null" >&2
 }
-ok() { echo "  ok: $*"; }
 
 mkdir -p "$OUT"
+e2e_lock
 cc -shared -fPIC -Wall -Wextra tests/e2e/fsyncfail.c -o "$OUT/fsyncfail.so" -ldl
 
 FB_REL=pgfaults-queue.bin # PGDATA-relative, like a real deployment
-docker rm -f -v "$CT" >/dev/null 2>&1 || true
+docker rm -f -v "$CT" >/dev/null 2>&1
 docker run -d --name "$CT" -e POSTGRES_PASSWORD=dev \
   -v "$OUT/fsyncfail.so:/tmp/fsyncfail.so:ro" \
   -e LD_PRELOAD=/tmp/fsyncfail.so \
   -e FSYNCFAIL_COUNT=2 \
+  -e OPENFAIL_COUNT=100000 \
+  -e OPENFAIL_ERRNO=13 \
   postgres:"$V" >/dev/null || fail "could not start postgres:$V"
-cleanup() { docker rm -f -v "$CT" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f -v "$CT" >/dev/null 2>&1; }
 trap cleanup EXIT INT TERM
 
-wait_ready() {
-  n=0
-  while [ "$n" -lt 60 ]; do
-    docker exec "$CT" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
-    n=$((n + 1)); sleep 1
-  done
-  docker logs --tail 30 "$CT" >&2 || true
-  fail "postgres in $CT not ready after 60s"
-}
 wait_ready
 
 # The shim's watched path depends on PGDATA, which differs across majors
@@ -64,6 +67,9 @@ wait_ready
 # passes everything through, so the boot itself is never faulted.
 PGDATA_C=$(docker exec "$CT" psql -U postgres -Atc "SHOW data_directory")
 set_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/fsyncfail-target"; }
+clear_target() { docker exec "$CT" rm -f /tmp/fsyncfail-target; }
+set_open_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/openfail-target"; }
+clear_open_target() { docker exec "$CT" rm -f /tmp/openfail-target; }
 
 # Deploy (the stand phase's recipe, minus the stand): library, control, SQL,
 # preload, then the extension itself.
@@ -82,18 +88,16 @@ docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.flush_interva
 docker exec "$CT" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 "$(dirname "$0")/e2e-require-ext.sh" "$CT"
 
-setguc() { docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
-stats() { docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
-statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
 # Markers in a file:// sink: count distinct events and duplicate seqs there.
 sink_lines() { docker exec "$CT" sh -c "grep -oE 'logtap fault $1 [0-9]+' /tmp/$2.log 2>/dev/null" | sort -u | wc -l; }
 sink_dups() { docker exec "$CT" sh -c "grep 'logtap fault' /tmp/$1.log 2>/dev/null" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l; }
-gen() { docker exec "$CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
-  WHILE i < $2 LOOP
-    RAISE WARNING 'logtap fault $1 %', i;
-    i := i + 1;
-  END LOOP; END \$\$" >/dev/null; }
+gen_wide() { # marker count: incompressible enough to cross a 1MB queue cap
+  docker exec "$CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
+    WHILE i < $2 LOOP
+      RAISE WARNING 'logtap fault $1 % %', i, (SELECT string_agg(md5(random()::text), '') FROM generate_series(1, 32));
+      i := i + 1;
+    END LOOP; END \$\$" >/dev/null 2>&1
+}
 
 echo "== file:// sink: fdatasync fails -> rollback + whole retry, one copy =="
 SUF=f$$
@@ -107,7 +111,12 @@ gen "sink1-$SUF" 20; sleep 3 # cycles 1-2: EIO -> ftruncate -> retry; then clean
 [ "$(sink_dups sink)" = 0 ] \
   || fail "sink sync-fail: duplicate seqs — failed-sync retry double-wrote the batch"
 [ "$(statf events_lost)" = 0 ] || fail "sink sync-fail: lost>0"
-ok "20/20 in the sink, 0 duplicate seqs (failed sync rolled back and retried whole)"
+# The rollback's own sync failed too (the shim's second EIO): the window
+# where an OS crash resurrects the truncated batch must be NAMED, not
+# silent — the warn-once latch's regression assert.
+[ "$(docker logs "$CT" 2>&1 | grep -c 'rollback after a failed fdatasync is not durable')" -ge 1 ] \
+  || fail "sink sync-fail: the failed rollback sync was not warned (not-durable window silent)"
+ok "20/20 in the sink, 0 duplicate seqs (failed sync rolled back and retried whole), failed rollback sync warned"
 
 echo "== fallback queue: fdatasync fails -> member kept, not duplicated, counted =="
 docker exec "$CT" sh -c "rm -f '$PGDATA_C/$FB_REL' /tmp/sink.log"
@@ -143,13 +152,107 @@ bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logta
 [ "$bl" = 0 ] || fail "fallback sync-fail: queue_backlog=$bl after replay"
 ok "fb_sync_failures=$syncfails, 60/60 replayed once each, queue drained (queued was $q)"
 
+echo "== compaction temp: non-EEXIST open failure preserves existing object =="
+# The queue compactor may remove its own stale temp only after open(O_EXCL)
+# reports EEXIST. Inject EACCES while a canary occupies the predictable path:
+# the canary must survive. Once injection stops, the real EEXIST path may
+# unlink that stale object and the cap must land normally.
+clear_target
+clear_open_target
+docker restart "$CT" >/dev/null; wait_ready
+docker exec "$CT" sh -c "rm -f '$PGDATA_C/$FB_REL' '$PGDATA_C/$FB_REL.compact' /tmp/open-compact.log"
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.export_fallback_file "$FB_REL"
+setguc pg_logtap.fallback_max_mb 1; reload; sleep 2
+CANARY="pg_logtap compact canary $SUF"
+docker exec -u postgres "$CT" sh -c "printf '%s' '$CANARY' > '$PGDATA_C/$FB_REL.compact'"
+set_open_target "$PGDATA_C/$FB_REL.compact"
+compacted0=$(statf events_compacted)
+gen_wide "open-$SUF" 4000
+sleep 4
+qsize=$(docker exec "$CT" stat -c %s "$PGDATA_C/$FB_REL" 2>/dev/null || echo 0)
+[ "$qsize" -gt 1048576 ] 2>/dev/null \
+  || fail "compact open-fail: queue size $qsize never crossed the 1MB cap"
+got_canary=$(docker exec "$CT" cat "$PGDATA_C/$FB_REL.compact" 2>/dev/null || true)
+[ "$got_canary" = "$CANARY" ] \
+  || fail "compact open-fail: .compact canary was removed or changed after injected EACCES"
+[ "$(statf events_compacted)" = "$compacted0" ] \
+  || fail "compact open-fail: a compaction landed while every exclusive temp open returned EACCES"
+
+clear_open_target
+gen "open-heal-$SUF" 20
+n=0; while [ "$n" -lt 15 ]; do
+  compacted_now=$(statf events_compacted)
+  [ "$compacted_now" -gt "$compacted0" ] 2>/dev/null && break
+  n=$((n + 1)); sleep 1
+done
+compacted_now=$(statf events_compacted)
+[ "$compacted_now" -gt "$compacted0" ] 2>/dev/null \
+  || fail "compact open-fail: cap did not land after EACCES injection cleared"
+if docker exec "$CT" test -e "$PGDATA_C/$FB_REL.compact"; then
+  fail "compact open-fail: stale .compact canary remained after normal EEXIST recovery"
+fi
+setguc pg_logtap.export_url 'file:///tmp/open-compact.log'; reload
+n=0; while [ "$n" -lt 15 ]; do
+  [ "$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$bl" = 0 ] || fail "compact open-fail: queue_backlog=$bl after replay"
+ok "EACCES preserved the canary; clearing it exercised EEXIST cleanup and the cap landed"
+
+echo "== compaction temp: fdatasync fails -> rewrite abandoned, counted, cap still lands =="
+# A landed compaction is a durability point (its temp is fdatasynced before
+# the rename), so an EIO there must count in fb_sync_failures like any other
+# sync failure — while the safety shape stays: rewrite abandoned, original
+# queue stands, nothing lost, no temp litter; once the syncs heal, the cap
+# rewrite lands.
+docker restart "$CT" >/dev/null; wait_ready # fresh worker: the shim's per-process budget resets
+docker exec "$CT" sh -c "rm -f '$PGDATA_C/$FB_REL' '$PGDATA_C/$FB_REL.compact' /tmp/replay.log"
+set_target "$PGDATA_C/$FB_REL.compact"
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.fallback_max_mb 1; reload; sleep 2
+# ~1MB cap needs incompressible bulk. One md5 repeated is gzip candy (a
+# 4000-event burst parked as 181KB once); 32 INDEPENDENT md5s per event are
+# random hex ≈ 4 bits/char under gzip, so 4000 x ~512B ≈ 2MB really crosses.
+gen_wide "cmp-$SUF" 4000
+sleep 4 # park, cross the cap, fail the temp syncs, then heal past the budget
+syncfails=$(statf fb_sync_failures)
+[ "$syncfails" -ge 1 ] 2>/dev/null || fail "compact sync-fail: fb_sync_failures=$syncfails — the temp fdatasync EIO was not counted"
+[ "$(statf fallback_broken)" = 0 ] || fail "compact sync-fail: fallback_broken=1 — the abandoned rewrite broke the queue"
+[ "$(docker exec "$CT" stat -c %s "$PGDATA_C/$FB_REL.compact" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "compact sync-fail: abandoned temp left behind"
+[ "$(statf events_compacted)" -ge 1 ] 2>/dev/null \
+  || fail "compact sync-fail: no compaction ever landed (events_compacted=0) — the cap cannot work after an EIO"
+# Replay what survived the cap: every delivered event exactly once.
+setguc pg_logtap.export_url 'file:///tmp/compact.log'; reload
+n=0; while [ "$n" -lt 15 ]; do
+  [ "$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
+[ "$bl" = 0 ] || fail "compact sync-fail: queue_backlog=$bl after replay"
+got=$(sink_lines "cmp-$SUF" compact)
+[ "$got" -ge 500 ] 2>/dev/null || fail "compact sync-fail: only $got/4000 cmp events survived to replay — backlog=0 is vacuous"
+[ "$(sink_dups compact)" = 0 ] || fail "compact sync-fail: duplicate seqs after the EIO'd rewrites"
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512
+ok "temp fdatasync EIO counted (fb_sync_failures=$syncfails), queue whole, cap landed after healing, replay drained with 0 dups"
+
 echo "== /dev/full: write fails mid-batch -> torn line rolled back, held in RAM =="
+# Delta, not absolute zero: the compact scenario's landed caps counted their
+# trimmed events lost (legitimately — the outage outlasted the cap), and
+# this container's shmem still carries them.
+lost0=$(statf events_lost)
+# dropped deltas too: the compact scenario's compaction walks stall drain
+# past a 1024-ring on a slow disk (seen on a CI runner: 76 dropped carried
+# from there) — this phase generates 20 events, it cannot overflow the ring.
+drp0=$(statf events_dropped)
 docker exec "$CT" sh -c "rm -f /tmp/replay.log"
 setguc pg_logtap.export_fallback_file '' # no queue: the RAM backlog is the only hold
 setguc pg_logtap.export_url 'file:///dev/full'; reload; sleep 2
 gen "full1-$SUF" 20; sleep 3 # ENOSPC on every write; backlog accumulates
-[ "$(statf events_lost)" = 0 ] || fail "/dev/full: lost>0 without the queue"
-[ "$(statf events_dropped)" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
+[ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "/dev/full: lost grew without the queue"
+[ "$(( $(statf events_dropped) - drp0 ))" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
 setguc pg_logtap.export_url 'file:///tmp/full.log'; reload; sleep 2
 n=0; while [ "$n" -lt 15 ]; do
   [ "$(sink_lines "full1-$SUF" full)" -ge 20 ] && break

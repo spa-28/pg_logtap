@@ -20,6 +20,18 @@ pub var source_host: []const u8 = "";
 pub var source_cluster: []const u8 = "";
 pub var source_pgdata: []const u8 = "";
 
+/// Worst-case bytes one serialized event can occupy. The fallback queue's
+/// framing and replay bounds derive from it (fb.zig's member_max), so the
+/// serializer owns the number — the two cannot drift apart. The expansion
+/// is JSON escaping: a control byte becomes the six-byte `\u00XX`, so every
+/// variable part is counted at 6× its input width — the message
+/// (ring.max_message), the nine FixedStr(aux_len) fields, the 63-byte
+/// catalog names, host (127: the gethostname buffer), cluster (cut at 256
+/// in refreshSourceId — the one input with no natural bound) and pgdata (a
+/// path, 4096). The fixed tail — keys, numerics, timestamp, sqlstate, mask
+/// lists — fits the 4 KiB slack.
+pub const worst_serialized_entry = 6 * (ring.max_message + 9 * ring.aux_len + 2 * 63 + 127 + 256 + 4096) + 4096;
+
 /// `msg` is the event's message bytes, passed separately from the fixed
 /// fields: it is the one variable-width part of an event (pg_logtap.
 /// message_max), so every owner of it — the ring slot, the RAM backlog
@@ -357,6 +369,57 @@ test "truncated and redacted are independent arrays" {
         try std.testing.expect(std.mem.find(u8, line, c.want) != null);
         try std.testing.expect(try std.json.validate(std.testing.allocator, line));
     }
+}
+
+test "widest legal entry stays inside worst_serialized_entry" {
+    // fb.zig sizes its replay buffer from the constant; this drives the real
+    // serializer through the widest legal event — every variable part filled
+    // with 0x01, the byte with the largest escape (six bytes) — and holds the
+    // line to it. A serializer change that crosses the bound makes the queue
+    // skip members it wrote itself (events lost on the durability path).
+    var entry = std.mem.zeroes(ring.ShmLogEntry);
+    entry.seq = 1;
+    entry.elevel = 19;
+    var msg_src: [ring.max_message]u8 = undefined;
+    @memset(&msg_src, 0x01);
+    var msg_buf: [ring.max_message]u8 = undefined;
+    const msg = ring.setMsg(&entry.message_len, &entry.truncated_mask, &msg_src, &msg_buf);
+    var aux: [ring.aux_len]u8 = undefined;
+    @memset(&aux, 0x01);
+    ring.setStr(&entry.detail, &entry.truncated_mask, .detail, &aux);
+    ring.setStr(&entry.hint, &entry.truncated_mask, .hint, &aux);
+    ring.setStr(&entry.context, &entry.truncated_mask, .context, &aux);
+    ring.setStr(&entry.filename, &entry.truncated_mask, .filename, &aux);
+    ring.setStr(&entry.funcname, &entry.truncated_mask, .funcname, &aux);
+    ring.setStr(&entry.query, &entry.truncated_mask, .query, &aux);
+    ring.setStr(&entry.app, &entry.truncated_mask, .app, &aux);
+    ring.setStr(&entry.client_host, &entry.truncated_mask, .client_host, &aux);
+    ring.setStr(&entry.backend_type, &entry.truncated_mask, .backend_type, &aux);
+    var host_buf: [127]u8 = undefined;
+    var cluster_buf: [256]u8 = undefined;
+    var pgdata_buf: [4096]u8 = undefined;
+    @memset(&host_buf, 0x01);
+    @memset(&cluster_buf, 0x01);
+    @memset(&pgdata_buf, 0x01);
+    source_host = &host_buf;
+    source_cluster = &cluster_buf;
+    source_pgdata = &pgdata_buf;
+    defer {
+        source_host = "";
+        source_cluster = "";
+        source_pgdata = "";
+    }
+    const names: Names = .{ .database = host_buf[0..63], .user = host_buf[0..63] };
+
+    var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line_w.deinit();
+    try writeEntry(&line_w.writer, &entry, msg, names);
+
+    // the expansion is real: the message alone approaches 6× its raw width
+    try std.testing.expect(line_w.writer.end >= 6 * ring.max_message);
+    // and the whole line fits the bound the fallback queue derives from
+    try std.testing.expect(line_w.writer.end <= worst_serialized_entry);
+    try std.testing.expect(try std.json.validate(std.testing.allocator, line_w.written()));
 }
 
 test "message wider than the default slot" {
