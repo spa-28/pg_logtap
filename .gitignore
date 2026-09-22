@@ -5,3 +5,8 @@
 /.zig-cache/
 /dev/
 /REVIEW*.md
+
+# local knowledge-graph state
+/graphify-out/
+/.code-review-graph/
+/.claude/
