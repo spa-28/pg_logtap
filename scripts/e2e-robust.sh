@@ -203,9 +203,11 @@ ok "statement passwords cut (message and query), benign message word verbatim, r
 # Empty pattern after reset is "layer off", not a failure: the flag reads 0.
 setguc pg_logtap.redact_pattern '[unclosed'; reload; sleep 1
 [ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid redact_pattern did not set redact_pattern_failed=1"
+setguc pg_logtap.redact_pattern '(SECRET).*(\1)'; reload; sleep 1
+[ "$(statf redact_pattern_failed)" = 1 ] || fail "backref redact_pattern did not set redact_pattern_failed=1"
 setguc pg_logtap.redact_pattern ''; reload; sleep 1
 [ "$(statf redact_pattern_failed)" = 0 ] || fail "pattern reset did not clear redact_pattern_failed"
-ok "redact_pattern_failed: invalid pattern → 1, reset → 0 (fail-open is visible)"
+ok "redact_pattern_failed: invalid/backref pattern → 1, reset → 0 (fail-open is visible)"
 
 # Extended protocol (JDBC, psycopg, pgbench -M extended): duration lines for
 # parse/bind/execute carry the raw SQL WITHOUT the "statement: " marker — the

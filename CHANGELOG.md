@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Hardening
+
+- `pattern`, `pattern_exclude` and `redact_pattern` reject POSIX backreferences
+  (`\1`…`\9`) before compiling the regex. Plain EREs stay accepted; the
+  rejected form can push glibc `regexec` onto its slow matcher inside every
+  logging backend. `redact_pattern` keeps its fail-open behavior and raises
+  `redact_pattern_failed` for the rejected layer.
+
 ## 0.5.0 (2026-09-07)
 
 TLS export and HTTP auth-header round. Upgrade is the
