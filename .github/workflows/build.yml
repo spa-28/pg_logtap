@@ -123,9 +123,9 @@ jobs:
             cp "$d/pg_logtap.so.debug" "$debug/lib/"
             tar -C "$runtime" -czf "rel/$runtime.tar.gz" .
             tar -C "$debug" -czf "rel/$debug.tar.gz" .
-            tar -tzf "rel/$runtime.tar.gz" | grep -qx './lib/pg_logtap.so'
+            tar -tzf "rel/$runtime.tar.gz" | grep -Fx './lib/pg_logtap.so' >/dev/null
             ! tar -tzf "rel/$runtime.tar.gz" | grep -q 'pg_logtap.so.debug'
-            tar -tzf "rel/$debug.tar.gz" | grep -qx './lib/pg_logtap.so.debug'
+            tar -tzf "rel/$debug.tar.gz" | grep -Fx './lib/pg_logtap.so.debug' >/dev/null
             ! tar -tzf "rel/$debug.tar.gz" | grep -q 'extension/'
           done
       - uses: softprops/action-gh-release@v2
