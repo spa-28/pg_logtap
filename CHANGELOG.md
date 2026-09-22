@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.1 (2026-09-22)
+
 ### Hardening
 
 - `pattern`, `pattern_exclude` and `redact_pattern` reject POSIX backreferences
@@ -9,6 +11,12 @@
   rejected form can push glibc `regexec` onto its slow matcher inside every
   logging backend. `redact_pattern` keeps its fail-open behavior and raises
   `redact_pattern_failed` for the rejected layer.
+
+### Changed
+
+- Release packages carry a debug-stripped `pg_logtap.so`. Matching detached
+  DWARF symbols ship in a separate `-debug.tar.gz` asset for each PostgreSQL
+  major and architecture.
 
 ## 0.5.0 (2026-09-07)
 

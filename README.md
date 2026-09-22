@@ -60,11 +60,18 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.5.0/pg_logtap-0.5.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.5.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.5.1/pg_logtap-0.5.1-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.5.1-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
+
+The matching `pg_logtap-<version>-pg<N>-<arch>-debug.tar.gz` is optional:
+it contains detached DWARF symbols for GDB, not a runtime dependency. To let
+GDB find them through the module's `.gnu_debuglink`, put
+`lib/pg_logtap.so.debug` beside the installed `.so` (or in its `.debug/`
+directory). The version, PostgreSQL major, and architecture must match the
+installed runtime exactly.
 
 Release binaries cover **amd64 and arm64**, built with ReleaseSafe against
 glibc 2.28 — the oldest glibc among current distributions (RHEL 8, both
@@ -78,6 +85,9 @@ Prerequisites: Zig 0.16.0, `pg_config` for the target major on PATH, and
 libpq headers (`postgresql-server-dev-NN` + `libpq-dev` on Debian/Ubuntu) —
 the [pgzx](https://github.com/spa-28/pgzx) dependency (git dep in
 `build.zig.zon`) translates the server headers and links libpq at build time.
+`make e2e` additionally requires GNU Binutils (`objcopy` and `readelf`; the
+`binutils` package on Debian/Ubuntu) to produce and validate the release-like
+stripped runtime.
 
 ```sh
 make && make install          # uses pg_config from PATH
@@ -607,9 +617,12 @@ git tag v0.3.0 && git push origin v0.3.0
 ```
 
 Publishing the Release triggers CI, which rebuilds the matrix (PG majors ×
-amd64/arm64, each arch natively on its own runner) and attaches one package
-per combination as `pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` +
-`extension/` tree ready to untar into the PostgreSQL installation.
+amd64/arm64, each arch natively on its own runner). GNU Binutils splits DWARF
+before the e2e deployment, so the tested runtime package is
+`pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` + `extension/` tree ready
+to untar into the PostgreSQL installation. Its matching
+`pg_logtap-<version>-pg<N>-<arch>-debug.tar.gz` contains only
+`lib/pg_logtap.so.debug` for debugging.
 
 ## Roadmap
 
