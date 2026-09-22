@@ -10,11 +10,6 @@ from scratch when the need becomes real.
   boundaries (ring overflow mid-chain, backlog trim at a chain head, backend
   death between slots) are exactly the failure classes that took the longest
   to stabilize; each needs its own e2e scenario before this lands.
-- **Regex backreferences**: `\1` drops glibc's regexec off its fast matcher
-  (~n²·⁶ measured, worst case ~20 s at the message cap); plain EREs are
-  linear. A pattern-length/input-length guard, or a linear-time matcher,
-  would make pathological patterns safe to accept. Until then the pattern
-  GUC docs carry the warning.
 - **Persist the fallback replay cursor on disk**: soft worker restarts already
   resume from a device/inode-validated shared-memory cursor and publish it
   atomically with replay/loss counters. On-disk persistence would instead

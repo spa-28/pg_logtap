@@ -11,7 +11,7 @@
 //! Measured: plain EREs are linear on both glibc and musl ((a+)+b, (a|aa)+b,
 //! (x+x+)+y at n=1000 → ≤3 ms); backreferences (\1) drop glibc off its fast
 //! matcher to ~n^2.6 (measured 47/91/163 ms at n=100/130/160 → ~20 s at the
-//! 1024-byte message-slot cap) — avoid \1 and friends in patterns.
+//! 1024-byte message-slot cap), so \1 and friends are rejected at compile time.
 const std = @import("std");
 
 /// Allocated by src/c/regex_shim.c; size is the target libc's own.
@@ -37,9 +37,28 @@ pub const CompileDiag = struct {
     }
 };
 
+fn setDiag(diag: ?*CompileDiag, msg: []const u8) void {
+    if (diag) |d| {
+        d.len = @min(d.buf.len, msg.len);
+        @memcpy(d.buf[0..d.len], msg[0..d.len]);
+    }
+}
+
+fn hasBackref(pattern: []const u8) bool {
+    var pos: usize = 0;
+    while (pos + 1 < pattern.len) : (pos += 1) {
+        if (pattern[pos] == '\\' and pattern[pos + 1] >= '1' and pattern[pos + 1] <= '9') return true;
+    }
+    return false;
+}
+
 /// Shared compile-with-diag: on failure the shim filled buf with regerror's
 /// NUL-terminated text, which is copied into the caller's diag if it wants it.
 fn compileInto(comptime f: anytype, pattern: [:0]const u8, diag: ?*CompileDiag) ?*LtRegex {
+    if (hasBackref(pattern)) {
+        setDiag(diag, "backreferences (\\1..\\9) are not supported");
+        return null;
+    }
     var buf: [128]u8 = undefined;
     const re = f(pattern.ptr, &buf, buf.len) orelse {
         if (diag) |d| {
@@ -145,6 +164,15 @@ test "empty pattern compiles to always-match" {
 
 test "invalid pattern rejected" {
     try std.testing.expect(Regex.compile("[unclosed") == null);
+}
+
+test "regex backreferences rejected" {
+    var diag = CompileDiag{};
+    try std.testing.expect(Regex.compileDiag("(secret).*(\\1)", &diag) == null);
+    try std.testing.expect(std.mem.find(u8, diag.text(), "backreferences") != null);
+    var red = Redactor.compile("token-[0-9]+") orelse return error.CompileFailed;
+    defer red.deinit();
+    try std.testing.expect(Redactor.compile("(token).*(\\1)") == null);
 }
 
 test "compile failure reports regerror's text" {

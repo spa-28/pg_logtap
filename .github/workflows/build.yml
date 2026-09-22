@@ -69,7 +69,7 @@ jobs:
             echo "deb [signed-by=/etc/apt/keyrings/pgdg.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
             sudo apt-get update
           fi
-          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev libkrb5-dev
+          sudo apt-get install -y postgresql-server-dev-${{ matrix.pg }} libpq-dev libkrb5-dev binutils
       # The check job runs the unit tests on amd64 only; run them per arch
       # too — the regex shim and the ring layout are the arch-sensitive parts.
       - run: make test
@@ -81,13 +81,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: pg_logtap-pg${{ matrix.pg }}-${{ matrix.arch }}
-          path: dist/pg${{ matrix.pg }}/lib/pg_logtap.so
+          path: |
+            dist/pg${{ matrix.pg }}/lib/pg_logtap.so
+            dist/pg${{ matrix.pg }}/lib/pg_logtap.so.debug
           if-no-files-found: error
 
-  # On a published release: rebuild via the jobs above, then attach one
-  # installable package per PG major × arch, named
-  # pg_logtap-<version>-pg<N>-<amd64|arm64>.tar.gz
-  # (lib/ + extension/ layout, ready to untar into the PG install).
+  # On a published release: rebuild via the jobs above, then attach a stripped
+  # runtime package and matching detached-symbol package per PG major × arch.
   release:
     needs: [check, matrix]
     if: github.event_name == 'release'
@@ -96,10 +96,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
       - run: |
+          set -euo pipefail
           V=${GITHUB_REF_NAME#v}
           ctl=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
           [ "$V" = "$ctl" ] || { echo "tag v$V != control default_version $ctl"; exit 1; }
@@ -109,10 +112,21 @@ jobs:
             pg=${rest%%-*}
             arch=${rest##*-}
             pkg=pg_logtap-$V-pg$pg-$arch
-            mkdir -p pkg/lib pkg/extension rel
-            cp "$d/pg_logtap.so" pkg/lib/
-            cp pg_logtap.control sql/*.sql pkg/extension/
-            tar -C pkg -czf "rel/$pkg.tar.gz" .
+            runtime=$pkg
+            debug=$pkg-debug
+            [ -f "$d/pg_logtap.so" ] && [ -f "$d/pg_logtap.so.debug" ] || {
+              echo "missing runtime or debug symbols in $d"; exit 1;
+            }
+            mkdir -p "$runtime/lib" "$runtime/extension" "$debug/lib"
+            cp "$d/pg_logtap.so" "$runtime/lib/"
+            cp pg_logtap.control sql/*.sql "$runtime/extension/"
+            cp "$d/pg_logtap.so.debug" "$debug/lib/"
+            tar -C "$runtime" -czf "rel/$runtime.tar.gz" .
+            tar -C "$debug" -czf "rel/$debug.tar.gz" .
+            tar -tzf "rel/$runtime.tar.gz" | grep -qx './lib/pg_logtap.so'
+            ! tar -tzf "rel/$runtime.tar.gz" | grep -q 'pg_logtap.so.debug'
+            tar -tzf "rel/$debug.tar.gz" | grep -qx './lib/pg_logtap.so.debug'
+            ! tar -tzf "rel/$debug.tar.gz" | grep -q 'extension/'
           done
       - uses: softprops/action-gh-release@v2
         with:

@@ -54,6 +54,20 @@ case "$(uname -m)" in
 esac
 FLAGS=(-Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe)
 
+split_debug() { # <so>: publish detached DWARF and test the stripped runtime.
+  local so=$1 debug="$1.debug"
+  command -v objcopy >/dev/null || { echo "GNU objcopy is required" >&2; return 1; }
+  command -v readelf >/dev/null || { echo "GNU readelf is required" >&2; return 1; }
+  objcopy --version | grep -q GNU || { echo "GNU objcopy is required" >&2; return 1; }
+  rm -f "$debug" || return 1
+  objcopy --only-keep-debug "$so" "$debug" || return 1
+  objcopy --strip-debug "$so" || return 1
+  objcopy --add-gnu-debuglink="$debug" "$so" || return 1
+  readelf -S -W "$so" | grep -q '[[:space:]]\.gnu_debuglink' || return 1
+  ! readelf -S -W "$so" | grep -q '[[:space:]]\.debug_' || return 1
+  readelf -S -W "$debug" | grep -q '[[:space:]]\.debug_info' || return 1
+}
+
 # --- phases -------------------------------------------------------------------
 
 phase_stand() { # <v>: build, receivers stand (once), per-major pg, deploy.
@@ -72,6 +86,7 @@ phase_stand() { # <v>: build, receivers stand (once), per-major pg, deploy.
     scripts/build.sh "$v" "${FLAGS[@]}" && mkdir -p "dist/pg$v/lib" && \
       cp zig-out/lib/pg_logtap.so "dist/pg$v/lib/"   # local: build in pgzx-build
   fi
+  split_debug "dist/pg$v/lib/pg_logtap.so" || return 1
 
   # The receivers (vector/vlogs/silent + the one-shot ready gate) are shared
   # by every major — compose brings the stand up ONCE. The stand's own pg

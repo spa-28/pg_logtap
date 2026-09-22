@@ -19,9 +19,9 @@ guesses toward over-redaction: a value that merely looks like `password =
 clipped text would over-mask, so the flag is ORed across layers). Accept
 that non-secret text will sometimes ship as `<REDACTED>`; audit receivers
 against raw server logs, not against the export. One layer fails open: a
-`redact_pattern` that does not compile disables only that layer (server-log
-WARNING plus the `pg_logtap_redact_pattern_failed` gauge) while the
-always-on cuts keep working.
+`redact_pattern` that does not compile, or uses a rejected backreference
+(`\1`…`\9`), disables only that layer (server-log WARNING plus the
+`pg_logtap_redact_pattern_failed` gauge) while the always-on cuts keep working.
 
 ## Supported versions
 

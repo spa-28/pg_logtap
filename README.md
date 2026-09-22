@@ -60,11 +60,18 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.5.0/pg_logtap-0.5.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.5.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.5.1/pg_logtap-0.5.1-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.5.1-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
+
+The matching `pg_logtap-<version>-pg<N>-<arch>-debug.tar.gz` is optional:
+it contains detached DWARF symbols for GDB, not a runtime dependency. To let
+GDB find them through the module's `.gnu_debuglink`, put
+`lib/pg_logtap.so.debug` beside the installed `.so` (or in its `.debug/`
+directory). The version, PostgreSQL major, and architecture must match the
+installed runtime exactly.
 
 Release binaries cover **amd64 and arm64**, built with ReleaseSafe against
 glibc 2.28 — the oldest glibc among current distributions (RHEL 8, both
@@ -78,6 +85,9 @@ Prerequisites: Zig 0.16.0, `pg_config` for the target major on PATH, and
 libpq headers (`postgresql-server-dev-NN` + `libpq-dev` on Debian/Ubuntu) —
 the [pgzx](https://github.com/spa-28/pgzx) dependency (git dep in
 `build.zig.zon`) translates the server headers and links libpq at build time.
+`make e2e` additionally requires GNU Binutils (`objcopy` and `readelf`; the
+`binutils` package on Debian/Ubuntu) to produce and validate the release-like
+stripped runtime.
 
 ```sh
 make && make install          # uses pg_config from PATH
@@ -104,10 +114,10 @@ GUCs and restart again.
 | Option | Default | Context | Description |
 |---|---|---|---|
 | `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 23=PANIC — see the level table below). |
-| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars), but avoid backreferences (`\1`) — they drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and the scan runs over the full `message_max` — a wider slot widens the worst case; matching runs in every logging backend). |
-| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. |
+| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars). Backreferences (`\1`…`\9`) are rejected — they drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and the scan runs over the full `message_max`; matching runs in every logging backend). |
+| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. Backreferences are rejected for the same reason as `pattern`. |
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. ⚠ sensitive — see below. |
-| `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; avoid backreferences (see `pattern`). |
+| `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; backreferences are rejected (see `pattern`). |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
 | `pg_logtap.message_max` | `1024` (1024–1048576) | postmaster | Slot width for each event's `message` in bytes; longer messages are cut at a UTF-8 character boundary and named in `truncated`. Other fields stay 256 bytes. Shared memory cost is `ring_capacity × (message_max + ~2.4 KB)` — the default keeps the slot byte-identical to 0.3.x (≈3.4 KB); the max width with the max ring is ≈8.6 GB. Capture cost grows with the message's actual length, not the setting (~1.8 µs/KB — a 1 MB message adds ~1.9 ms in the logging backend; short messages pay microseconds as before). Check the receiver's line limit before raising it (see Receivers). |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
@@ -299,8 +309,8 @@ the fallback file and the receiver all hold the masked form only:
   ```
 
   Empty (the default) disables the layer. It runs in every logging backend,
-  so keep the pattern plain (see the backreference note under `pattern`), and
-  treat it as damage reduction: any single pattern can be evaded by a
+  so backreferences (`\1`…`\9`) are rejected. Treat it as damage reduction:
+  any single pattern can be evaded by a
   determined writer, and a masked field is still evidence that something
   sensitive was there.
 
@@ -607,9 +617,12 @@ git tag v0.3.0 && git push origin v0.3.0
 ```
 
 Publishing the Release triggers CI, which rebuilds the matrix (PG majors ×
-amd64/arm64, each arch natively on its own runner) and attaches one package
-per combination as `pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` +
-`extension/` tree ready to untar into the PostgreSQL installation.
+amd64/arm64, each arch natively on its own runner). GNU Binutils splits DWARF
+before the e2e deployment, so the tested runtime package is
+`pg_logtap-<version>-pg<N>-<arch>.tar.gz` — a `lib/` + `extension/` tree ready
+to untar into the PostgreSQL installation. Its matching
+`pg_logtap-<version>-pg<N>-<arch>-debug.tar.gz` contains only
+`lib/pg_logtap.so.debug` for debugging.
 
 ## Roadmap
 
