@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.2 (2026-09-23)
+
 ### Fixed
 
 - The export worker starts after recovery reaches a consistent hot-standby
