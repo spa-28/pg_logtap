@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- The export worker starts after recovery reaches a consistent hot-standby
+  state, so permanent standbys and referee nodes export without promotion.
+- The export worker initializes shared-catalog access without connecting to a
+  hardcoded `postgres` database. Database and user name enrichment remains
+  automatic through the shared catalogs.
+
 ## 0.5.1 (2026-09-22)
 
 ### Hardening

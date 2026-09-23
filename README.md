@@ -36,6 +36,7 @@ pass through, so some systems ingest directly without a collector in between.
 - **TLS export** — `https://` and `tcps://` schemes: the same transports over TLS 1.2/1.3, CA pinning, name/SNI override for IP-literal URLs and TLS-terminating load balancers, auth headers for http(s) ([details](docs/delivery.md#tls-https-tcps)).
 - **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
+- **Permanent-standby support** — the exporter starts once hot standby reaches a consistent state and does not bind to a particular database. Each event's source database and user are still resolved independently from PostgreSQL's shared catalogs, including in multi-database clusters.
 
 ## PostgreSQL Logging Settings
 

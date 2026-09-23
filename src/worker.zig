@@ -188,7 +188,7 @@ pub fn init() void {
     // URL the worker just sleeps on its latch (no drain, no export).
     bgworker.register("pg_logtap exporter", "pg_logtap", "pg_logtap_worker", .{
         .flags = pg.BGWORKER_SHMEM_ACCESS | pg.BGWORKER_BACKEND_DATABASE_CONNECTION,
-        .start_time = pg.BgWorkerStart_RecoveryFinished,
+        .start_time = pg.BgWorkerStart_ConsistentState,
         .restart_time = 1,
     });
 }
@@ -204,8 +204,9 @@ pub fn workerMain() void {
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.HUP), handleHup);
         _ = pg.pqsignal(@intFromEnum(std.posix.SIG.USR1), handleUsr1);
     }
-    // Catalog access for database/user name resolution.
-    pg.BackgroundWorkerInitializeConnection("postgres", null, 0);
+    // Shared-catalog access for database/user names, without binding the
+    // exporter to a database that may not exist on a standby/referee.
+    pg.BackgroundWorkerInitializeConnection(null, null, 0);
     pg.BackgroundWorkerUnblockSignals();
 
     const alloc = std.heap.c_allocator;

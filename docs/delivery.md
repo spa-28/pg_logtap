@@ -146,6 +146,14 @@ process does have a PGPROC**, so crash-recovery lines — "database system was
 interrupted", "database system was ready to accept read-only connections" —
 **are** captured and exported like any backend line.
 
+The exporter starts when recovery reaches a consistent hot-standby state; it
+does not wait for promotion and does not connect to a named database. A
+permanent standby therefore keeps exporting while `pg_is_in_recovery()` stays
+true. Event `database` and `user` fields remain available because their names
+come from the cluster-wide `pg_database` and `pg_authid` catalogs. Resolution
+uses each event's captured database and role OIDs, so events from different
+databases retain their own source names.
+
 ## Loss boundaries per scenario
 
 Buffers: the shmem ring (≤ R events) + the worker RAM backlog (trimmed to the
