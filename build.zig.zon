@@ -1,12 +1,12 @@
 .{
     .name = .pg_logtap,
-    .version = "0.5.1",
+    .version = "0.5.2",
     .fingerprint = 0xa4a7ecd69b38e118,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .pgzx = .{
-            .url = "git+https://github.com/spa-28/pgzx#f815939e2d0e5143a72ae1c38e360445c4714fde",
-            .hash = "pgzx-0.1.0-PsG6MFXRAwDrq-0BqLowcR96EhNCbJYM4jI1Q_XOVZq1",
+            .url = "git+https://github.com/spa-28/pgzx#90d418231f1b98599327834a02396d4f65f400d6",
+            .hash = "pgzx-0.1.0-PsG6MK-LBABQ8bf_ITfN4IA-nPOTA62tqYJMC1q3EvCp",
         },
         .zlinter = .{
             .url = "git+https://github.com/kurtwagner/zlinter?ref=0.16.x#8b10b45d33c684be4f869baf95a37c282e9db750",

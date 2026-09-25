@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e # the shared stand's root; per-major dirs live under it
 mkdir -p "$OUT"
@@ -190,6 +190,12 @@ phase_cluster_ops() { # <v>: ops that interact with other backends — the
   "
 }
 
+phase_standby() { # <v>: database-independent worker startup on a primary
+  # without database postgres, then export from a physical standby that stays
+  # in recovery. Own throwaway containers; the matrix stand supplies Vector.
+  scripts/e2e-standby.sh "$1"
+}
+
 phase_e2e() { # <v>: N distinct events must reach Vector (file sink).
   scripts/e2e-vector.sh "pglogtap-mx$1" 20
 }
@@ -312,6 +318,9 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
   if has_phase stand; then phase_stand "$v" || { echo "pg$v: stand FAILED"; STATUS=1; ok=0; }; fi
   if [ "$ok" = 1 ] && has_phase cluster-ops; then
     phase_cluster_ops "$v" || { echo "pg$v: cluster-ops (barrier/signal classes) FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase standby; then
+    phase_standby "$v" || { echo "pg$v: standby/no-postgres FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase e2e; then
     phase_e2e "$v" || { echo "pg$v: e2e FAILED"; STATUS=1; ok=0; }
