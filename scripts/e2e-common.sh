@@ -95,34 +95,6 @@ SELECT format('ALTER SYSTEM SET %s = %L', :'guc', :'value')
 \gexec
 SQL
 }
-resetguc() { # remove only ALTER SYSTEM's value; lower-precedence config wins
-  guc_name_valid "$1" || return 2
-  docker exec -i "$E2E_CT" psql -X -U postgres -v ON_ERROR_STOP=1 \
-    -v "guc=$1" >/dev/null <<'SQL'
-SELECT format('ALTER SYSTEM RESET %s', :'guc')
-\gexec
-SQL
-}
-guc_auto_has() { # true when postgresql.auto.conf explicitly owns this setting
-  guc_name_valid "$1" || return 2
-  docker exec -i "$E2E_CT" psql -X -U postgres -At -v ON_ERROR_STOP=1 \
-    -v "guc=$1" <<'SQL'
-SELECT EXISTS (
-  SELECT FROM pg_file_settings
-  WHERE sourcefile = current_setting('data_directory') || '/postgresql.auto.conf'
-    AND name = :'guc')
-SQL
-}
-guc_auto_value() { # parsed value from the last matching auto.conf entry
-  guc_name_valid "$1" || return 2
-  docker exec -i "$E2E_CT" psql -X -U postgres -At -v ON_ERROR_STOP=1 \
-    -v "guc=$1" <<'SQL'
-SELECT setting FROM pg_file_settings
-WHERE sourcefile = current_setting('data_directory') || '/postgresql.auto.conf'
-  AND name = :'guc'
-ORDER BY sourceline DESC LIMIT 1
-SQL
-}
 reload() { docker exec "$E2E_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -qc "SELECT pg_reload_conf()" >/dev/null; }
 stats() { docker exec "$E2E_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
 statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }

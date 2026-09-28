@@ -10,11 +10,9 @@
   change. `application/json` enables direct HTTP ingestion by Fluent Bit
   4.0.14, including gzipped request bodies, while generic extra headers still
   reject a conflicting second `Content-Type`.
-- A direct Fluent Bit HTTP/TCP acceptance phase verifies isolated routing,
-  exact JSON event sets and the HTTP `application/json` + gzip path.
-- Tested receiver guides and checked-in configurations cover direct Vector
-  HTTP/TCP, OpenTelemetry Collector HTTP/TCP with an optional VictoriaLogs
-  downstream, and ClickHouse HTTP/JSONEachRow with request gzip.
+- Tested receiver guides and checked-in configurations cover direct Vector and
+  Fluent Bit HTTP/TCP, OpenTelemetry Collector HTTP/TCP with an optional
+  VictoriaLogs downstream, and ClickHouse HTTP/JSONEachRow with request gzip.
 - A tested Fluentd 1.19.3 configuration and reproducible manual stand cover
   direct HTTP with the default `application/x-ndjson` plus request gzip, and
   raw TCP with newline-delimited JSON.

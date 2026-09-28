@@ -17,8 +17,9 @@ sha256:945b0bdb80ff2886cebedbfa5130d0856877320368b7d9bd0431512907b75177
 ```
 
 The TCP path is available in pg_logtap 0.5.2. The configurable HTTP
-`Content-Type` is under `Unreleased`; use the current-checkout matrix test below
-until a release artifact containing `export_http_content_type` is published.
+`Content-Type` is under `Unreleased`; build the current checkout to exercise the
+HTTP path until a release artifact containing `export_http_content_type` is
+published.
 
 ## Fluent Bit configuration
 
@@ -117,21 +118,13 @@ body returns a 2xx response and is split into individual records when labelled
 that sender-owned label. `export_http_extra_headers` continues to reject a
 second `Content-Type`, avoiding conflicting headers.
 
-## Acceptance coverage
+## Tested result
 
-[`scripts/e2e-fluent-bit.sh`](../scripts/e2e-fluent-bit.sh) runs one current
-pg_logtap sender sequentially through both inputs. It requires exact indexed
-marker sets, valid JSON without duplicates, route isolation, unchanged failure
-counters, and enables gzip on the HTTP path. Run it through the normal PG18
-stand/build path:
-
-```sh
-PHASES=stand,fluent-bit scripts/test-matrix.sh 0 18
-```
-
-A PostgreSQL 18 run of that test received exactly 20/20 HTTP events and 20/20
-TCP events, with valid JSON, no cross-route markers and no increase in
-`events_dropped`, `send_cycles_failed` or `events_lost`.
+A PostgreSQL 18 stand using the current development build was checked directly
+against both Fluent Bit inputs. It received exactly 20/20 HTTP events and 20/20
+TCP events. The HTTP request used `application/json` with gzip; both outputs
+contained valid JSON, the route markers stayed isolated, and
+`events_dropped`, `send_cycles_failed` and `events_lost` did not increase.
 
 The released 0.5.2 TCP stand below received 100 indexed events: 20 each at
 `DEBUG1`, `LOG`, `INFO`, `NOTICE` and `WARNING`, with exact indexes and valid

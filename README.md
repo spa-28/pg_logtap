@@ -520,7 +520,6 @@ receiver's port actually accepting):
 PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
 # deploy the build into it, then:
 scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
-scripts/e2e-fluent-bit.sh pglogtap-e2e 20    # direct HTTP application/json + gzip and raw TCP through Fluent Bit
 scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
 scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
 scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting

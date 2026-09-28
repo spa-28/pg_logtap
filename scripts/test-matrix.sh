@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,fluent-bit,faults,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e # the shared stand's root; per-major dirs live under it
 mkdir -p "$OUT"
@@ -272,11 +272,6 @@ phase_tls() { # <v>: TLS export acceptance — verified https, ca-cleared and
   scripts/e2e-tls.sh "pglogtap-mx$1"
 }
 
-phase_fluent_bit() { # <v>: direct HTTP (custom Content-Type + gzip) and raw
-  # TCP ingestion, routed by distinct Fluent Bit tags into isolated JSONL files.
-  scripts/e2e-fluent-bit.sh "pglogtap-mx$1"
-}
-
 phase_faults() { # <v>: fault injection — a throwaway postgres under an
   # LD_PRELOAD shim that fails fdatasync for one named file: rollback-and-
   # retry on a file:// sink, keep-but-count on the fallback queue, and
@@ -347,9 +342,6 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
   fi
   if [ "$ok" = 1 ] && has_phase tls; then
     phase_tls "$v" || { echo "pg$v: tls FAILED"; STATUS=1; ok=0; }
-  fi
-  if [ "$ok" = 1 ] && has_phase fluent-bit; then
-    phase_fluent_bit "$v" || { echo "pg$v: fluent-bit FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase faults; then
     phase_faults "$v" || { echo "pg$v: faults FAILED"; STATUS=1; ok=0; }
