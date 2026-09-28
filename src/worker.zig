@@ -69,6 +69,7 @@ var guc_export_gzip: bool = false;
 var guc_export_tls_ca: [*c]u8 = null;
 var guc_export_tls_verify: bool = true;
 var guc_export_tls_server_name: [*c]u8 = null;
+var guc_export_http_content_type: [*c]u8 = null;
 var guc_export_http_extra_headers: [*c]u8 = null;
 var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
@@ -174,7 +175,8 @@ pub fn init() void {
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after the fixed headers — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte or an empty line is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_content_type", "Content-Type value on http(s):// export requests. The default labels the unchanged NDJSON body as application/x-ndjson; set application/json for receivers such as Fluent Bit that require that media type. SIGHUP applies it from the next request. Empty, whitespace-only, control/non-ASCII bytes and values longer than 256 bytes are rejected.", null, &guc_export_http_content_type, "application/x-ndjson", pg.PGC_SIGHUP, 0, checkContentType, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after Host and Content-Type — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte, an empty line or a sender-owned name such as Content-Type is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -772,6 +774,17 @@ fn gucStrRaw(name: [:0]const u8) []const u8 {
     return std.mem.span(@as([*:0]const u8, @ptrCast(val)));
 }
 
+/// SET-time wire-value check for export_http_content_type (discipline in
+/// export.zig, unit-tested there). The GUC storage stays PostgreSQL-owned;
+/// sendHttp borrows the current value only while formatting one request.
+fn checkContentType(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    return dest_mod.contentTypeValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
+}
+
 /// SET-time CR/LF check for export_http_extra_headers (discipline in export.zig,
 /// unit-tested there): guc.c runs this for ALTER SYSTEM (a session SET is
 /// refused before any value check — PGC_SIGHUP), and boot
@@ -918,7 +931,8 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // reason — not a torn header on the wire.
     var head_buf: [2048]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: application/x-ndjson\r\n", .{ h.path, h.host, h.port }) catch return failSend("head build", 0);
+    const content_type = gucSpan(guc_export_http_content_type);
+    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: {s}\r\n", .{ h.path, h.host, h.port, content_type }) catch return failSend("head build", 0);
     const extra_hdr = gucSpan(guc_export_http_extra_headers);
     if (extra_hdr.len > 0) dest_mod.writeHeaderLines(&head, extra_hdr) catch return failSend("head build", 0);
     if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);

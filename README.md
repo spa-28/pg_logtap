@@ -127,7 +127,8 @@ GUCs and restart again.
 | `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. Keep it on local disk — the read sits inside the send attempt, and a hung network filesystem would stall the worker outside every timeout. The receiver may present leaf+intermediate — pin the root (or the intermediate itself); the file may hold several certs. |
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
-| `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra header line(s) on every http(s) request after the fixed headers, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects a raw `\r` or an empty line. |
+| `pg_logtap.export_http_content_type` | `application/x-ndjson` | SIGHUP | `Content-Type` value on `http://`/`https://` requests. This changes only the MIME label; the body remains NDJSON. Set `application/json` for receivers such as Fluent Bit 4.0.14. Values must be 1–256 bytes of visible ASCII/space/tab and not whitespace-only. |
+| `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra application header line(s) on every http(s) request after `Host` and `Content-Type`, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects raw control bytes, an empty line and sender-owned names including `Content-Type` (use `export_http_content_type`). |
 | `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. New counted frames retain an exact fallback count when a gzip payload is unreadable; when the payload is readable, its NDJSON line count wins over damaged count metadata. Clean legacy queues remain replayable. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). Keep it on local disk, like `export_tls_ca`: appends and the final shutdown parking have no timeout, and a hung network filesystem would block the worker outright. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One monotonic absolute deadline per send attempt: every resolved connect address and later stage gets only the remaining budget; plain body writes check it between syscalls, and TLS re-arms it before every socket read/write, so dribbling fragments, stalled reads, EINTR retries, or wall-clock changes cannot stretch the attempt. DNS resolution itself remains blocking, but consumes the budget before connect. |
@@ -331,7 +332,7 @@ On top of that, the operational knobs:
 
 `export_url` schemes (gzip applies to the `http(s)://` schemes):
 
-- `http://host:port[/path]` — HTTP/1.1 POST, `application/x-ndjson` (no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it. When resolution fails in-process, the last address a dial actually reached is retried for up to 60 s (same host only; only a dial after a fresh, working resolution refreshes the window — the cached-address dial itself does not, so the 60 s bound is hard) — emergency delivery through a wedged resolver, not a cache: with `https://`/`tcps://` a stale address that no longer serves the host fails certificate verification, with `http://`/`tcp://` a reassigned IP can receive logs for at most that 60 s window;
+- `http://host:port[/path]` — HTTP/1.1 POST, NDJSON with `Content-Type: application/x-ndjson` by default (`export_http_content_type` changes the label, not the body; no TLS). Hostnames resolve via getaddrinfo on every dial — resolution is bounded by resolver timeouts, not `export_timeout_ms`; IP literals skip it. When resolution fails in-process, the last address a dial actually reached is retried for up to 60 s (same host only; only a dial after a fresh, working resolution refreshes the window — the cached-address dial itself does not, so the 60 s bound is hard) — emergency delivery through a wedged resolver, not a cache: with `https://`/`tcps://` a stale address that no longer serves the host fails certificate verification, with `http://`/`tcp://` a reassigned IP can receive logs for at most that 60 s window;
 - `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_extra_headers` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
 - `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
@@ -345,10 +346,13 @@ SYSTEM` outright (both would malform the request line).
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
 (`Content-Encoding: gzip`) — same NDJSON after decompression, just less
-wire. Request-body gzip is *not* universal: Vector `http_server`,
-VictoriaLogs/VictoriaMetrics insert endpoints, Fluent Bit `http` and
-Logstash `http` inputs decompress it natively; a hand-rolled endpoint that
-reads the raw body does not — leave the GUC off for those.
+wire. Request-body gzip and MIME support are not universal: Vector
+`http_server`, VictoriaLogs/VictoriaMetrics insert endpoints, the tested
+OpenTelemetry webhook receiver and Fluentd 1.19.3 `in_http` accept the default
+`application/x-ndjson`. Fluent Bit 4.0.14 accepts the same NDJSON batches,
+including request gzip, when
+`pg_logtap.export_http_content_type = 'application/json'`; its HTTP parser
+rejects the default label. Leave gzip off for receivers that read the raw body.
 
 ## Receivers
 
@@ -357,10 +361,12 @@ TCP or file — so Vector is convenient but not required:
 
 | Receiver | `pg_logtap.export_url` |
 |---|---|
-| **Vector** (primary) | `http://vector:8686` |
+| **Vector** (primary) | `http://vector:8686` (recommended) or `tcp://vector:54525`; see [direct HTTP/TCP configuration](docs/vector.md) |
+| **OpenTelemetry Collector** | `http://otel-collector:8088/pg-logtap` (recommended) or `tcp://otel-collector:54525`; see [HTTP/TCP configuration](docs/otel-collector.md) |
 | **VictoriaLogs** direct | `http://vlogs:9428/insert/jsonline?_stream_fields=host,level&_msg_field=message&_time_field=timestamp` |
-| **ClickHouse** | `http://ch:8123/?query=INSERT+INTO+logs+FORMAT+JSONEachRow` |
-| **Fluent Bit / Fluentd** | HTTP source with JSON |
+| **ClickHouse** | `http://clickhouse:8123/?query=INSERT%20INTO%20pg_logtap.logs%20FORMAT%20JSONEachRow&date_time_input_format=best_effort&wait_end_of_query=1`; see [direct HTTP configuration](docs/clickhouse.md) |
+| **Fluentd** | `http://fluentd:9880/pg_logtap_http` (recommended) or `tcp://fluentd:5170`; see [direct HTTP/TCP configuration](docs/fluentd.md) |
+| **Fluent Bit** | `tcp://fluent-bit:5170` with v0.5.2; current `Unreleased` builds also support `http://fluent-bit:9880/pg_logtap_http` with `export_http_content_type = 'application/json'`; see [direct HTTP/TCP configuration](docs/fluent-bit.md) |
 | **Logstash** | `tcp://logstash:5000` (+ `json_lines` codec) |
 | file shippers (filebeat, promtail, rsyslog) | `file:///var/log/pg_logtap.jsonl` + tail |
 | your own | any HTTP/TCP endpoint that reads lines |
@@ -514,6 +520,7 @@ receiver's port actually accepting):
 PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
 # deploy the build into it, then:
 scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
+scripts/e2e-fluent-bit.sh pglogtap-e2e 20    # direct HTTP application/json + gzip and raw TCP through Fluent Bit
 scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
 scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
 scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
@@ -521,7 +528,7 @@ scripts/e2e-hook-chain.sh pglogtap-e2e       # another extension's emit-log + sh
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https, ca-cleared/empty-ca fails, impostor chain, server_name mismatch, intermediate CA, tcps, verify=off, auth gate (401 without headers, bearer/basic with), TLS 1.2-only receiver
+scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https/tcps, CA/name failures, auth gate, Content-Type reload, bearer/basic credentials, TLS 1.2-only receiver
 scripts/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
 scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
 scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm

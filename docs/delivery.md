@@ -23,8 +23,8 @@ view) restarts from zero on every restart.
 | fallback queue | durable (fdatasynced once per flush cycle), **replayed automatically** on recovery | the write itself | a soft worker restart resumes the last atomically published cursor; a postmaster restart replays from byte 0 → already-delivered members may be resent. The receiver may also have accepted the failed send that queued them |
 
 Three honesty notes on those ACKs. `http://`: **any 2xx** counts as
-delivered — the standard semantics of HTTP log receivers (Vector,
-VictoriaLogs, Fluent Bit), but a proxy that answers 200 without
+delivered — the standard semantics of the tested HTTP log receivers (Vector,
+VictoriaLogs, OpenTelemetry Collector, ClickHouse, Fluentd, Fluent Bit), but a proxy that answers 200 without
 forwarding defeats any status check you could make. `tcp://`: the
 protocol has no framing or ACK, so a **partial write can tear the last
 line** mid-batch — the receiver's codec must tolerate or resync (a
@@ -93,13 +93,22 @@ control verification:
   matches an IP-literal host) and a TLS-terminating load balancer in front
   of the receiver. Empty = the URL host.
 
-`export_http_extra_headers` (plain `http://` included) appends extra header
-line(s) to every http(s) request after the fixed headers — e.g.
+`export_http_content_type` owns the single `Content-Type` header on every
+http(s) request. Its SIGHUP default is `application/x-ndjson`; changing it
+changes only that MIME label, never the NDJSON body or optional gzip encoding.
+The value must be 1–256 bytes of visible ASCII/space/tab and cannot be
+whitespace-only, so it cannot inject or terminate another HTTP header. An
+in-flight request finishes with the previous value; the worker applies the
+reload before a later request.
+
+`export_http_extra_headers` (plain `http://` included) appends extra
+application header line(s) after `Host` and `Content-Type` — e.g.
 `'Authorization: Bearer <token>'` for VictoriaLogs. Multiple lines are
 separated by the two-character `\n` sequence — a GUC value cannot carry a
 real newline (ALTER SYSTEM rejects one outright), so the escape is the only
 multi-line form; each line is CRLF-terminated on send. SET rejects a raw
-`\r` or an empty line (either would malform every request).
+control byte, an empty line and sender-owned names such as `Content-Type`;
+use `export_http_content_type` instead of creating a conflicting second copy.
 
 ## Ordering and identity
 

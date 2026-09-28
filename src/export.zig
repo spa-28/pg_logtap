@@ -16,6 +16,27 @@ pub const Dest = union(enum) {
     file: []const u8,
 };
 
+const content_type_max = 256;
+
+fn fieldValueValid(value: []const u8) bool {
+    for (value) |ch| {
+        if (ch != ' ' and ch != '\t' and (ch < 0x21 or ch > 0x7e)) return false;
+    }
+    return true;
+}
+
+/// SET-time discipline for the sender-owned Content-Type value. Keep it a
+/// non-empty visible ASCII field value; the receiver decides which media type
+/// it accepts. The bound reserves most of the fixed request-header buffer for
+/// the path, host and optional application headers.
+pub fn contentTypeValid(value: []const u8) bool {
+    if (value.len == 0 or value.len > content_type_max or !fieldValueValid(value)) return false;
+    for (value) |ch| {
+        if (ch != ' ' and ch != '\t') return true;
+    }
+    return false;
+}
+
 /// SET-time discipline for export_http_extra_headers: reject only what the
 /// sender cannot fix — an empty line (it would end the header section before
 /// the fixed headers) and a raw CR/LF byte. Lines are separated by the
@@ -45,16 +66,14 @@ pub fn headerValid(val: []const u8) bool {
         // Field values carry visible ASCII, SP and HTAB only — any other
         // control byte (or raw high byte) would corrupt the wire form
         // writeHeaderLines emits; non-ASCII belongs percent-encoded.
-        for (line[colon + 1 ..]) |ch| {
-            if (ch != ' ' and ch != '\t' and (ch < 0x21 or ch > 0x7e)) return false;
-        }
+        if (!fieldValueValid(line[colon + 1 ..])) return false;
         // The sender owns these names: they carry the request's framing and
         // identity, and a second one from config makes a request with
         // conflicting semantics (two Content-Lengths is smuggling-shaped).
         // Expect would invite interim 1xx responses the status reader does
-        // not parse (it takes the first status line only), and Content-Type
-        // is always the sender's application/x-ndjson. Application headers
-        // (Authorization, X-*) stay allowed.
+        // not parse (it takes the first status line only). Content-Type has
+        // its own sender-owned GUC. Application headers (Authorization, X-*)
+        // stay allowed.
         for ([_][]const u8{ "host", "content-length", "transfer-encoding", "connection", "content-encoding", "te", "upgrade", "proxy-connection", "expect", "content-type" }) |owned| {
             if (std.ascii.eqlIgnoreCase(name, owned)) return false;
         }
@@ -181,6 +200,27 @@ test "reject control bytes and spaces in network schemes" {
     try std.testing.expectEqualStrings("/tmp/my logs.jsonl", parseUrl("file:///tmp/my logs.jsonl").?.file);
 }
 
+test "export_http_content_type field value discipline" {
+    try std.testing.expect(contentTypeValid("application/x-ndjson"));
+    try std.testing.expect(contentTypeValid("application/json"));
+    try std.testing.expect(contentTypeValid("application/vnd.example+json; charset=utf-8"));
+    try std.testing.expect(contentTypeValid("\t application/json "));
+
+    const at_limit: [content_type_max]u8 = @splat('a');
+    const over_limit: [content_type_max + 1]u8 = @splat('a');
+    try std.testing.expect(contentTypeValid(&at_limit));
+    try std.testing.expect(!contentTypeValid(&over_limit));
+
+    try std.testing.expect(!contentTypeValid(""));
+    try std.testing.expect(!contentTypeValid(" \t "));
+    try std.testing.expect(!contentTypeValid("application/json\r\nX-Evil: 1"));
+    try std.testing.expect(!contentTypeValid("application/json\n"));
+    try std.testing.expect(!contentTypeValid("application/\x00json"));
+    try std.testing.expect(!contentTypeValid("application/\x01json"));
+    try std.testing.expect(!contentTypeValid("application/\x7fjson"));
+    try std.testing.expect(!contentTypeValid("application/\xc3\xa9"));
+}
+
 test "export_http_extra_headers CR/LF discipline" {
     try std.testing.expect(headerValid("")); // boot default
     try std.testing.expect(headerValid("Authorization: Bearer t")); // the plain form
@@ -205,7 +245,7 @@ test "export_http_extra_headers protocol-owned names rejected" {
     try std.testing.expect(!headerValid("Upgrade: h2c"));
     try std.testing.expect(!headerValid("Proxy-Connection: keep-alive"));
     try std.testing.expect(!headerValid("Expect: 100-continue")); // interim 1xx — the status reader takes the first line only
-    try std.testing.expect(!headerValid("Content-Type: application/json")); // sender always writes x-ndjson
+    try std.testing.expect(!headerValid("Content-Type: application/json")); // use export_http_content_type
     try std.testing.expect(!headerValid("X-A: 1\\nHost: evil.example")); // anywhere in the list
     // "Hostname" is not "Host": a prefix collision must not reject an
     // unowned (if odd) name, and an application header stays allowed.
