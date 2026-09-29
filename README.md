@@ -352,7 +352,9 @@ OpenTelemetry webhook receiver and Fluentd 1.19.3 `in_http` accept the default
 `application/x-ndjson`. Fluent Bit 4.0.14 accepts the same NDJSON batches,
 including request gzip, when
 `pg_logtap.export_http_content_type = 'application/json'`; its HTTP parser
-rejects the default label. Leave gzip off for receivers that read the raw body.
+rejects the default label. Grafana Alloy 1.20.1 `loki.source.api` accepts the
+default label at `/loki/api/v1/raw`, but reads the raw body without inflating
+request gzip, so set `pg_logtap.export_gzip = off` for that path.
 
 ## Receivers
 
@@ -365,6 +367,7 @@ TCP or file — so Vector is convenient but not required:
 | **OpenTelemetry Collector** | `http://otel-collector:8088/pg-logtap` (recommended) or `tcp://otel-collector:54525`; see [HTTP/TCP configuration](docs/otel-collector.md) |
 | **VictoriaLogs** direct | `http://vlogs:9428/insert/jsonline?_stream_fields=host,level&_msg_field=message&_time_field=timestamp` |
 | **ClickHouse** | `http://clickhouse:8123/?query=INSERT%20INTO%20pg_logtap.logs%20FORMAT%20JSONEachRow&date_time_input_format=best_effort&wait_end_of_query=1`; see [direct HTTP configuration](docs/clickhouse.md) |
+| **Grafana Alloy → Loki** | `http://alloy:9880/loki/api/v1/raw` with `export_gzip = off`; see [tested HTTP adapter configuration](docs/grafana-alloy.md) |
 | **Fluentd** | `http://fluentd:9880/pg_logtap_http` (recommended) or `tcp://fluentd:5170`; see [direct HTTP/TCP configuration](docs/fluentd.md) |
 | **Fluent Bit** | `tcp://fluent-bit:5170` with v0.5.2; current `Unreleased` builds also support `http://fluent-bit:9880/pg_logtap_http` with `export_http_content_type = 'application/json'`; see [direct HTTP/TCP configuration](docs/fluent-bit.md) |
 | **Logstash** | `tcp://logstash:5000` (+ `json_lines` codec) |
@@ -372,9 +375,10 @@ TCP or file — so Vector is convenient but not required:
 | your own | any HTTP/TCP endpoint that reads lines |
 
 Not direct (put a collector in between): **Kafka** (binary protocol);
-**Loki / Elasticsearch / OpenSearch** (different body format); endpoints that
-need mTLS client certificates or a vendor-specific body (Datadog, Elastic
-Cloud). A plain `https://` NDJSON endpoint with a bearer token is direct:
+**Loki** ([use the tested Grafana Alloy adapter](docs/grafana-alloy.md)),
+**Elasticsearch / OpenSearch** (different body format); endpoints that need
+mTLS client certificates or a vendor-specific body (Datadog, Elastic Cloud).
+A plain `https://` NDJSON endpoint with a bearer token is direct:
 `export_tls_ca` + `export_http_extra_headers` cover it. Principle: pg_logtap is a
 dumb reliable transporter of a trivial format; transformation and fan-out
 are the collector's job.

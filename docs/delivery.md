@@ -24,9 +24,12 @@ view) restarts from zero on every restart.
 
 Three honesty notes on those ACKs. `http://`: **any 2xx** counts as
 delivered — the standard semantics of the tested HTTP log receivers (Vector,
-VictoriaLogs, OpenTelemetry Collector, ClickHouse, Fluentd, Fluent Bit), but a proxy that answers 200 without
-forwarding defeats any status check you could make. `tcp://`: the
-protocol has no framing or ACK, so a **partial write can tear the last
+VictoriaLogs, OpenTelemetry Collector, ClickHouse, Fluentd, Fluent Bit,
+Grafana Alloy), but a proxy that answers 200 without forwarding defeats any
+status check you could make. Alloy's raw endpoint returns 204 after in-process
+acceptance; this does not prove that its `loki.write` component persisted the
+entries, so verify that chain with Alloy metrics and a Loki query. `tcp://`:
+the protocol has no framing or ACK, so a **partial write can tear the last
 line** mid-batch — the receiver's codec must tolerate or resync (a
 length-delimited codec does; a strict line parser will not). `file://`:
 the rollback above makes the file whole batches only — a receiver

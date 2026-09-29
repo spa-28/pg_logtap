@@ -16,6 +16,9 @@
 - A tested Fluentd 1.19.3 configuration and reproducible manual stand cover
   direct HTTP with the default `application/x-ndjson` plus request gzip, and
   raw TCP with newline-delimited JSON.
+- A tested Grafana Alloy 1.20.1 configuration and reproducible manual stand
+  cover HTTP ingestion of the default uncompressed NDJSON through
+  `loki.source.api`, forwarding to Loki 3.7.8, and downstream query validation.
 
 ## 0.5.2 (2026-09-25)
 
