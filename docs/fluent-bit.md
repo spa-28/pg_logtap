@@ -16,10 +16,9 @@ fluent/fluent-bit:4.0.14
 sha256:945b0bdb80ff2886cebedbfa5130d0856877320368b7d9bd0431512907b75177
 ```
 
-The TCP path is available in pg_logtap 0.5.2. The configurable HTTP
-`Content-Type` is under `Unreleased`; build the current checkout to exercise the
-HTTP path until a release artifact containing `export_http_content_type` is
-published.
+Both paths are available in pg_logtap 0.6.0. The HTTP path requires 0.6.0 or
+newer because Fluent Bit needs the configurable `export_http_content_type`
+setting.
 
 ## Fluent Bit configuration
 
@@ -120,7 +119,7 @@ second `Content-Type`, avoiding conflicting headers.
 
 ## Tested result
 
-A PostgreSQL 18 stand using the current development build was checked directly
+A PostgreSQL 18 stand using the pg_logtap 0.6.0 build was checked directly
 against both Fluent Bit inputs. It received exactly 20/20 HTTP events and 20/20
 TCP events. The HTTP request used `application/json` with gzip; both outputs
 contained valid JSON, the route markers stayed isolated, and

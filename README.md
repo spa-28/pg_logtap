@@ -61,8 +61,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.5.2/pg_logtap-0.5.2-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.5.2-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.6.0/pg_logtap-0.6.0-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.6.0-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -369,7 +369,7 @@ TCP or file — so Vector is convenient but not required:
 | **ClickHouse** | `http://clickhouse:8123/?query=INSERT%20INTO%20pg_logtap.logs%20FORMAT%20JSONEachRow&date_time_input_format=best_effort&wait_end_of_query=1`; see [direct HTTP configuration](docs/clickhouse.md) |
 | **Grafana Alloy → Loki** | `http://alloy:9880/loki/api/v1/raw` with `export_gzip = off`; see [tested HTTP adapter configuration](docs/grafana-alloy.md) |
 | **Fluentd** | `http://fluentd:9880/pg_logtap_http` (recommended) or `tcp://fluentd:5170`; see [direct HTTP/TCP configuration](docs/fluentd.md) |
-| **Fluent Bit** | `tcp://fluent-bit:5170` with v0.5.2; current `Unreleased` builds also support `http://fluent-bit:9880/pg_logtap_http` with `export_http_content_type = 'application/json'`; see [direct HTTP/TCP configuration](docs/fluent-bit.md) |
+| **Fluent Bit** | `http://fluent-bit:9880/pg_logtap_http` with `export_http_content_type = 'application/json'` (recommended), or `tcp://fluent-bit:5170`; see [direct HTTP/TCP configuration](docs/fluent-bit.md) |
 | **Logstash** | `tcp://logstash:5000` (+ `json_lines` codec) |
 | file shippers (filebeat, promtail, rsyslog) | `file:///var/log/pg_logtap.jsonl` + tail |
 | your own | any HTTP/TCP endpoint that reads lines |

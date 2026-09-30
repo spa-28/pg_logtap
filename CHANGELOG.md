@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 (2026-09-30)
+
 ### Added
 
 - `export_http_content_type` sets the sender-owned `Content-Type` header on
