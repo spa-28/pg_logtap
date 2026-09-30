@@ -899,8 +899,12 @@ echo "== dns_fail_streak gauge: unresolvable host, then recovery =="
 setguc pg_logtap.export_fallback_file '' # this scenario is about dns, not the queue
 setguc pg_logtap.export_url "http://no-such-logtap-host$SUF:8686"
 reload; sleep 1
-gen dnsfail 5; sleep 2 # traffic forces a dial: getaddrinfo NONAME → streak ≥ 1
-# (the events buffer in the RAM backlog — no fallback file in this scenario)
+gen dnsfail 5 # traffic forces a dial: getaddrinfo NONAME → streak ≥ 1
+# The worker may start that cycle just after a fixed sleep expires; wait on the
+# gauge itself. The events buffer in the RAM backlog — no fallback file here.
+n=0; while [ "$n" -lt 10 ] && [ "$(statf dns_fail_streak)" -lt 1 ]; do
+  n=$((n + 1)); sleep 1
+done
 streak=$(statf dns_fail_streak)
 [ "$streak" -ge 1 ] 2>/dev/null || fail "dns-fail gauge: dns_fail_streak=$streak after failed lookups — not exported?"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload
@@ -926,13 +930,13 @@ ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
 echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest lost =="
 # Sizing: this run's queue scenario shows ~15 compressed bytes per event, so
 # a 1MB cap holds ~68k events. 150k events (~2.2MB) force at least one
-# compaction to the newest 512KB even when the 8192-deep RAM backlog trims
-# part of the burst on the way (a 90k storm sat exactly at the cap and
-# whether compaction fired depended on parking's race with the storm). The
-# exact split is compression-dependent; the asserts are the CONTRACT: file
-# bounded, newest tail delivered, dropped events counted lost (compacted
-# when the file was trimmed, lost when the backlog was), no duplicate
-# replay.
+# compaction to the newest 512KB. Pace this one producer below the observed
+# queue drain rate: the scenario tests fallback compaction, not whether a fast
+# backend can overflow the 1024-slot capture ring before enough events reach
+# the queue. The exact split is compression-dependent; the asserts are the
+# CONTRACT: file bounded, newest tail delivered, dropped events counted lost
+# (compacted when the file was trimmed, lost when the backlog was), no
+# duplicate replay.
 docker exec "$PG_CT" sh -c "rm -f '$FB_DIR/$FB_REL2'"
 setguc pg_logtap.fallback_max_mb 1
 # The default backlog depth (65536 × ~3.4KB ≈ 220MB of worker RAM, documented
@@ -946,7 +950,16 @@ setguc pg_logtap.export_backlog_max 8192
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
 D0=$(statf events_dropped) # ring may legally overflow while the worker
 # gzip-parks the burst — those events close the universe in dropped, not lost
-gen cap1 150000; sleep 8 # storm parks >2MB of members; compaction must fire
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ DECLARE i int := 0; BEGIN
+  WHILE i < 150000 LOOP
+    RAISE WARNING 'logtap $E2E_TAG cap1$E2E_SUF %', i;
+    i := i + 1;
+    IF i % 500 = 0 THEN PERFORM pg_sleep(0.15); END IF;
+  END LOOP; END \$\$" >/dev/null 2>&1 || fail "fallback_max_mb: paced generator failed"
+drain_ring
+n=0; while [ "$n" -lt 20 ] && [ "$(statf events_compacted)" -eq 0 ]; do
+  n=$((n + 1)); sleep 1
+done
 sz=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/$FB_REL2" 2>/dev/null || echo 0)
 [ "$sz" -le 1500000 ] || fail "fallback_max_mb: queue file $sz bytes with a 1MB cap"
 L=$(statf events_lost)

@@ -1,0 +1,81 @@
+# Reproducible pg_logtap -> OpenTelemetry Collector -> VictoriaLogs stand.
+# See docs/otel-collector.md for startup, generation and LogsQL checks.
+receivers:
+  webhook_event/pg_logtap:
+    endpoint: 0.0.0.0:8088
+    path: /pg-logtap
+    split_logs_at_json_boundary: true
+    max_request_body_size: 16777216
+
+  tcp_log/pg_logtap:
+    listen_address: 0.0.0.0:54525
+    encoding: utf-8
+    max_log_size: 8MiB
+    one_log_per_packet: false
+    operators:
+      - type: json_parser
+        parse_from: body
+        parse_to: attributes
+        parse_ints: true
+        on_error: drop
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.000000Z'
+        severity:
+          parse_from: attributes.level
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  transform/pg_logtap_http:
+    error_mode: propagate
+    log_statements:
+      - merge_maps(log.attributes, ParseJSON(log.body), "upsert") where IsString(log.body)
+      - set(log.attributes["seq"], Int(log.attributes["seq"])) where log.attributes["seq"] != nil
+      - set(log.time, Time(log.attributes["timestamp"], "%Y-%m-%dT%H:%M:%S.%f%z")) where log.attributes["timestamp"] != nil
+      - set(log.severity_text, log.attributes["level"]) where log.attributes["level"] != nil
+      - set(log.severity_number, SEVERITY_NUMBER_DEBUG) where IsString(log.attributes["level"]) and IsMatch(log.attributes["level"], "^DEBUG")
+      - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.attributes["level"] == "LOG" or log.attributes["level"] == "INFO"
+      - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.attributes["level"] == "NOTICE" or log.attributes["level"] == "WARNING"
+      - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.attributes["level"] == "ERROR"
+      - set(log.severity_number, SEVERITY_NUMBER_FATAL) where log.attributes["level"] == "FATAL" or log.attributes["level"] == "PANIC"
+      - set(resource.attributes["service.name"], "postgresql")
+      - set(resource.attributes["host.name"], log.attributes["host"]) where log.attributes["host"] != nil
+      - set(resource.attributes["service.namespace"], log.attributes["cluster"]) where log.attributes["cluster"] != nil
+      - set(log.body, log.attributes["message"]) where log.attributes["message"] != nil
+
+  transform/pg_logtap_tcp:
+    error_mode: propagate
+    log_statements:
+      - set(resource.attributes["service.name"], "postgresql")
+      - set(resource.attributes["host.name"], log.attributes["host"]) where log.attributes["host"] != nil
+      - set(resource.attributes["service.namespace"], log.attributes["cluster"]) where log.attributes["cluster"] != nil
+      - set(log.body, log.attributes["message"]) where log.attributes["message"] != nil
+
+  batch/http: {}
+  batch/tcp: {}
+
+exporters:
+  otlp_http/victorialogs:
+    logs_endpoint: http://victorialogs:9428/insert/opentelemetry/v1/logs
+    encoding: proto
+    compression: gzip
+
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs/pg_logtap_http:
+      receivers: [webhook_event/pg_logtap]
+      processors: [memory_limiter, transform/pg_logtap_http, batch/http]
+      exporters: [otlp_http/victorialogs, debug]
+
+    logs/pg_logtap_tcp:
+      receivers: [tcp_log/pg_logtap]
+      processors: [memory_limiter, transform/pg_logtap_tcp, batch/tcp]
+      exporters: [otlp_http/victorialogs, debug]

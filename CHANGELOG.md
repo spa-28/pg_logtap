@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.6.0 (2026-09-30)
+
+### Added
+
+- `export_http_content_type` sets the sender-owned `Content-Type` header on
+  HTTP(S) requests after SIGHUP. The backward-compatible default remains
+  `application/x-ndjson`; the NDJSON body and optional gzip encoding do not
+  change. `application/json` enables direct HTTP ingestion by Fluent Bit
+  4.0.14, including gzipped request bodies, while generic extra headers still
+  reject a conflicting second `Content-Type`.
+- Tested receiver guides and checked-in configurations cover direct Vector and
+  Fluent Bit HTTP/TCP, OpenTelemetry Collector HTTP/TCP with an optional
+  VictoriaLogs downstream, and ClickHouse HTTP/JSONEachRow with request gzip.
+- A tested Fluentd 1.19.3 configuration and reproducible manual stand cover
+  direct HTTP with the default `application/x-ndjson` plus request gzip, and
+  raw TCP with newline-delimited JSON.
+- A tested Grafana Alloy 1.20.1 configuration and reproducible manual stand
+  cover HTTP ingestion of the default uncompressed NDJSON through
+  `loki.source.api`, forwarding to Loki 3.7.8, and downstream query validation.
+
 ## 0.5.2 (2026-09-25)
 
 ### Fixed

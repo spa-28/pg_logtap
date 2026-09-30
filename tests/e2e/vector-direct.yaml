@@ -1,0 +1,38 @@
+data_dir: /var/lib/vector
+
+sources:
+  pg_logtap_http:
+    type: http_server
+    address: 0.0.0.0:8686
+    decoding:
+      codec: json
+    framing:
+      method: newline_delimited
+
+  pg_logtap_tcp:
+    type: socket
+    mode: tcp
+    address: 0.0.0.0:54525
+    decoding:
+      codec: json
+    framing:
+      method: newline_delimited
+
+sinks:
+  http_file:
+    type: file
+    inputs: [pg_logtap_http]
+    path: /var/log/vector/pg-logtap-http.jsonl
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+
+  tcp_file:
+    type: file
+    inputs: [pg_logtap_tcp]
+    path: /var/log/vector/pg-logtap-tcp.jsonl
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited

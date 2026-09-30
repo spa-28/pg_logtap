@@ -1,0 +1,19 @@
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+loki.source.api "pg_logtap" {
+  http {
+    listen_address = "0.0.0.0"
+    listen_port    = 9880
+  }
+
+  labels = {
+    job       = "pg_logtap",
+    transport = "http",
+  }
+
+  forward_to = [loki.write.local.receiver]
+}

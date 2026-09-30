@@ -29,9 +29,9 @@
 #            is the duplicate window this scenario is contractually allowed
 #   phase 9  authenticated https: a receiver demanding a tenant header plus
 #            Authorization answers 401 to every send without them (failed
-#            cycles, nothing accepted) and delivers with the plain
-#            multi-line bearer form (bare \n between lines — normalized on
-#            the wire) and with Basic credentials
+#            cycles, nothing accepted), validates application/json followed
+#            by a SIGHUP reload to the default application/x-ndjson, and
+#            delivers with both bearer and Basic credentials
 #   phase 10 the dribbling peer: one handshake-record byte every 2s while a
 #            repeated worker-SIGHUP storm interrupts readv — every EINTR retry
 #            must re-arm from the absolute deadline, so the first failed cycle
@@ -254,20 +254,38 @@ class HAmbig(H):
 httpd_ambig = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_AMBIG"])), HAmbig)
 httpd_ambig.socket = ctx.wrap_socket(httpd_ambig.socket, server_side=True)
 threading.Thread(target=httpd_ambig.serve_forever, daemon=True).start()
-# Phase 9's gatekeeper: demands a tenant header AND a bearer token (the
-# plain multi-line form — the sender normalizes the bare \n on the wire),
-# or Basic credentials; anything less gets the 401 the exporter treats as
-# a failed send. A rejected request's body is still read before the answer
-# — an unread body turns the server's close into an RST that can discard
-# the 401 status bytes still in flight.
+# Phase 9's gatekeeper: bearer requests name the Content-Type they expect
+# through the tenant marker, while Basic credentials require the default.
+# Anything unauthenticated gets the 401 the exporter treats as a failed send;
+# a valid credential with the wrong sender-owned Content-Type gets 415. Every
+# rejected request's body is still read before the answer — an unread body
+# turns the server's close into an RST that can discard the status bytes.
 BASIC = base64.b64encode(b"pglogtap:s3cret").decode()
 class HAuth(H):
     sink = "auth-out.jsonl"
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         auth = self.headers.get("Authorization", "")
-        if not ((auth == "Bearer e2e-token" and self.headers.get("X-Logtap-E2E") == "t9") or auth == "Basic " + BASIC):
+        tenant = self.headers.get("X-Logtap-E2E", "")
+        expected_type = {
+            "t9-json": "application/json",
+            "t9-default": "application/x-ndjson",
+        }.get(tenant)
+        if auth == "Bearer e2e-token":
+            authenticated = expected_type is not None
+        elif auth == "Basic " + BASIC:
+            authenticated = True
+            expected_type = "application/x-ndjson"
+        else:
+            authenticated = False
+        if not authenticated:
             self.send_response(401)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"no")
+            return
+        if self.headers.get("Content-Type") != expected_type:
+            self.send_response(415)
             self.send_header("Content-Length", "2")
             self.end_headers()
             self.wfile.write(b"no")
@@ -560,32 +578,39 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
 wait_for p8amb "$N" "$OUT"
 echo "phase 8 ok: pre-status close failed the send, body reached the closer ($AMBIG_GOT distinct, the allowed window), all $N replayed whole"
 
-# --- phase 9: authenticated https. The gatekeeper demands a tenant header
-# plus a bearer token — two lines, separated by the two-character \n
-# sequence the docs show (ALTER SYSTEM rejects a value with a real newline,
-# so the escape is the only multi-line form) — and then Basic credentials:
-# the same wire path, the two spellings operators actually type. Without
-# the headers every send eats a 401 (failed cycles, nothing accepted);
-# the parked events flush whole once the header lands.
+# --- phase 9: authenticated https plus sender-owned Content-Type reload. The
+# gatekeeper demands a tenant header AND bearer token — two lines separated by
+# the two-character \n form — and checks application/json first, then the
+# application/x-ndjson default after a second SIGHUP. Basic credentials finish
+# on that restored default. Without headers every send eats a 401 (failed
+# cycles, nothing accepted); the parked events flush whole once auth lands.
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_AUTH/insert/jsonline'" \
   "pg_logtap.export_tls_ca = '$CA_IN_CT'" \
   "pg_logtap.export_tls_server_name = 'localhost'" \
+  "pg_logtap.export_http_content_type = 'application/x-ndjson'" \
   "pg_logtap.export_http_extra_headers = ''"
 gen p9fail "$N"
 sleep 3 # a couple of flush cycles of guaranteed 401s
 FAILED6=$(statf send_cycles_failed)
 [ "$FAILED6" -gt "$FAILED5" ] 2>/dev/null || { echo "e2e-tls: phase 9 expected failed cycles on the 401s, got $FAILED6 (was $FAILED5)"; exit 1; }
 [ "$(received p9fail "$AUTH_OUT")" = 0 ] || { echo "e2e-tls: phase 9 leaked $(received p9fail "$AUTH_OUT") events past the 401 gate"; exit 1; }
-set_gucs "pg_logtap.export_http_extra_headers = 'X-Logtap-E2E: t9\nAuthorization: Bearer e2e-token'"
-gen p9ok "$N"
+set_gucs "pg_logtap.export_http_content_type = 'application/json'" \
+  "pg_logtap.export_http_extra_headers = 'X-Logtap-E2E: t9-json\nAuthorization: Bearer e2e-token'"
+gen p9json "$N"
 wait_for p9fail "$N" "$AUTH_OUT"
-wait_for p9ok "$N" "$AUTH_OUT"
-echo "phase 9 ok: 401 gate ($((FAILED6 - FAILED5)) failed cycles, zero accepted), $N buffered + $N live with the backslash-n separated bearer form"
+wait_for p9json "$N" "$AUTH_OUT"
+echo "phase 9a ok: 401 gate ($((FAILED6 - FAILED5)) failed cycles), then application/json delivered $N buffered + $N live"
+set_gucs "pg_logtap.export_http_content_type = 'application/x-ndjson'" \
+  "pg_logtap.export_http_extra_headers = 'X-Logtap-E2E: t9-default\nAuthorization: Bearer e2e-token'"
+gen p9default "$N"
+wait_for p9default "$N" "$AUTH_OUT"
+echo "phase 9b ok: SIGHUP restored application/x-ndjson and delivered $N/$N"
 set_gucs "pg_logtap.export_http_extra_headers = 'Authorization: Basic $B64'"
 gen p9basic "$N"
 wait_for p9basic "$N" "$AUTH_OUT"
-echo "phase 9b ok: Basic credentials delivered $N/$N"
-set_gucs "pg_logtap.export_http_extra_headers = ''"
+echo "phase 9c ok: Basic credentials delivered $N/$N on the default Content-Type"
+set_gucs "pg_logtap.export_http_extra_headers = ''" \
+  "pg_logtap.export_http_content_type = 'application/x-ndjson'"
 
 # --- phase 10: the dribbling peer — the handshake timeout's worst case. One
 # record byte every 2s, forever: every individual read succeeds inside its
@@ -772,5 +797,5 @@ wait_for p14h 500 "$OUT" 60
 wait_for p14t 500 "$OUT" 60
 echo "phase 14 ok: SIGHUP-interrupted https sendmsg failed in ${TDRIB_FIRST_MS}ms; https+tcps stayed deadline-bounded ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles), all 1000 replayed once repointed"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9ok "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
+echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9fail "$AUTH_OUT")+$(received p9json "$AUTH_OUT")+$(received p9default "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

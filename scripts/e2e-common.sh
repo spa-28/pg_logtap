@@ -82,8 +82,20 @@ fail() {
 }
 ok() { echo "  ok: $*"; }
 
-setguc() { docker exec "$E2E_CT" psql -U postgres -qc "ALTER SYSTEM SET $1 = '$2'" >/dev/null; }
-reload() { docker exec "$E2E_CT" psql -U postgres -qc "SELECT pg_reload_conf()" >/dev/null; }
+guc_name_valid() {
+  case ${1-} in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.]*) return 1 ;;
+  esac
+}
+setguc() { # setguc <name> <value>: psql quotes arbitrary legal string values
+  guc_name_valid "$1" || return 2
+  docker exec -i "$E2E_CT" psql -X -U postgres -v ON_ERROR_STOP=1 \
+    -v "guc=$1" -v "value=$2" >/dev/null <<'SQL'
+SELECT format('ALTER SYSTEM SET %s = %L', :'guc', :'value')
+\gexec
+SQL
+}
+reload() { docker exec "$E2E_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -qc "SELECT pg_reload_conf()" >/dev/null; }
 stats() { docker exec "$E2E_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"; }
 statf() { s=$(stats); v=${s#*"$1"=}; echo "${v%% *}"; }
 
