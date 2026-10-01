@@ -7,6 +7,9 @@
 //! IPv6 literal hosts are not supported (bracket parsing); hostname or IPv4 only.
 const std = @import("std");
 
+pub const host_max: usize = 255;
+pub const http_head_cap: usize = 2048;
+
 pub const Endpoint = struct { host: []const u8, port: u16, tls: bool = false };
 pub const Http = struct { host: []const u8, port: u16, path: []const u8, tls: bool = false };
 
@@ -98,6 +101,16 @@ pub fn writeHeaderLines(w: anytype, val: []const u8) !void {
     }
 }
 
+/// The complete HTTP/1.1 request head. Configuration checks and the sender
+/// both use this function, so a tuple accepted at SET cannot overflow a
+/// different runtime format.
+pub fn writeHttpHead(w: anytype, h: Http, content_type: []const u8, extra_headers: []const u8, gzipped: bool, content_len: usize) !void {
+    try w.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: {s}\r\n", .{ h.path, h.host, h.port, content_type });
+    if (extra_headers.len > 0) try writeHeaderLines(w, extra_headers);
+    if (gzipped) try w.writeAll("Content-Encoding: gzip\r\n");
+    try w.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{content_len});
+}
+
 pub fn parseUrl(url: []const u8) ?Dest {
     if (std.mem.startsWith(u8, url, "http://")) return parseHttp(url["http://".len..], false);
     if (std.mem.startsWith(u8, url, "https://")) return parseHttp(url["https://".len..], true);
@@ -146,7 +159,7 @@ fn parseEndpoint(hostport: []const u8) ?Endpoint {
     if (!cleanAscii(hostport)) return null;
     const colon = std.mem.findScalarLast(u8, hostport, ':') orelse return null;
     const host = hostport[0..colon];
-    if (host.len == 0 or std.mem.findScalar(u8, host, ':') != null) return null; // IPv6 / garbage
+    if (host.len == 0 or host.len > host_max or std.mem.findScalar(u8, host, ':') != null) return null; // IPv6 / garbage
     const port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return null;
     return .{ .host = host, .port = port };
 }
@@ -275,4 +288,61 @@ test "export_http_extra_headers wire form" {
     var writer2 = std.Io.Writer.fixed(&buf);
     try writeHeaderLines(&writer2, "X-Tenant: a\\nAuthorization: Bearer t");
     try std.testing.expectEqualStrings("X-Tenant: a\r\nAuthorization: Bearer t\r\n", writer2.buffered());
+}
+
+test "network host length boundary" {
+    const at_host: [host_max]u8 = @splat('a');
+    const over_host: [host_max + 1]u8 = @splat('a');
+    var buf: [host_max + 16]u8 = undefined;
+
+    const at_http = try std.fmt.bufPrint(&buf, "http://{s}:80", .{&at_host});
+    try std.testing.expect(parseUrl(at_http) != null);
+    const over_http = try std.fmt.bufPrint(&buf, "http://{s}:80", .{&over_host});
+    try std.testing.expect(parseUrl(over_http) == null);
+
+    const at_tcp = try std.fmt.bufPrint(&buf, "tcp://{s}:9", .{&at_host});
+    try std.testing.expect(parseUrl(at_tcp) != null);
+    const over_tcp = try std.fmt.bufPrint(&buf, "tcp://{s}:9", .{&over_host});
+    try std.testing.expect(parseUrl(over_tcp) == null);
+}
+
+test "HTTP request head wire form" {
+    var buf: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    try writeHttpHead(&writer, .{ .host = "receiver", .port = 8686, .path = "/events" }, "application/json", "X-Tenant: a\\nAuthorization: Bearer t", true, 123);
+    try std.testing.expectEqualStrings(
+        "POST /events HTTP/1.1\r\n" ++
+            "Host: receiver:8686\r\n" ++
+            "Content-Type: application/json\r\n" ++
+            "X-Tenant: a\r\n" ++
+            "Authorization: Bearer t\r\n" ++
+            "Content-Encoding: gzip\r\n" ++
+            "Content-Length: 123\r\n" ++
+            "Connection: close\r\n\r\n",
+        writer.buffered(),
+    );
+}
+
+test "HTTP request head exact capacity and overflow" {
+    const http = Http{ .host = "h", .port = 1, .path = "/" };
+    var probe_buf: [http_head_cap]u8 = undefined;
+    var probe = std.Io.Writer.fixed(&probe_buf);
+    try writeHttpHead(&probe, http, "a", "", true, std.math.maxInt(usize));
+
+    const path_len = 1 + http_head_cap - probe.buffered().len;
+    var path_buf: [http_head_cap + 1]u8 = @splat('p');
+    path_buf[0] = '/';
+
+    var exact_buf: [http_head_cap]u8 = undefined;
+    var exact = std.Io.Writer.fixed(&exact_buf);
+    try writeHttpHead(&exact, .{ .host = http.host, .port = http.port, .path = path_buf[0..path_len] }, "a", "", true, std.math.maxInt(usize));
+    try std.testing.expectEqual(http_head_cap, exact.buffered().len);
+
+    var overflow_buf: [http_head_cap]u8 = undefined;
+    var overflow = std.Io.Writer.fixed(&overflow_buf);
+    var overflowed = false;
+    writeHttpHead(&overflow, .{ .host = http.host, .port = http.port, .path = path_buf[0 .. path_len + 1] }, "a", "", true, std.math.maxInt(usize)) catch {
+        overflowed = true;
+    };
+    try std.testing.expect(overflowed);
 }

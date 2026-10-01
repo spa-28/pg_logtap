@@ -75,12 +75,13 @@ var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
 var guc_export_slow_ms: c_int = 250;
 var guc_export_backlog_max: c_int = 65_536;
-/// Receiver liveness probe: set when a live send answered but took at least
-/// export_slow_ms — such a receiver cannot keep up (256 events per slow
-/// round trip), so live batches park on the fallback file instead of piling
-/// up in the RAM backlog and being trimmed. Cleared by a fast send on the
-/// drain path once the receiver recovers.
+/// Set when a send answered but took at least export_slow_ms — such a receiver
+/// cannot keep up (256 events per slow round trip), so live batches park on
+/// the fallback file instead of piling up in the RAM backlog and being
+/// trimmed. Under continuous capture, one oldest queued member is retried at
+/// this monotonic deadline; a fast answer clears both fields.
 var receiver_slow = false;
+var next_slow_probe_us: i64 = 0;
 var guc_metrics_port: c_int = 0;
 var guc_metrics_addr: [*c]u8 = null;
 
@@ -136,6 +137,29 @@ fn netNowUs() i64 {
     return @intCast(@divTrunc(timestamp.nanoseconds, 1000));
 }
 
+/// Update slow-receiver state after one real delivery attempt. A failure only
+/// reschedules an already-slow receiver; ordinary outage handling remains the
+/// fallback/RAM backlog path. Saturating arithmetic keeps extreme configured
+/// timeouts from wrapping the monotonic deadline.
+fn finishReceiverAttempt(started_us: i64, succeeded: bool) void {
+    const finished_us = netNowUs();
+    const duration_us = if (finished_us > started_us) finished_us - started_us else 0;
+    if (guc_export_slow_ms <= 0) {
+        receiver_slow = false;
+        next_slow_probe_us = 0;
+        return;
+    }
+    const slow = succeeded and duration_us >= @as(i64, guc_export_slow_ms) * 1000;
+    if (succeeded and !slow) {
+        receiver_slow = false;
+        next_slow_probe_us = 0;
+        return;
+    }
+    if (!succeeded and !receiver_slow) return;
+    receiver_slow = true;
+    next_slow_probe_us = finished_us +| @max(@as(i64, 1_000_000), duration_us *| 10);
+}
+
 /// Arm an EXPLICIT deadline's remainder on a socket — the per-syscall
 /// re-arm inside writeAll. netArmDeadline below is the stage-boundary
 /// version (the send attempt's global deadline).
@@ -176,7 +200,7 @@ pub fn init() void {
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_http_content_type", "Content-Type value on http(s):// export requests. The default labels the unchanged NDJSON body as application/x-ndjson; set application/json for receivers such as Fluent Bit that require that media type. SIGHUP applies it from the next request. Empty, whitespace-only, control/non-ASCII bytes and values longer than 256 bytes are rejected.", null, &guc_export_http_content_type, "application/x-ndjson", pg.PGC_SIGHUP, 0, checkContentType, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after Host and Content-Type — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte, an empty line or a sender-owned name such as Content-Type is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after Host and Content-Type — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte, an empty line or a sender-owned name such as Content-Type is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Superuser-only because values commonly contain credentials. Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, pg.GUC_SUPERUSER_ONLY, checkHeader, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -237,6 +261,7 @@ pub fn workerMain() void {
             // new destination's batches until a quiet cycle re-probed it.
             // A still-slow receiver re-arms the flag on its next answer.
             receiver_slow = false;
+            next_slow_probe_us = 0;
         }
         // Absorb procsignal barriers (see handleUsr1). Errors here have no
         // better handler than the next cycle — the barrier itself doesn't
@@ -362,10 +387,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // Capture outranks replay: a member send to a slow receiver blocks
             // this loop for hundreds of milliseconds, and at high inflow the
             // ring fills and drops events at capture before the next drain.
-            // While the receiver is slow AND this cycle saw any live inflow,
-            // park-only: fsync and hand the loop back to drainInto; members
-            // resume once inflow quiets or it recovers.
-            if (receiver_slow and drained_total > 0) continue;
+            // Park-only while this cycle sees live inflow, except for one real
+            // oldest-member probe when the monotonic cooldown expires. Quiet
+            // cycles keep replaying without rate limiting.
+            if (receiver_slow and drained_total > 0 and netNowUs() < next_slow_probe_us) break;
             const next = fbq.nextMember(alloc);
             lost += fbq.lost;
             fbq.lost = 0;
@@ -388,13 +413,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 .member => |member| member,
             };
             const gzipped = gzipPayload(alloc, dest, member.body, &gzip_buf);
-            const m_sent_at = pg.GetCurrentTimestamp();
-            if (send(dest, url, gzipped.payload, gzipped.enabled)) {
-                // Drain-path round trip is the receiver liveness probe: a slow
-                // answer re-arms the park (receiver_slow), a fast one clears
-                // it — this also arms it after a restart into a slow receiver
-                // where the live-send probe never ran.
-                if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
+            const attempt_started = netNowUs();
+            const delivered = send(dest, url, gzipped.payload, gzipped.enabled);
+            finishReceiverAttempt(attempt_started, delivered);
+            if (delivered) {
+                // A slow answer re-arms the park and its next probe; a fast one
+                // clears both. This also detects a slow receiver after restart,
+                // where the live-send path may not run first.
                 fbq.logDivert(false);
                 // counted queued at append time; this is its delivery
                 replayed += member.events;
@@ -432,16 +457,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             continue;
         }
         const gzipped = gzipPayload(alloc, dest, chunk.body, &gzip_buf);
-        const sent_at = pg.GetCurrentTimestamp();
-        if (send(dest, url, gzipped.payload, gzipped.enabled)) {
+        const attempt_started = netNowUs();
+        const delivered = send(dest, url, gzipped.payload, gzipped.enabled);
+        finishReceiverAttempt(attempt_started, delivered);
+        if (delivered) {
             fbq.logDivert(false);
             pending.dropFront(chunk.consumed);
             sent += chunk.consumed;
-            // Liveness probe, both ways: an answer this slow cannot keep up
-            // with capture; a fast one clears the park — the live path must
-            // clear it too, or a slow answer with no fallback file set parks
-            // every later batch with no way back.
-            if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000;
         } else if (final) {
             // Send failed during the shutdown flush: without this branch one
             // chunk parked and the rest of the RAM backlog died silently with
@@ -658,13 +680,24 @@ pub fn fileUrlAliasesFallback(url: []const u8, fb_raw: []const u8) bool {
     return std.mem.eql(u8, full, dest_v.file);
 }
 
+/// Render the worst-case runtime head: gzip enabled and the widest possible
+/// Content-Length. The same renderer and fixed cap are used by sendHttp.
+fn httpHeadFits(dest_v: dest_mod.Dest, content_type: []const u8, extra_headers: []const u8) bool {
+    if (dest_v != .http) return true;
+    var buf: [dest_mod.http_head_cap]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    dest_mod.writeHttpHead(&writer, dest_v.http, content_type, extra_headers, true, std.math.maxInt(usize)) catch return false;
+    return true;
+}
+
 /// SET-time check for export_url: the URL must parse (network schemes
 /// reject control bytes and spaces here — the host and path ride the HTTP
 /// request line verbatim, so they must be plain visible ASCII), and a
 /// file:// dest must not name the fallback queue's file (rule on
-/// fileUrlAliasesFallback). guc.c runs this for ALTER SYSTEM (a session SET
-/// is refused before any value check — PGC_SIGHUP); boot
-/// runs '' through here too — empty means "no export worker", not a bad URL.
+/// fileUrlAliasesFallback). HTTP destinations must fit with the current
+/// content type and extra headers. guc.c runs this for ALTER SYSTEM (a session
+/// SET is refused before any value check — PGC_SIGHUP); boot runs '' through
+/// here too — empty means "no export worker", not a bad URL.
 fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
@@ -673,6 +706,7 @@ fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
     if (raw.len == 0) return true;
     const dest_v = dest_mod.parseUrl(raw) orelse return false;
+    if (!httpHeadFits(dest_v, gucSpan(guc_export_http_content_type), gucSpan(guc_export_http_extra_headers))) return false;
     if (dest_v != .file) return true;
     // sendFile's path buffers are 4096 bytes: a longer path used to load
     // fine and then fail every send silently (no reason, no detail) —
@@ -782,19 +816,29 @@ fn checkContentType(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) 
     _ = source;
     const ptr = newval orelse return true;
     const raw_c = ptr.* orelse return true;
-    return dest_mod.contentTypeValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
+    const content_type = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (!dest_mod.contentTypeValid(content_type)) return false;
+    const url = gucSpan(guc_export_url);
+    if (url.len == 0) return true;
+    const dest_v = dest_mod.parseUrl(url) orelse return false;
+    return httpHeadFits(dest_v, content_type, gucSpan(guc_export_http_extra_headers));
 }
 
-/// SET-time CR/LF check for export_http_extra_headers (discipline in export.zig,
-/// unit-tested there): guc.c runs this for ALTER SYSTEM (a session SET is
-/// refused before any value check — PGC_SIGHUP), and boot
-/// runs the default '' through here too (always accepted).
+/// SET-time CR/LF and complete-head check for export_http_extra_headers
+/// (discipline in export.zig, unit-tested there): guc.c runs this for ALTER
+/// SYSTEM (a session SET is refused before any value check — PGC_SIGHUP), and
+/// boot runs the default '' through here too (always accepted).
 fn checkHeader(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
     const ptr = newval orelse return true;
     const raw_c = ptr.* orelse return true;
-    return dest_mod.headerValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
+    const header = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (!dest_mod.headerValid(header)) return false;
+    const url = gucSpan(guc_export_url);
+    if (url.len == 0) return true;
+    const dest_v = dest_mod.parseUrl(url) orelse return false;
+    return httpHeadFits(dest_v, gucSpan(guc_export_http_content_type), header);
 }
 
 // --- oid → name cache (catalog lookups under one short transaction) -----------
@@ -925,18 +969,11 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // Re-arm post-dial: resolution and connect may have spent most of the
     // attempt, so handshake/writes/status read run only on what remains.
     if (!netArmDeadline(conn_fd)) return false;
-    // Fixed headers (method line, Host, content type/encoding/length) run
-    // ~110 bytes; 2048 leaves room for any realistic path, host and auth
-    // header, and one that still does not fit fails the send with the
-    // reason — not a torn header on the wire.
-    var head_buf: [2048]u8 = undefined;
+    // Configuration checks render the same worst-case head into the same cap;
+    // keep this catch as defense in depth against a cross-GUC reload race.
+    var head_buf: [dest_mod.http_head_cap]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    const content_type = gucSpan(guc_export_http_content_type);
-    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: {s}\r\n", .{ h.path, h.host, h.port, content_type }) catch return failSend("head build", 0);
-    const extra_hdr = gucSpan(guc_export_http_extra_headers);
-    if (extra_hdr.len > 0) dest_mod.writeHeaderLines(&head, extra_hdr) catch return failSend("head build", 0);
-    if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
-    head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
+    dest_mod.writeHttpHead(&head, h, gucSpan(guc_export_http_content_type), gucSpan(guc_export_http_extra_headers), gzipped, body.len) catch return failSend("head build", 0);
     if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
     if (!writeAll(conn_fd, head.buffered(), true, net_deadline_us)) return false; // writeAll owns the reason
     if (!writeAll(conn_fd, body, true, net_deadline_us)) return false;
@@ -1135,7 +1172,7 @@ var dns_fail_streak: u32 = 0;
 // that moves to a new IP while dns also fails in-process stays unreachable
 // until the resolver heals or the worker restarts; recreating the receiver
 // recreates the stand, which restarts postgres too.
-var dns_good_host: [255]u8 = undefined;
+var dns_good_host: [dest_mod.host_max]u8 = undefined;
 var dns_good_host_len: usize = 0;
 // When dns_good_addr was cached (µs); 0 = never.
 var dns_good_at_us: i64 = 0;
@@ -1157,11 +1194,11 @@ var dns_good_port: u16 = 0;
 /// the failure mode is the same as a dead receiver (ring absorbs, then
 /// events_lost), never a permanent hang. IP literals skip resolution.
 fn dialTcp(host: []const u8, port: u16) ?c_int {
-    if (host.len >= 256) {
+    if (host.len > dest_mod.host_max) {
         _ = failSend("host too long", 0);
         return null;
     }
-    var host_buf: [256]u8 = undefined;
+    var host_buf: [dest_mod.host_max + 1]u8 = undefined;
     @memcpy(host_buf[0..host.len], host);
     host_buf[host.len] = 0;
     var port_buf: [6]u8 = undefined;

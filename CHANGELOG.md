@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Fixed
+
+- Built-in password masking identifies statement-bearing primary messages by
+  PostgreSQL's untranslated format ID, so translated `lc_messages` output no
+  longer bypasses the cut and application messages resembling English
+  statement prefixes are no longer misclassified.
+- Bind values are masked by PostgreSQL's structural `$N = '...'` payload in
+  translated `DETAIL`/`HINT`/`CONTEXT` fields, including
+  `log_parameter_max_length_on_error` error context.
+- Invalid `pattern`, `pattern_exclude` and `redact_pattern` assignments are
+  rejected before they replace the active compiled expression; ordinary
+  configuration errors no longer disable filtering or redaction.
+- Slow-receiver mode periodically probes the oldest queued member even under
+  continuous capture, so recovery no longer depends on an idle input window.
+- Network hosts longer than 255 bytes and HTTP configurations whose complete
+  rendered request head exceeds 2048 bytes are rejected at configuration time;
+  runtime sending uses the same renderer and limits.
+
+### Security
+
+- `export_http_extra_headers` is superuser-only, hiding bearer tokens and other
+  credentials from ordinary roles. Superusers and trusted settings readers
+  (`pg_read_all_settings`, including `pg_monitor`) can still read it.
+
+### Changed
+
+- The next extension version is `0.6.1`. Updating a historical installation
+  normalizes `pg_logtap_stats_t` and `pg_logtap_delivery` to the fresh-install
+  column order. Noncanonical installations must remove external dependencies
+  and custom object metadata before the update; the transactional migration
+  never uses `CASCADE`, and successful normalization changes the type/view OIDs.
+
 ## 0.6.0 (2026-09-30)
 
 ### Added

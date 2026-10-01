@@ -38,12 +38,66 @@ set -u
 e2e_init robust "${1:-}"
 e2e_gate
 
+echo "== credential header GUC: privileged visibility =="
+plain_role="lt_hdr_plain_$$"
+reader_role="lt_hdr_reader_$$"
+monitor_role="lt_hdr_monitor_$$"
+dummy_header="Authorization: Bearer robust$SUF"
+docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -qc "
+  CREATE ROLE $plain_role LOGIN;
+  CREATE ROLE $reader_role LOGIN;
+  CREATE ROLE $monitor_role LOGIN;
+  GRANT pg_read_all_settings TO $reader_role;
+  GRANT pg_monitor TO $monitor_role;" >/dev/null
+setguc pg_logtap.export_http_extra_headers "$dummy_header"; reload; sleep 1
+super_value=$(docker exec "$PG_CT" psql -X -U postgres -Atc \
+  "SHOW pg_logtap.export_http_extra_headers")
+[ "$super_value" = "$dummy_header" ] \
+  || fail "credential header GUC: superuser could not read configured value"
+role=$plain_role
+  if docker exec "$PG_CT" psql -X -U "$role" -d postgres -v ON_ERROR_STOP=1 -Atc \
+    "SHOW pg_logtap.export_http_extra_headers" >/dev/null 2>&1; then
+    fail "credential header GUC: ordinary role can SHOW the value"
+  fi
+  if docker exec "$PG_CT" psql -X -U "$role" -d postgres -v ON_ERROR_STOP=1 -Atc \
+    "SELECT current_setting('pg_logtap.export_http_extra_headers')" >/dev/null 2>&1; then
+    fail "credential header GUC: ordinary role can use current_setting"
+  fi
+  rows=$(docker exec "$PG_CT" psql -X -U "$role" -d postgres -Atc \
+    "SELECT count(*) FROM pg_settings WHERE name = 'pg_logtap.export_http_extra_headers'")
+  [ "$rows" = 0 ] || fail "credential header GUC: ordinary role can see pg_settings row"
+  if docker exec "$PG_CT" psql -X -U "$role" -d postgres -v ON_ERROR_STOP=1 -qc \
+    "ALTER ROLE $role SET pg_logtap.export_http_extra_headers = 'X-Test: changed'" \
+    >/dev/null 2>&1; then
+    fail "credential header GUC: ordinary role can change the value"
+  fi
+for role in "$reader_role" "$monitor_role"; do
+  visible=$(docker exec "$PG_CT" psql -X -U "$role" -d postgres -Atc \
+    "SELECT current_setting('pg_logtap.export_http_extra_headers') = '$dummy_header'")
+  [ "$visible" = t ] || fail "credential header GUC: trusted settings reader cannot read value"
+  rows=$(docker exec "$PG_CT" psql -X -U "$role" -d postgres -Atc \
+    "SELECT count(*) FROM pg_settings WHERE name = 'pg_logtap.export_http_extra_headers'")
+  [ "$rows" = 1 ] || fail "credential header GUC: trusted settings reader cannot see pg_settings row"
+  if docker exec "$PG_CT" psql -X -U "$role" -d postgres -v ON_ERROR_STOP=1 -qc \
+    "ALTER ROLE $role SET pg_logtap.export_http_extra_headers = 'X-Test: changed'" \
+    >/dev/null 2>&1; then
+    fail "credential header GUC: read privilege also granted write privilege"
+  fi
+done
+setguc pg_logtap.export_http_extra_headers ''; reload
+docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -qc "
+  REVOKE pg_read_all_settings FROM $reader_role;
+  REVOKE pg_monitor FROM $monitor_role;
+  DROP ROLE $plain_role, $reader_role, $monitor_role;" >/dev/null
+ok "ordinary roles cannot read/change credentials; pg_read_all_settings and pg_monitor remain read-only"
+
 echo "== huge fields: message and detail past their ring slots =="
 # Reset every GUC a previous (possibly failed) run may have left armed — the
 # scenarios below set their own; a leftover redact_pattern or field_query
 # changes what this one must observe.
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''
-setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+setguc pg_logtap.level_min 15; setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 # A previous run may have left the ring full of undrained backlog; markers
 # emitted into a full ring are dropped at emit (counted, never delivered)
 # and the first scenario would time out on them. Also fires on a freshly
@@ -198,16 +252,68 @@ docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" 
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
 
-# An invalid redact_pattern fails OPEN (the layer turns off, logs flow) — the
-# only durable signal is the redact_pattern_failed gauge, probed both ways.
-# Empty pattern after reset is "layer off", not a failure: the flag reads 0.
-setguc pg_logtap.redact_pattern '[unclosed'; reload; sleep 1
-[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid redact_pattern did not set redact_pattern_failed=1"
-setguc pg_logtap.redact_pattern '(SECRET).*(\1)'; reload; sleep 1
-[ "$(statf redact_pattern_failed)" = 1 ] || fail "backref redact_pattern did not set redact_pattern_failed=1"
+echo "== regex GUCs: invalid replacements preserve active expressions =="
+raw_count() { grep -F -c "$1" "$OUT/vector-out.jsonl" 2>/dev/null || true; }
+wait_raw() {
+  needle=$1; n=0
+  while [ "$n" -lt 20 ]; do
+    [ "$(raw_count "$needle")" -ge 1 ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "regex GUCs: receiver never saw $needle"
+}
+reject_regex() { # reject_regex <guc> <bad value> <active value>
+  if setguc "$1" "$2" 2>/dev/null; then
+    fail "$1 accepted invalid regex"
+  fi
+  current=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW $1")
+  [ "$current" = "$3" ] || fail "$1 changed after rejected regex"
+  [ "$(statf redact_pattern_failed)" = 0 ] \
+    || fail "$1 rejection changed redact_pattern_failed"
+}
+
+include_re="^RXINC$SUF [0-9]+$"
+setguc pg_logtap.pattern "$include_re"; reload; sleep 1
+reject_regex pg_logtap.pattern '[unclosed' "$include_re"
+reject_regex pg_logtap.pattern '(RX).*(\1)' "$include_re"
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'RXINC$SUF %', 2;
+  RAISE WARNING 'RXMISS$SUF %', 2;
+END \$\$" >/dev/null 2>&1
+wait_raw "RXINC$SUF 2"
+[ "$(raw_count "RXMISS$SUF 2")" = 0 ] \
+  || fail "pg_logtap.pattern stopped filtering after rejected replacement"
+
+setguc pg_logtap.pattern ''; setguc pg_logtap.pattern_exclude "RXBLOCK$SUF"; reload; sleep 1
+reject_regex pg_logtap.pattern_exclude '[unclosed' "RXBLOCK$SUF"
+reject_regex pg_logtap.pattern_exclude '(RX).*(\1)' "RXBLOCK$SUF"
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'RXBLOCK$SUF 2';
+  RAISE WARNING 'RXPASS$SUF 2';
+END \$\$" >/dev/null 2>&1
+wait_raw "RXPASS$SUF 2"
+[ "$(raw_count "RXBLOCK$SUF 2")" = 0 ] \
+  || fail "pg_logtap.pattern_exclude stopped filtering after rejected replacement"
+
+redact_re="RXSECRET$SUF-[0-9]+"
+setguc pg_logtap.pattern_exclude ''; setguc pg_logtap.redact_pattern "$redact_re"; reload; sleep 1
+reject_regex pg_logtap.redact_pattern '[unclosed' "$redact_re"
+reject_regex pg_logtap.redact_pattern '(RX).*(\1)' "$redact_re"
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN
+  RAISE WARNING 'RXRED$SUF 2 RXSECRET$SUF-2';
+END \$\$" >/dev/null 2>&1
+wait_raw "RXRED$SUF 2"
+red_line=$(grep -F "RXRED$SUF 2" "$OUT/vector-out.jsonl" | tail -1)
+printf '%s' "$red_line" | grep -q '<REDACTED>' \
+  || fail "pg_logtap.redact_pattern stopped masking after rejected replacement"
+printf '%s' "$red_line" | grep -F -q "RXSECRET$SUF-2" \
+  && fail "pg_logtap.redact_pattern exposed a secret after rejected replacement"
+[ "$(statf redact_pattern_failed)" = 0 ] \
+  || fail "ordinary rejected regex set redact_pattern_failed"
 setguc pg_logtap.redact_pattern ''; reload; sleep 1
-[ "$(statf redact_pattern_failed)" = 0 ] || fail "pattern reset did not clear redact_pattern_failed"
-ok "redact_pattern_failed: invalid/backref pattern → 1, reset → 0 (fail-open is visible)"
+[ "$(statf redact_pattern_failed)" = 0 ] \
+  || fail "successful regex reset did not clear redact_pattern_failed"
+ok "all regex GUCs reject syntax/backreferences and retain active behavior"
 
 # Extended protocol (JDBC, psycopg, pgbench -M extended): duration lines for
 # parse/bind/execute carry the raw SQL WITHOUT the "statement: " marker — the
@@ -244,15 +350,13 @@ EOF
 setguc log_min_duration_statement -1; reload
 ok "extended-protocol parse/execute duration lines get the password cut"
 
-# Bind parameters: with log_parameter_max_length the server puts the actual
-# values into DETAIL ("parameters: $1 = '...'") on statement lines — the SQL
-# carries only $N placeholders, so the token cut cannot see the secret. The
-# bind-value layer masks every quoted value on that line. psql \bind is psql
-# 16+; PG15 gets the same contract through pgbench -M extended (client
-# variables leave as real bind parameters). The DETAIL prefix is
-# lower-case on PG15/16 ("parameters:"), capitalised on PG17+ — asserts
-# accept both shapes.
-setguc log_min_duration_statement 0; setguc log_parameter_max_length 100; reload; sleep 1
+# Bind parameters: statement logging puts values in a translated DETAIL
+# wrapper, while execution errors put them in a translated CONTEXT wrapper
+# when log_parameter_max_length_on_error is set. The shared `$N = 'value'`
+# payload must be masked in both. psql \bind is psql 16+; PG15 drives the same
+# extended-protocol paths through pgbench -M extended.
+setguc log_min_duration_statement 0; setguc log_parameter_max_length 100
+setguc log_parameter_max_length_on_error 100; reload; sleep 1
 vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
 if [ "$vnum" -ge 160000 ]; then
   # -i: without it docker exec does not forward stdin, psql reads an empty
@@ -283,6 +387,12 @@ for line in whole.splitlines():
         assert "SECRET" not in d and "pw" not in d, d
         saw += 1
 assert saw > 0, "no bind-parameter detail lines reached the receiver"
+EOF
+  # Bind succeeds, then division by zero fails during Execute. PostgreSQL adds
+  # every saved bind value to CONTEXT on this error path.
+  docker exec -e "PGAPPNAME=logtap-ctx$SUF" -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF
+SELECT 'ctxmarker$SUF' AS tag, \$1::text, 1 / \$2::int \bind 'SECRET-ctx$SUF-uvw456' '0'
+\g
 EOF
 else
   # PG15: no psql \bind — drive extended protocol with pgbench. -f script
@@ -316,9 +426,36 @@ for line in whole.splitlines():
         saw += 1
 assert saw > 0, "no bind-parameter detail lines reached the receiver"
 EOF
+  docker exec "$PG_CT" sh -c "cat > /tmp/p15ctx.sql <<EOF
+SELECT 'ctxmarker$SUF' AS tag, :secret::text, 1 / :zero::int;
+EOF"
+  docker exec "$PG_CT" pgbench -U postgres -M extended -t 1 -c 1 \
+    -f /tmp/p15ctx.sql -D "secret=SECRET-ctx$SUF-uvw456" -D zero=0 \
+    "dbname=postgres application_name=logtap-ctx$SUF" >/dev/null 2>&1
+  docker exec "$PG_CT" rm -f /tmp/p15ctx.sql
 fi
-setguc log_min_duration_statement -1; setguc log_parameter_max_length -1; reload
-ok "bind-parameter values masked on the parameters line"
+n=0; while [ "$n" -lt 20 ]; do
+  [ "$(grep -c "\"app\":\"logtap-ctx$SUF\"" "$OUT/vector-out.jsonl")" -gt 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: error-context bind values masked"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+whole = open(path, encoding="utf-8").read()
+secret = "SECRET-ctx" + suf + "-uvw456"
+assert secret not in whole, "bind value reached the receiver via CONTEXT"
+app = "logtap-ctx" + suf
+contexts = []
+for line in whole.splitlines():
+    e = json.loads(line)
+    if e.get("app") == app and e.get("context"):
+        contexts.append(e["context"])
+assert contexts, "no extended-protocol error CONTEXT reached the receiver"
+assert any("$1 = <REDACTED>" in c and "$2 = <REDACTED>" in c for c in contexts), contexts
+EOF
+setguc log_min_duration_statement -1; setguc log_parameter_max_length -1
+setguc log_parameter_max_length_on_error 0; reload
+ok "bind-parameter values masked in translated DETAIL and error CONTEXT wrappers"
 
 # pattern_exclude matches the whole event text, not just the message: the
 # token rides DETAIL (where RAISE ... USING DETAIL puts it) — the event must
@@ -465,8 +602,9 @@ echo "== redact gauge assign under live lock traffic =="
 # reload, and the gauge update takes the ring LWLock — contended there, it
 # would PANIC ("cannot wait without a PGPROC structure") and take the whole
 # cluster down. The capture-side MyProc gate must keep the postmaster off the
-# lock; the window needs live lock traffic to matter, so flip an invalid
-# pattern through several reloads while backends push logged statements. Runs
+# lock; the window needs live lock traffic to matter, so flip valid patterns
+# through several reloads while backends push logged statements. Invalid
+# patterns never reach assign now — their rejection is covered above. Runs
 # AFTER the memory-peak assert on purpose: statement-rate logging at the
 # default backlog depth is what that assert exists to forbid.
 # Backlog is still clamped to 8192 by the scenario above, so the burst's RAM
@@ -476,14 +614,14 @@ docker exec "$PG_CT" sh -c "printf '%s\n' 'SELECT 1;' > /tmp/probe-load$SUF.sql"
 docker exec -d "$PG_CT" pgbench -U postgres -c 4 -T 12 -f "/tmp/probe-load$SUF.sql" postgres
 flip=0
 while [ "$flip" -lt 8 ]; do
-  setguc pg_logtap.redact_pattern "[reload-under-load-$flip"
+  setguc pg_logtap.redact_pattern "reload-under-load-$flip"
   reload; sleep 1
   flip=$((flip + 1))
 done
 docker exec "$PG_CT" psql -U postgres -qc "SELECT 1" >/dev/null 2>&1 || fail "redact_pattern reload under load crashed the server"
-[ "$(statf redact_pattern_failed)" = 1 ] || fail "invalid pattern under load did not set redact_pattern_failed=1"
+[ "$(statf redact_pattern_failed)" = 0 ] || fail "valid pattern under load set redact_pattern_failed"
 setguc pg_logtap.redact_pattern ''; setguc log_min_duration_statement -1; reload; sleep 1
-ok "redact_pattern reloaded 8x under pgbench statement load: postmaster survived, gauge set"
+ok "redact_pattern reloaded 8x under pgbench statement load: postmaster survived, gauge clear"
 
 echo "== fragmented HTTP status: the line straddles recvs =="
 # TCP owes the sender no message boundaries: a receiver whose "HTTP/1.1 200"

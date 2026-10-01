@@ -92,4 +92,21 @@ healthz=$(docker exec "$PG_CT" bash -c \
   2>/dev/null)
 
 echo "first_failed_ms=$elapsed_ms failed_cycles=$fail queued=$que dropped=$drp lost=$lost healthz=${healthz:-none}"
-[ "$fail" -ge 1 ] && [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ]
+[ "$fail" -ge 1 ] && [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ] \
+  || fail "silent receiver: timeout, parking or healthz assertion failed"
+
+# Drain this queue before a later suite selects another fallback path: lifecycle
+# counters still include events left in the old file after a path switch.
+setguc pg_logtap.export_url "http://$VEC:8686" || fail "silent receiver: could not restore receiver"
+reload || fail "silent receiver: recovery reload failed"
+n=0
+while [ "$n" -lt 30 ]; do
+  [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] \
+  || fail "silent receiver: queue did not drain after receiver recovery"
+setguc pg_logtap.export_fallback_file '' || fail "silent receiver: could not disable fallback"
+setguc pg_logtap.export_timeout_ms 5000 || fail "silent receiver: could not restore timeout"
+setguc pg_logtap.metrics_port 0 || fail "silent receiver: could not disable metrics"
+reload || fail "silent receiver: cleanup reload failed"

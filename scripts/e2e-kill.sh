@@ -55,6 +55,83 @@ set -u
 e2e_init kill "${1:-}"
 e2e_gate
 
+echo "== transport configuration boundaries =="
+host255=$(python3 -c 'print("h" * 255)')
+host256=$(python3 -c 'print("h" * 256)')
+url255="http://$host255:8686"
+url256="http://$host256:8686"
+baseline_url="http://$VEC:8686"
+setguc pg_logtap.export_http_content_type 'application/x-ndjson'
+setguc pg_logtap.export_http_extra_headers ''
+setguc pg_logtap.export_url "$baseline_url"; reload; sleep 1
+setguc pg_logtap.export_url "$url255" \
+  || fail "transport validation: 255-byte host was rejected"
+# Do not reload the deliberately unresolvable boundary hostname; overwrite its
+# pending auto.conf value with the working receiver first.
+setguc pg_logtap.export_url "$baseline_url"
+if setguc pg_logtap.export_url "$url256" 2>/dev/null; then
+  fail "transport validation: 256-byte host was accepted"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url" ] \
+  || fail "transport validation: rejected host replaced the active URL"
+
+keep_header='X-Keep: yes'
+long_path="/$(python3 -c 'print("p" * 1600)')"
+wide_type=$(python3 -c 'print("a" * 256)')
+mid_header="X-Fill: $(python3 -c 'print("a" * 250)')"
+wide_header="X-Fill: $(python3 -c 'print("a" * 292)')"
+setguc pg_logtap.export_http_extra_headers "$keep_header"
+setguc pg_logtap.export_url "$baseline_url$long_path"
+setguc pg_logtap.export_http_content_type "$wide_type"
+reload; sleep 1
+if setguc pg_logtap.export_http_extra_headers "$wide_header" 2>/dev/null; then
+  fail "transport validation: HTTP head larger than 2048 bytes was accepted"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url$long_path" ] \
+  || fail "transport validation: rejected head changed export_url"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_content_type")" = "$wide_type" ] \
+  || fail "transport validation: rejected head changed content type"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_extra_headers")" = "$keep_header" ] \
+  || fail "transport validation: rejected head changed extra headers"
+
+# Exercise the same aggregate-head guard through each candidate callback, not
+# only through export_http_extra_headers.
+setguc pg_logtap.export_url "$baseline_url" \
+  || fail "transport validation: could not stage URL candidate baseline"
+reload
+setguc pg_logtap.export_http_content_type "$wide_type" \
+  || fail "transport validation: could not stage wide content type"
+setguc pg_logtap.export_http_extra_headers "$wide_header" \
+  || fail "transport validation: could not stage wide extra header"
+reload; sleep 1
+if setguc pg_logtap.export_url "$baseline_url$long_path" 2>/dev/null; then
+  fail "transport validation: URL candidate made the HTTP head exceed 2048 bytes"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url" ] \
+  || fail "transport validation: rejected URL candidate replaced the active URL"
+
+setguc pg_logtap.export_http_content_type 'application/x-ndjson' \
+  || fail "transport validation: could not stage content-type baseline"
+setguc pg_logtap.export_http_extra_headers '' \
+  || fail "transport validation: could not clear extra headers"
+reload
+setguc pg_logtap.export_url "$baseline_url$long_path" \
+  || fail "transport validation: could not stage long URL"
+reload
+setguc pg_logtap.export_http_extra_headers "$mid_header" \
+  || fail "transport validation: could not stage medium extra header"
+reload; sleep 1
+if setguc pg_logtap.export_http_content_type "$wide_type" 2>/dev/null; then
+  fail "transport validation: content-type candidate made the HTTP head exceed 2048 bytes"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_content_type")" = 'application/x-ndjson' ] \
+  || fail "transport validation: rejected content type replaced the active value"
+
+setguc pg_logtap.export_url "$baseline_url"
+setguc pg_logtap.export_http_content_type 'application/x-ndjson'
+setguc pg_logtap.export_http_extra_headers ''; reload; sleep 1
+ok "255-byte host and near-cap head accepted; oversized host and URL/header/content-type tuples rejected"
+
 # Ground truth on the receiver name at failure time: a fresh glibc lookup
 # (what the bash probe uses) vs the worker's wedged one, plus the container's
 # actual network registration — repeated, because the wedge sets in AFTER a

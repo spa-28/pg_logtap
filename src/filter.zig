@@ -241,47 +241,48 @@ fn findWord(hay: []const u8, word: []const u8) ?usize {
 /// changed nothing) and whether it had to clip at the scratch size.
 pub const Masked = struct { text: []const u8, clipped: bool };
 
-/// True when the message line is statement-embedded SQL: the simple-protocol
-/// `statement: ` marker, or an extended-protocol phase line — postgres.c logs
-/// `parse <name>: <sql>`, `bind <name>...`, `execute <name>: <sql>` WITHOUT
-/// the "statement: " marker, each optionally behind a `duration: N ms  `
-/// prefix (log_min_duration_statement). The password cut is gated on this:
-/// an ordinary message merely mentioning a word stays verbatim.
-pub fn stmtLine(msg: []const u8) bool {
-    if (std.mem.find(u8, msg, "statement: ") != null) return true;
-    var rest = msg;
-    if (std.mem.startsWith(u8, rest, "duration: ")) {
-        rest = rest["duration: ".len..];
-        var num_len: usize = 0;
-        while (num_len < rest.len and (std.ascii.isDigit(rest[num_len]) or rest[num_len] == '.')) : (num_len += 1) {}
-        if (!std.mem.startsWith(u8, rest[num_len..], " ms  ")) return false;
-        rest = rest[num_len + " ms  ".len ..];
-    }
-    return std.mem.startsWith(u8, rest, "parse ") or
-        std.mem.startsWith(u8, rest, "bind ") or
-        std.mem.startsWith(u8, rest, "execute ");
+/// True only for PostgreSQL primary-message format IDs that embed SQL. The
+/// rendered message is translated and formatted, so classifying that text
+/// would make the always-on password cut depend on lc_messages and would also
+/// mistake application prose for a server statement line.
+pub fn statementMessageId(message_id: []const u8) bool {
+    const ids = [_][]const u8{
+        "statement: %s",
+        "duration: %s ms  statement: %s",
+        "parse %s: %s",
+        "duration: %s ms  parse %s: %s",
+        "duration: %s ms  bind %s%s%s: %s",
+        "%s %s%s%s: %s",
+        "duration: %s ms  %s %s%s%s: %s",
+    };
+    for (ids) |id| if (std.mem.eql(u8, message_id, id)) return true;
+    return false;
 }
 
-test "statement-embedded SQL markers, simple and extended protocol" {
-    // simple protocol
-    try std.testing.expect(stmtLine("statement: SELECT 1"));
-    try std.testing.expect(stmtLine("duration: 3.2 ms  statement: SELECT 1"));
-    // extended protocol (JDBC/psycopg/pgbench -M extended): phase lines
-    // carry the raw SQL without the "statement: " marker
-    try std.testing.expect(stmtLine("parse stmt_1: SELECT $1"));
-    try std.testing.expect(stmtLine("bind sd_1 to stmt_1"));
-    try std.testing.expect(stmtLine("execute S_1: SELECT $1"));
-    try std.testing.expect(stmtLine("duration: 1.2 ms  execute S_1: SELECT $1"));
-    try std.testing.expect(stmtLine("duration: 0.4 ms  parse sd_1: ALTER ROLE a PASSWORD 'x'"));
-    // ordinary lines that merely contain the words: verbatim
-    try std.testing.expect(!stmtLine("executor slow today"));
-    try std.testing.expect(!stmtLine("parser recovered"));
-    try std.testing.expect(!stmtLine("duration of the outage: parse errors"));
-    try std.testing.expect(!stmtLine("parsed the config"));
-    // a message literally starting with a phase verb is treated as a
-    // statement line: the gate errs toward cutting (over-redaction), and the
-    // cut itself still needs a standalone password token to change anything
-    try std.testing.expect(stmtLine("bind variable count"));
+test "statement-embedded SQL primary message IDs" {
+    const accepted = [_][]const u8{
+        "statement: %s",
+        "duration: %s ms  statement: %s",
+        "parse %s: %s",
+        "duration: %s ms  parse %s: %s",
+        "duration: %s ms  bind %s%s%s: %s",
+        "%s %s%s%s: %s",
+        "duration: %s ms  %s %s%s%s: %s",
+    };
+    for (accepted) |id| try std.testing.expect(statementMessageId(id));
+
+    const rejected = [_][]const u8{
+        "",
+        "%s",
+        "duration: %s ms",
+        "bind %s to %s",
+        "statement: %s ",
+        "statement: SELECT 1",
+        "duration: 3.2 ms  statement: SELECT 1",
+        "оператор: SELECT 1",
+        "bind password 'x'",
+    };
+    for (rejected) |id| try std.testing.expect(!statementMessageId(id));
 }
 
 /// Everything from the end of a standalone `password` token on is dropped and
@@ -339,48 +340,42 @@ pub fn redactPasswordValue(dst: []u8, src: []const u8) Masked {
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
-/// Bind-parameter values ride in DETAIL as `Parameters: $1 = '...'` (put
-/// there by log_parameter_max_length — the errdetail shape in
-/// exec_bind_message/exec_execute_message) — the statement text carries
-/// only the $N placeholders, so the password token cut cannot see the secret.
-/// PG15/16 spell the prefix lower-case (`parameters:`), PG17+ capitalised
-/// it; both are ours to mask. On that one line shape every single-quoted
-/// value ('' inside is an escaped quote, not the end) becomes <REDACTED>;
-/// pgaudit parity — it does not log parameter values at all. Any other
-/// detail returns src untouched: text we do not recognize is not ours to
-/// rewrite. The values stay in the server's own log; only the export is
-/// masked.
+/// PostgreSQL formats bind values inside translated DETAIL/CONTEXT wrappers
+/// as `$N = 'value'`. The wrapper is locale-dependent; this payload grammar
+/// is not. Mask only exact numbered, quoted assignments, preserving NULL and
+/// all surrounding diagnostics. A started but unterminated quoted value is
+/// masked through the end because PostgreSQL may have length-capped it.
 pub fn redactParamValues(dst: []u8, src: []const u8) Masked {
-    const pfx_upper = "Parameters: ";
-    const pfx = if (std.mem.startsWith(u8, src, pfx_upper))
-        pfx_upper
-    else if (std.mem.startsWith(u8, src, "parameters: "))
-        "parameters: "[0..pfx_upper.len]
-    else
-        return .{ .text = src, .clipped = false };
     var clipped = false;
-    var out_len = put(dst, src[0..pfx.len], &clipped);
-    var pos = pfx.len;
-    while (pos < src.len) {
-        if (src[pos] != '\'') { // between values: `$1 = `, `, ` — verbatim
-            var end = pos;
-            while (end < src.len and src[end] != '\'') end += 1;
-            out_len += put(dst[out_len..], src[pos..end], &clipped);
-            pos = end;
+    var out_len: usize = 0;
+    var scan: usize = 0;
+    var search: usize = 0;
+    var masked_any = false;
+    while (search < src.len) {
+        const param_at = search + (std.mem.findScalar(u8, src[search..], '$') orelse break);
+        var value_at = param_at + 1;
+        while (value_at < src.len and std.ascii.isDigit(src[value_at])) value_at += 1;
+        if (value_at == param_at + 1 or !std.mem.startsWith(u8, src[value_at..], " = '")) {
+            search = param_at + 1;
             continue;
         }
-        // quoted value: a lone ' ends it, '' is an escaped quote inside it
-        var end = pos + 1;
-        while (end < src.len) {
-            if (src[end] != '\'') {
-                end += 1;
-            } else if (end + 1 < src.len and src[end + 1] == '\'') {
-                end += 2;
+        value_at += " = ".len; // opening quote
+        var value_end = value_at + 1;
+        while (value_end < src.len) {
+            if (src[value_end] != '\'') {
+                value_end += 1;
+            } else if (value_end + 1 < src.len and src[value_end + 1] == '\'') {
+                value_end += 2;
             } else break;
         }
+        out_len += put(dst[out_len..], src[scan..value_at], &clipped);
         out_len += put(dst[out_len..], redacted, &clipped);
-        pos = if (end < src.len) end + 1 else src.len; // unterminated tail: masked, done
+        masked_any = true;
+        scan = if (value_end < src.len) value_end + 1 else src.len;
+        search = scan;
     }
+    if (!masked_any) return .{ .text = src, .clipped = false };
+    if (scan < src.len) out_len += put(dst[out_len..], src[scan..], &clipped);
     return .{ .text = dst[0..out_len], .clipped = clipped };
 }
 
@@ -477,35 +472,42 @@ test "password assignment values masked, diagnostics survive" {
     try std.testing.expect(redactPasswordValue(&buf, underscored).text.ptr == underscored.ptr);
 }
 
-test "bind-parameter values masked on the Parameters line" {
-    var buf: [128]u8 = undefined;
+test "bind-parameter values masked inside localized wrappers" {
+    var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "Parameters: $1 = <REDACTED>, $2 = <REDACTED>",
-        redactParamValues(&buf, "Parameters: $1 = 'hunter2', $2 = '42'").text,
+        "Paramètres : $1 = <REDACTED>, $2 = NULL, $3 = <REDACTED>",
+        redactParamValues(&buf, "Paramètres : $1 = 'secret', $2 = NULL, $3 = '42'").text,
     );
-    // '' inside a value is an escaped quote, not the terminator
     try std.testing.expectEqualStrings(
-        "Parameters: $1 = <REDACTED>",
-        redactParamValues(&buf, "Parameters: $1 = 'o''brien''s'").text,
+        "Параметры: $1 = <REDACTED>",
+        redactParamValues(&buf, "Параметры: $1 = 'пароль'").text,
     );
-    // empty value still masked; unterminated tail (length-capped log) too
-    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = ''").text);
+    try std.testing.expectEqualStrings(
+        "L'utilisateur a fourni $1 = <REDACTED>.",
+        redactParamValues(&buf, "L'utilisateur a fourni $1 = 'o''brien'.").text,
+    );
+    try std.testing.expectEqualStrings("値: $1 = <REDACTED>", redactParamValues(&buf, "値: $1 = ''").text);
     try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'trunc").text);
-    // a value containing the word password rides the same mask
-    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&buf, "Parameters: $1 = 'password x'").text);
-    // PG15/16 spell the prefix lower-case — same line, same mask
-    try std.testing.expectEqualStrings(
-        "parameters: $1 = <REDACTED>",
-        redactParamValues(&buf, "parameters: $1 = 'hunter2'").text,
-    );
-    // the gate is the exact errdetail shape: any other detail is not ours
-    // to rewrite
-    const foreign = "parameters $1 was 'x' and other detail text";
-    try std.testing.expect(redactParamValues(&buf, foreign).text.ptr == foreign.ptr);
-    try std.testing.expect(!redactParamValues(&buf, foreign).clipped);
-    // a mask run longer than the scratch clips at a UTF-8 boundary and reports
+
+    const unchanged = [_][]const u8{
+        "parameters $1 was 'x'",
+        "$x = 'x'",
+        "$ = 'x'",
+        "$1='x'",
+        "$1  = 'x'",
+        "$1 =  'x'",
+        "$1 = E'x'",
+        "$1 = NULL",
+        "ordinary 'quoted' prose",
+    };
+    for (unchanged) |text| {
+        const masked = redactParamValues(&buf, text);
+        try std.testing.expect(masked.text.ptr == text.ptr);
+        try std.testing.expect(!masked.clipped);
+    }
+
     var small: [26]u8 = undefined;
-    const clipped = redactParamValues(&small, "Parameters: $1 = 'aaaaéééééééé'");
+    const clipped = redactParamValues(&small, "Параметры: $1 = 'aaaaéééééééé'");
     try std.testing.expect(clipped.clipped);
     try std.testing.expect(std.unicode.utf8ValidateSlice(clipped.text));
 }

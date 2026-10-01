@@ -110,8 +110,8 @@ pub const ShmState = extern struct {
     /// not on postmaster death); the WARNING is edge-triggered, this counter
     /// is not — it is the alertable signal of a dying disk.
     fb_sync_failures: u64 = 0,
-    /// 1 = pg_logtap.redact_pattern did not compile; that redaction layer is
-    /// OFF (fail-open) until the pattern is fixed.
+    /// 1 = pg_logtap.redact_pattern unexpectedly failed assign-time compilation;
+    /// the previous compiled redactor remains active, if one existed.
     redact_pattern_failed: u8 = 0,
     /// Operator-facing WARNING/LOG lines the extension emitted, cumulative
     /// per kind — the log lines are edge-triggered (once per worker life or

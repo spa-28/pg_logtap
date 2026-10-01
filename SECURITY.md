@@ -10,18 +10,29 @@ covers the stance by design): keep it on loopback or a closed network.
 ## Redaction is best-effort and errs toward masking too much
 
 The redaction layers (the always-on password-token cut, the bind-parameter
-value cut, `redact_pattern`) run over message, detail, hint, context and the
-captured query. They are a leakage *reduction*, not a guarantee — a
-determined writer can evade any pattern. Where a layer has to guess, it
-guesses toward over-redaction: a value that merely looks like `password =
-…` in a DETAIL line is masked whole, and an event is flagged `clipped` when
-*any* layer clipped its text (re-running the other layers on an already
-clipped text would over-mask, so the flag is ORed across layers). Accept
-that non-secret text will sometimes ship as `<REDACTED>`; audit receivers
-against raw server logs, not against the export. One layer fails open: a
-`redact_pattern` that does not compile, or uses a rejected backreference
-(`\1`…`\9`), disables only that layer (server-log WARNING plus the
-`pg_logtap_redact_pattern_failed` gauge) while the always-on cuts keep working.
+value cut, `redact_pattern`) run before the ring, fallback queue and receiver.
+They are a leakage *reduction*, not a guarantee — a determined writer can
+still evade text matching. Statement provenance uses PostgreSQL's
+untranslated primary format ID, while the exported message stays localized;
+`lc_messages` therefore does not decide whether the built-in password cut
+runs. Translated auxiliary wrappers are preserved, but every exact `$N =
+'quoted value'` shape in DETAIL/HINT/CONTEXT is masked. This deliberately
+also over-masks application text with that shape, just as a value that merely
+looks like `password = …` is masked. Accept that non-secret text will
+sometimes ship as `<REDACTED>`; audit receivers against raw server logs, not
+against the export. A clip reported by one layer remains reported after later
+layers. Invalid `pattern`, `pattern_exclude` and `redact_pattern` assignments,
+including backreferences (`\1`…`\9`), are rejected before they replace the
+active compiled expression. The `pg_logtap_redact_pattern_failed` gauge is a
+defensive signal for an unexpected assign-time compile failure, not for an
+ordinary rejected setting.
+
+`pg_logtap.export_http_extra_headers` is marked superuser-only because it often
+contains bearer tokens. Ordinary roles cannot read it through `SHOW`,
+`current_setting()` or `pg_settings`; superusers and trusted roles with
+`pg_read_all_settings` (including `pg_monitor`) can. This is an access-control
+boundary, not encrypted secret storage: the value also exists in PostgreSQL
+configuration files and process memory.
 
 ## Supported versions
 

@@ -112,6 +112,35 @@ real newline (ALTER SYSTEM rejects one outright), so the escape is the only
 multi-line form; each line is CRLF-terminated on send. SET rejects a raw
 control byte, an empty line and sender-owned names such as `Content-Type`;
 use `export_http_content_type` instead of creating a conflicting second copy.
+The GUC is superuser-only: ordinary roles cannot read it, while superusers and
+roles with `pg_read_all_settings` (including `pg_monitor`) can. That limits
+casual disclosure but is not encrypted secret storage.
+
+Network hosts are limited to 255 bytes. HTTP(S) configuration is accepted
+only when the same renderer used by the sender can fit the worst-case complete
+request head into 2048 bytes. Each GUC check combines its candidate value with
+the currently installed URL/content type/extra headers; PostgreSQL does not
+atomically validate a future multi-GUC tuple, so the runtime renderer remains
+the final backstop.
+
+## SQL upgrade to 0.6.1
+
+Historical update chains appended statistics fields, so their composite type
+and view can have a different physical order from a fresh 0.6.0 installation.
+The `0.6.0--0.6.1` migration validates the exact released shape. It leaves an
+already-canonical pair untouched, preserving OIDs and dependencies; otherwise
+it drops and recreates only the view and type in canonical delivery order.
+
+The replacement takes exclusive locks and changes both OIDs. Before updating a
+noncanonical installation, remove external dependencies and restore baseline
+ownership/privileges. Remove custom column defaults, grants, comments, labels
+and options; these guards also cover the view's implicit row type and generated
+array types. Reset default table/type privileges that apply to the extension
+schema. Reconnect or reprepare OID-caching clients afterward, then restore
+intentional dependencies and metadata. Both drops use `RESTRICT`, never
+`CASCADE`: a dependency or
+unsupported customization aborts the complete `ALTER EXTENSION` transaction,
+leaving `extversion`, objects, OIDs and old order unchanged.
 
 ## Ordering and identity
 
@@ -429,10 +458,14 @@ the ring during one sleep. The queue drains one gzip member per flush cycle
 (plus a bounded 64 members before the worker yields to counters/metrics/SIGHUP),
 so delivery resumes without a RAM-backlog loss path. A receiver that answers
 but is too slow to keep up (`export_slow_ms`) parks live batches on the same
-file losslessly instead of stalling the worker, so `events_lost` there too
-grows only on sustained capture past export capacity, a full disk, cap
-trimming, or an unreadable counted member. An unreadable legacy member instead
-breaks the queue; later live events then take the RAM-backlog path.
+file losslessly instead of stalling the worker. Even under continuous input,
+the worker periodically retries the oldest real queued member after a cooldown
+of at least one second (or ten times the previous completed attempt duration,
+whichever is longer). A fast success clears slow mode; a still-slow success or
+failure starts the next cooldown. Thus `events_lost` there too grows only on
+sustained capture past export capacity, a full disk, cap trimming, or an
+unreadable counted member. An unreadable legacy member instead breaks the
+queue; later live events then take the RAM-backlog path.
 
 ## Alerting
 
@@ -444,7 +477,7 @@ Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules
 - `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file cannot be opened (a symlink at its path, permissions, a read-only disk) or failed its framing check (foreign content, two clusters sharing one file) — delivery degraded to the RAM bound; needs an operator: point the GUC at a different path or restart.
 - `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile. Not an outage by itself: delivery continues via the last-known-good address while it stays valid.
 - `PgLogtapFbSyncFailing` — `increase(pg_logtap_fb_sync_failures[5m]) > 0` for 5m: the fallback queue's `fdatasync` keeps failing — the disk is not making parked events durable. Events still replay (the members are in the file), so this is the dying-disk signal, not a loss signal.
-- `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` did not compile; redaction is OFF (fail-open by design — a bad pattern must not stop export), fix the pattern.
+- `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` passed validation but unexpectedly failed assign-time compilation; the previous compiled redactor remains active, if one existed. Check the server log and retry the assignment. Ordinary invalid patterns are rejected without changing this gauge.
 
 Counters reset on restart (per cluster life) — `increase()` handles that
 natively as long as the Prometheus scrape interval is shorter than the restart.

@@ -82,9 +82,10 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "pg_logtap redact_pattern is invalid on {{ $labels.instance }}"
+          summary: "pg_logtap redact_pattern assign failed on {{ $labels.instance }}"
           description: >-
-            pg_logtap.redact_pattern did not compile and redaction by that
-            layer is OFF (fail-open). The compile error text is in the server
-            log. Fix the pattern; the gauge clears on the next successful
-            compile.
+            pg_logtap.redact_pattern passed configuration validation but its
+            assign-time compile still failed, so the previous compiled pattern
+            remains active. Ordinary invalid assignments are rejected before
+            this gauge changes. Check the server log; the gauge clears on the
+            next successful assignment.

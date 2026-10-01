@@ -1,0 +1,12 @@
+/* pg_logtap 0.1.0 */
+CREATE FUNCTION pg_logtap_version() RETURNS text
+AS 'MODULE_PATHNAME', 'pg_logtap_version'
+LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE;
+
+CREATE FUNCTION pg_logtap_stats() RETURNS text
+AS 'MODULE_PATHNAME', 'pg_logtap_stats'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+
+CREATE FUNCTION pg_logtap_dump(row_limit int DEFAULT 100) RETURNS text[]
+AS 'MODULE_PATHNAME', 'pg_logtap_dump'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;

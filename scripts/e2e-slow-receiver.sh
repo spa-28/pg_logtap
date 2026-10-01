@@ -1,80 +1,158 @@
 #!/bin/sh
 # Acceptance: a receiver that answers but slowly (each response >=
 # pg_logtap.export_slow_ms) must not decide what gets lost: while it stays
-# slow, live batches park on the fallback file (lossless) instead of filling
-# the RAM backlog; once it answers fast again, the queue drains in order.
-# Without export_slow_ms such a receiver trimmed the RAM backlog
-# oldest-first (events_lost > 0 under load); without the cycle deadline the
-# worker loop itself stalled behind every slow round trip.
+# slow, live batches park on the fallback file. Once the receiver is fast,
+# one rate-limited oldest-member probe must detect recovery and drain the
+# queue even while capture remains continuously busy.
 # Usage: scripts/e2e-slow-receiver.sh [pg_container] [sink_port]
 # The stand (tests/e2e/compose.yaml) provides the network; this sink is
-# suite-local on purpose — the test toggles its delay mid-run (up_sink).
+# suite-local because the test changes its response delay in place.
 set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init slow "${1:-}"
 PORT="${2:-9498}"
-SINK=pglogtap-slow-${PG_CT#pglogtap-} # per container: rm -f'd at every up_sink
+SINK=pglogtap-slow-${PG_CT#pglogtap-}
+FB_REL="pg_logtap-slow$SUF.bin"
+producer_app="logtap-slow-producer$SUF"
+producer_pid=''
 e2e_gate
+STATE="$OUT/slow-state$SUF"
+mkdir -p "$STATE"
 
-# socat forks per connection; the background (sleep N; printf) answers with a
-# bare 200 after N seconds while `cat` drains the request body. N=1: every
-# send succeeds (failure path never fires) yet every send is "slow".
-up_sink() { # $1 = seconds to delay the response
+# socat forks per connection; each child reads the current delay from a mounted
+# file. Changing that file preserves the container name/IP and existing worker
+# state, unlike replacing the sink at the slow→fast transition.
+up_sink() { # $1 = seconds to delay subsequent responses
+  printf '%s\n' "$1" > "$STATE/delay"
+  [ "$(docker inspect -f '{{.State.Status}}' "$SINK" 2>/dev/null)" = running ] && return 0
   docker rm -f "$SINK" >/dev/null 2>&1
-  docker run -d --name "$SINK" --network "$NET" alpine/socat \
+  docker run -d --name "$SINK" --network "$NET" -v "$STATE:/state:ro" alpine/socat \
     "TCP-LISTEN:$PORT,reuseaddr,fork" \
-    SYSTEM:"(sleep $1; printf 'HTTP/1.0 200 OK\r\n\r\n') & cat >/dev/null" >/dev/null
+    SYSTEM:"(sleep \$(cat /state/delay); printf 'HTTP/1.0 200 OK\r\n\r\n') & cat >/dev/null" >/dev/null \
+    || fail "slow receiver: could not start suite-local sink"
   sleep 1
 }
-cleanup() { docker rm -f "$SINK" >/dev/null 2>&1; }
+stop_producer() {
+  [ -n "$producer_pid" ] || return 0
+  docker exec "$PG_CT" psql -U postgres -Atc \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$producer_app'" \
+    >/dev/null 2>&1
+  wait "$producer_pid" 2>/dev/null
+  producer_pid=''
+}
+cleanup() {
+  stop_producer
+  docker rm -f "$SINK" >/dev/null 2>&1
+  rm -f "$STATE/delay"
+  rmdir "$STATE" 2>/dev/null
+}
 trap cleanup EXIT
+# A hard-killed prior run cannot execute its trap; discard its sink because it
+# is mounted to that run's PID-specific state directory.
+docker rm -f "$SINK" >/dev/null 2>&1
+backlog_now() {
+  docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery"
+}
 
-# 250ms slow threshold, 1s answers, 3s hard timeout.
-docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_slow_ms = 250" \
-  -qc "ALTER SYSTEM SET pg_logtap.export_timeout_ms = 3000" \
-  -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = 'pg_logtap-fallback.bin'" \
-  -qc "ALTER SYSTEM SET pg_logtap.metrics_port = 9187" \
-  -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$SINK:$PORT'" \
-  -qc "SELECT pg_reload_conf()" >/dev/null
-
-base=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()")
-bque=${base#*events_queued=}; bque=${bque%% *}
-brep=${base#*events_replayed=}; brep=${brep%% *}
-bdrp=${base#*events_dropped=}; bdrp=${bdrp%% *}
-blost=${base#*events_lost=}; blost=${blost%% *}
-bsent=${base#*events_sent=}; bsent=${bsent%% *}
-
-# --- phase A: slow but answering ------------------------------------------
+FB_DIR=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory")
+docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL"
+setguc pg_logtap.pattern '' || fail "slow receiver: could not reset pattern"
+setguc pg_logtap.pattern_exclude '' || fail "slow receiver: could not reset exclude pattern"
+setguc pg_logtap.redact_pattern '' || fail "slow receiver: could not reset redact pattern"
+setguc pg_logtap.level_min 19 || fail "slow receiver: could not set capture level"
+setguc pg_logtap.flush_interval 100 || fail "slow receiver: could not set flush interval"
+setguc pg_logtap.export_slow_ms 250 || fail "slow receiver: could not set slow threshold"
+setguc pg_logtap.export_timeout_ms 3000 || fail "slow receiver: could not set timeout"
+setguc pg_logtap.export_backlog_max 65536 || fail "slow receiver: could not set RAM backlog"
+setguc pg_logtap.export_fallback_file "$FB_REL" || fail "slow receiver: could not set fallback file"
+setguc pg_logtap.fallback_max_mb 64 || fail "slow receiver: could not bound fallback file"
+setguc pg_logtap.export_gzip off || fail "slow receiver: could not disable gzip"
+setguc pg_logtap.metrics_port 9187 || fail "slow receiver: could not enable metrics"
 up_sink 1
-docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN FOR i IN 1..400 LOOP RAISE WARNING 'slow receiver e2e %', i; END LOOP; END \$\$" >/dev/null 2>&1
-sleep 8
+setguc pg_logtap.export_url "http://$SINK:$PORT" || fail "slow receiver: could not set sink URL"
+reload || fail "slow receiver: reload failed"
+sleep 1
+bque=$(statf events_queued)
+brep=$(statf events_replayed)
+bdrp=$(statf events_dropped)
+blost=$(statf events_lost)
 
-st=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()")
-que=${st#*events_queued=}; que=${que%% *}
-sent=${st#*events_sent=}; sent=${sent%% *}
-drp=${st#*events_dropped=}; drp=${drp%% *}; drp=$((drp - bdrp))
-lost=${st#*events_lost=}; lost=${lost%% *}; lost=$((lost - blost))
-que=$((que - bque)); sent=$((sent - bsent))
+# One backend emits steadily for long enough to span the slow answer, its 10x
+# cooldown, and fast recovery. The sink discards bodies, so this test asserts
+# queue/counter behavior rather than ordering or duplicate content.
+docker exec -e "PGAPPNAME=$producer_app" "$PG_CT" psql -U postgres -v ON_ERROR_STOP=1 -qc "
+  DO \$\$ DECLARE
+    stop_at timestamptz := clock_timestamp() + interval '30 seconds';
+    i bigint := 0;
+  BEGIN
+    WHILE clock_timestamp() < stop_at LOOP
+      RAISE WARNING 'slow receiver continuous %', i;
+      i := i + 1;
+      PERFORM pg_sleep(0.01);
+    END LOOP;
+  END \$\$" >/dev/null 2>&1 &
+producer_pid=$!
 
-# The loop must keep serving between slow sends (cycle deadline), and the
-# bash read -t pattern is deliberate — see e2e-silent-receiver.sh.
+backlog=0
+n=0
+while [ "$n" -lt 20 ]; do
+  backlog=$(backlog_now)
+  [ "$backlog" -gt 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "$backlog" -gt 0 ] || fail "slow receiver: live traffic never entered the fallback queue"
+kill -0 "$producer_pid" 2>/dev/null || fail "slow receiver: producer ended before recovery transition"
 healthz=$(docker exec "$PG_CT" bash -c \
   'exec 3<>/dev/tcp/127.0.0.1/9187 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && IFS= read -r -t 8 line <&3 && echo "$line"' \
   2>/dev/null)
+[ -n "$healthz" ] || fail "slow receiver: worker stopped serving healthz while parking"
 
-echo "  phaseA: parked=$que sent=$sent dropped=$drp lost=$lost healthz=${healthz:-none}"
-[ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ]
-
-# --- phase B: receiver speeds up, the queue drains in order ---------------
+queued_before=$backlog
 up_sink 0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  bl=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
-  [ "$bl" = 0 ] && break
-  sleep 1
+decreased=0
+drained_while_live=0
+n=0
+while [ "$n" -lt 25 ]; do
+  current=$(backlog_now)
+  [ "$current" -lt "$queued_before" ] && decreased=1
+  if [ "$current" = 0 ]; then
+    kill -0 "$producer_pid" 2>/dev/null \
+      || fail "slow receiver: queue drained only after continuous input stopped"
+    drained_while_live=1
+    break
+  fi
+  kill -0 "$producer_pid" 2>/dev/null \
+    || fail "slow receiver: producer ended before queue recovery"
+  n=$((n + 1)); sleep 1
 done
-st=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()")
-rep=${st#*events_replayed=}; rep=${rep%% *}; rep=$((rep - brep))
-lost=${st#*events_lost=}; lost=${lost%% *}; lost=$((lost - blost))
-bl2=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
-echo "  phaseB: replayed=$rep backlog=$bl2 lost=$lost"
-[ "$rep" -ge "$que" ] && [ "$bl2" = 0 ] && [ "$lost" -eq 0 ]
+[ "$decreased" = 1 ] || fail "slow receiver: backlog never decreased after sink recovery"
+[ "$drained_while_live" = 1 ] || fail "slow receiver: backlog did not reach zero under continuous input"
+
+stop_producer
+drain_ring
+n=0
+while [ "$n" -lt 20 ]; do
+  [ "$(backlog_now)" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "$(backlog_now)" = 0 ] || fail "slow receiver: queue refilled or remained after producer stop"
+queued=$(( $(statf events_queued) - bque ))
+replayed=$(( $(statf events_replayed) - brep ))
+dropped=$(( $(statf events_dropped) - bdrp ))
+lost=$(( $(statf events_lost) - blost ))
+[ "$queued" -gt 0 ] || fail "slow receiver: no events were counted queued"
+[ "$replayed" -gt 0 ] || fail "slow receiver: no queued events were replayed"
+[ "$dropped" = 0 ] || fail "slow receiver: events_dropped increased by $dropped"
+[ "$lost" = 0 ] || fail "slow receiver: events_lost increased by $lost"
+ok "backlog $queued_before→0 while producer stayed active; queued=$queued replayed=$replayed lost=0 dropped=0"
+
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''
+setguc pg_logtap.export_slow_ms 250
+setguc pg_logtap.export_timeout_ms 5000
+setguc pg_logtap.flush_interval 1000
+setguc pg_logtap.level_min 15
+setguc pg_logtap.metrics_port 0
+reload
+sleep 1
+docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL"

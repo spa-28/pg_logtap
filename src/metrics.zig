@@ -84,7 +84,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_fb_sync_failures Failed fdatasync calls on the fallback queue, cumulative. Events of such a cycle are in the file but not durable (lost on OS crash, not on postmaster death); the log WARNING is once per failure streak, this counter is not — a growing value is a dying disk. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level.
         \\# TYPE pg_logtap_fb_sync_failures counter
         \\pg_logtap_fb_sync_failures {d}
-        \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern did not compile and that redaction layer is OFF (fail-open). The compile error text is in the server log.
+        \\# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern unexpectedly failed assign-time compilation; the previous compiled redactor remains active, if one existed. The compile error text is in the server log.
         \\# TYPE pg_logtap_redact_pattern_failed gauge
         \\pg_logtap_redact_pattern_failed {d}
         \\# HELP pg_logtap_warn_tls_no_verify The verify=off WARNING fired (once per worker life): https/tcps export is shipping unauthenticated.
@@ -132,6 +132,7 @@ test "metrics response" {
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fallback_broken 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_fb_sync_failures 3\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern unexpectedly failed assign-time compilation; the previous compiled redactor remains active, if one existed.") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_tls_no_verify 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_skipped 4\n") != null);
     // Content-Length must match the body that actually follows it.
