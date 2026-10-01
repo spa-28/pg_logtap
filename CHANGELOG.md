@@ -11,6 +11,9 @@
 - Bind values are masked by PostgreSQL's structural `$N = '...'` payload in
   translated `DETAIL`/`HINT`/`CONTEXT` fields, including
   `log_parameter_max_length_on_error` error context.
+- Auxiliary-field password masking preserves text skipped over non-assignment
+  tokens, keeping bind prefixes recognizable by the following masking pass
+  instead of exposing values containing password tokens and escaped quotes.
 - Invalid `pattern`, `pattern_exclude` and `redact_pattern` assignments are
   rejected before they replace the active compiled expression; ordinary
   configuration errors no longer disable filtering or redaction.

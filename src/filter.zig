@@ -309,9 +309,10 @@ pub fn redactPasswordValue(dst: []u8, src: []const u8) Masked {
     var clipped = false;
     var out_len: usize = 0;
     var scan: usize = 0; // consumed prefix of src
+    var search: usize = 0;
     var masked_any = false; // copying starts only at the first masked value
-    while (scan < src.len) {
-        const token_at = scan + (findWord(src[scan..], "password") orelse break);
+    while (search < src.len) {
+        const token_at = search + (findWord(src[search..], "password") orelse break);
         var value_at = token_at + "password".len;
         while (value_at < src.len and (src[value_at] == ' ' or src[value_at] == '\t')) value_at += 1;
         if (value_at < src.len and src[value_at] == '=') {
@@ -319,7 +320,7 @@ pub fn redactPasswordValue(dst: []u8, src: []const u8) Masked {
             while (value_at < src.len and (src[value_at] == ' ' or src[value_at] == '\t')) value_at += 1;
         }
         if (value_at >= src.len or src[value_at] != '\'') { // not an assignment
-            scan = token_at + "password".len;
+            search = token_at + "password".len;
             continue;
         }
         var value_end = value_at + 1; // quoted: a lone ' ends it, '' escapes
@@ -334,6 +335,7 @@ pub fn redactPasswordValue(dst: []u8, src: []const u8) Masked {
         out_len += put(dst[out_len..], redacted, &clipped);
         masked_any = true;
         scan = if (value_end < src.len) value_end + 1 else src.len;
+        search = scan;
     }
     if (!masked_any) return .{ .text = src, .clipped = false };
     if (scan < src.len) out_len += put(dst[out_len..], src[scan..], &clipped);
@@ -470,6 +472,65 @@ test "password assignment values masked, diagnostics survive" {
     try std.testing.expect(redactPasswordValue(&buf, prose).text.ptr == prose.ptr);
     const underscored = "user_passwords table";
     try std.testing.expect(redactPasswordValue(&buf, underscored).text.ptr == underscored.ptr);
+}
+
+test "password assignment near misses preserve unconsumed text" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "prefix password note password = <REDACTED> trailing",
+        redactPasswordValue(&buf, "prefix password note password = 'SECRET-canary' trailing").text,
+    );
+    try std.testing.expectEqualStrings(
+        "password=<REDACTED>; password note; password=<REDACTED>; password trailing",
+        redactPasswordValue(&buf, "password='one'; password note; password='two'; password trailing").text,
+    );
+    try std.testing.expectEqualStrings(
+        "password=<REDACTED>; password note",
+        redactPasswordValue(&buf, "password='one'; password note").text,
+    );
+    try std.testing.expectEqualStrings(
+        "password note; PASSWORD hint; password=<REDACTED> end",
+        redactPasswordValue(&buf, "password note; PASSWORD hint; password='a''b' end").text,
+    );
+    try std.testing.expectEqualStrings(
+        "password note; password=<REDACTED>",
+        redactPasswordValue(&buf, "password note; password='unterminated").text,
+    );
+    const prose = "password note; PASSWORD hint; password trailing";
+    const untouched = redactPasswordValue(&buf, prose);
+    try std.testing.expect(untouched.text.ptr == prose.ptr);
+    try std.testing.expect(!untouched.clipped);
+}
+
+test "password-value then bind-value masking preserves localized prefixes" {
+    var password_buf: [256]u8 = undefined;
+    var param_buf: [256]u8 = undefined;
+    inline for (.{ "Parameters: ", "Параметры: ", "Paramètres : " }) |prefix| {
+        const src = prefix ++ "$1 = 'password note password ''SECRET-canary'' trailing', $2 = NULL, $3 = 'SECRET-next'";
+        const password = redactPasswordValue(&password_buf, src);
+        const result = redactParamValues(&param_buf, password.text);
+        try std.testing.expectEqualStrings(prefix ++ "$1 = <REDACTED>, $2 = NULL, $3 = <REDACTED>", result.text);
+        try std.testing.expect(std.mem.find(u8, result.text, "SECRET-") == null);
+        try std.testing.expect(!password.clipped and !result.clipped);
+        try std.testing.expect(param_buf[result.text.len] == 0);
+    }
+    const unfinished = redactPasswordValue(&password_buf, "Parameters: $1 = 'password note password ''SECRET-canary");
+    try std.testing.expectEqualStrings("Parameters: $1 = <REDACTED>", redactParamValues(&param_buf, unfinished.text).text);
+
+    // A password at a bind value's end can consume later bind headers in the
+    // value pass. The following bind pass must still hide every secret.
+    const edge = redactPasswordValue(&password_buf, "Parameters: $1 = 'password', $2 = NULL, $3 = 'SECRET-canary'");
+    const result = redactParamValues(&param_buf, edge.text);
+    try std.testing.expect(std.mem.find(u8, result.text, "SECRET-canary") == null);
+    try std.testing.expect(std.mem.find(u8, result.text, redacted) != null);
+
+    var small: [26]u8 = undefined;
+    const clipped = redactPasswordValue(&small, "Параметры: $1 = 'password note password ''SECRET-canary'' trailing'");
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expect(small[clipped.text.len] == 0);
+    const after_bind = redactParamValues(&param_buf, clipped.text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(after_bind.text));
+    try std.testing.expect(std.mem.find(u8, after_bind.text, "SECRET-canary") == null);
 }
 
 test "bind-parameter values masked inside localized wrappers" {

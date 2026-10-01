@@ -355,6 +355,32 @@ ok "extended-protocol parse/execute duration lines get the password cut"
 # when log_parameter_max_length_on_error is set. The shared `$N = 'value'`
 # payload must be masked in both. psql \bind is psql 16+; PG15 drives the same
 # extended-protocol paths through pgbench -M extended.
+# Exercise the mandatory layers together, without a regex hiding a failure.
+# A skipped password token must not remove the bind prefix from either field.
+docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -qc "DO \$do\$ BEGIN
+  RAISE WARNING 'logtap robust redaux$SUF 0'
+    USING DETAIL = 'Parameters: \$1 = ''password note password ''''SECRET-aux$SUF-canary'''' trailing''',
+          HINT = 'Paramètres : \$1 = ''password note password ''''SECRET-aux$SUF-canary'''' trailing''';
+END \$do\$" >/dev/null 2>&1
+wait_for redaux 1 "" 20
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "redact: password-value then bind-value auxiliary pipeline"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+marker = "logtap robust redaux" + suf + " 0"
+seen = False
+for line in open(path, encoding="utf-8"):
+    if marker not in line:
+        continue
+    assert "SECRET-aux" + suf + "-canary" not in line, "canary reached exported data"
+    event = json.loads(line)
+    if event.get("message") == marker:
+        assert event.get("detail") == "Parameters: $1 = <REDACTED>", event
+        assert event.get("hint") == "Paramètres : $1 = <REDACTED>", event
+        seen = True
+assert seen, "auxiliary-field pipeline probe missing"
+EOF
+ok "password-value and bind-value layers compose without losing auxiliary prefixes"
+
 setguc log_min_duration_statement 0; setguc log_parameter_max_length 100
 setguc log_parameter_max_length_on_error 100; reload; sleep 1
 vnum=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW server_version_num")
@@ -391,7 +417,7 @@ EOF
   # Bind succeeds, then division by zero fails during Execute. PostgreSQL adds
   # every saved bind value to CONTEXT on this error path.
   docker exec -e "PGAPPNAME=logtap-ctx$SUF" -i "$PG_CT" psql -U postgres >/dev/null 2>&1 <<EOF
-SELECT 'ctxmarker$SUF' AS tag, \$1::text, 1 / \$2::int \bind 'SECRET-ctx$SUF-uvw456' '0'
+SELECT 'ctxmarker$SUF' AS tag, \$1::text, 1 / \$2::int \bind 'password note password ''''SECRET-ctx$SUF-uvw456'''' trailing' '0'
 \g
 EOF
 else
@@ -430,7 +456,7 @@ EOF
 SELECT 'ctxmarker$SUF' AS tag, :secret::text, 1 / :zero::int;
 EOF"
   docker exec "$PG_CT" pgbench -U postgres -M extended -t 1 -c 1 \
-    -f /tmp/p15ctx.sql -D "secret=SECRET-ctx$SUF-uvw456" -D zero=0 \
+    -f /tmp/p15ctx.sql -D "secret=password note password ''SECRET-ctx$SUF-uvw456'' trailing" -D zero=0 \
     "dbname=postgres application_name=logtap-ctx$SUF" >/dev/null 2>&1
   docker exec "$PG_CT" rm -f /tmp/p15ctx.sql
 fi
