@@ -1,5 +1,5 @@
 #!/bin/sh
-# Acceptance: every released SQL origin reaches one canonical 0.6.1 API.
+# Acceptance: representative released SQL layouts reach one canonical 0.6.1 API.
 # Fresh 0.6.0 keeps object OIDs; historical orders are replaced only when
 # ownership, ACLs and dependencies make that replacement lossless.
 # Usage: scripts/e2e-upgrade.sh [pg_container]
@@ -113,10 +113,11 @@ BEGIN
     SELECT string_agg(a.attname::text, ',' ORDER BY a.attnum)
       INTO got
       FROM pg_catalog.pg_attribute AS a
-     WHERE a.attrelid = type_oid
+     WHERE a.attrelid = (SELECT t.typrelid FROM pg_catalog.pg_type AS t
+                         WHERE t.oid = type_oid)
        AND a.attnum > 0
        AND NOT a.attisdropped;
-    IF got <> '$CANONICAL_ORDER' THEN
+    IF got IS DISTINCT FROM '$CANONICAL_ORDER' THEN
         RAISE EXCEPTION 'noncanonical type order: %', got;
     END IF;
 
@@ -126,7 +127,7 @@ BEGIN
      WHERE a.attrelid = view_oid
        AND a.attnum > 0
        AND NOT a.attisdropped;
-    IF got <> '$CANONICAL_ORDER' THEN
+    IF got IS DISTINCT FROM '$CANONICAL_ORDER' THEN
         RAISE EXCEPTION 'noncanonical view order: %', got;
     END IF;
 
@@ -357,6 +358,20 @@ for database in $DATABASES; do create_database "$database"; done
 # Direct 0.6.1 installation is the reference fingerprint.
 install_version "$DB_DIRECT" 0.6.1
 check_final "$DB_DIRECT" || fail "upgrade: direct 0.6.1 shape check failed"
+# The shape assertion itself must reject a wrong composite attribute order/name.
+query "$DB_DIRECT" "ALTER TYPE $SCHEMA.pg_logtap_stats_t RENAME ATTRIBUTE events_captured TO unexpected_captured" >/dev/null \
+  || fail "upgrade: could not stage noncanonical composite"
+shape_status=0
+shape_error=$(check_final "$DB_DIRECT" 2>&1) || shape_status=$?
+query "$DB_DIRECT" "ALTER TYPE $SCHEMA.pg_logtap_stats_t RENAME ATTRIBUTE unexpected_captured TO events_captured" >/dev/null \
+  || fail "upgrade: could not restore canonical composite"
+[ "$shape_status" -ne 0 ] || fail "upgrade: shape assertion accepted noncanonical composite"
+case "$shape_error" in
+  *'noncanonical type order'*) ;;
+  *) fail "upgrade: shape assertion rejected noncanonical composite for the wrong reason: $shape_error" ;;
+esac
+check_final "$DB_DIRECT" || fail "upgrade: restored direct 0.6.1 shape check failed"
+ok "shape assertion rejects noncanonical composite attributes"
 reference=$(fingerprint "$DB_DIRECT") \
   || fail "upgrade: could not fingerprint direct 0.6.1"
 

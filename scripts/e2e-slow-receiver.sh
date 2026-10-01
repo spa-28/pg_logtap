@@ -17,7 +17,9 @@ producer_app="logtap-slow-producer$SUF"
 producer_pid=''
 e2e_gate
 STATE="$OUT/slow-state$SUF"
-mkdir -p "$STATE"
+(umask 077; mkdir "$STATE") || fail "slow receiver: could not create private state directory"
+restore_ready=0
+FB_DIR=''
 
 # socat forks per connection; each child reads the current delay from a mounted
 # file. Changing that file preserves the container name/IP and existing worker
@@ -36,15 +38,43 @@ stop_producer() {
   [ -n "$producer_pid" ] || return 0
   docker exec "$PG_CT" psql -U postgres -Atc \
     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$producer_app'" \
-    >/dev/null 2>&1
-  wait "$producer_pid" 2>/dev/null
+    >/dev/null 2>&1 || return 1
+  wait "$producer_pid" 2>/dev/null || true # terminated psql normally exits nonzero
   producer_pid=''
 }
 cleanup() {
-  stop_producer
-  docker rm -f "$SINK" >/dev/null 2>&1
-  rm -f "$STATE/delay"
-  rmdir "$STATE" 2>/dev/null
+  cleanup_status=$?
+  trap - EXIT
+  cleanup_failed=0
+  restore_failed=0
+  stop_producer || cleanup_failed=1
+  if [ "$restore_ready" = 1 ]; then
+    docker exec -i "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 \
+      < "$STATE/restore.sql" >/dev/null || restore_failed=1
+    reload || restore_failed=1
+    sleep 1
+  fi
+  if docker inspect "$SINK" >/dev/null 2>&1; then
+    docker rm -f "$SINK" >/dev/null 2>&1 || cleanup_failed=1
+  fi
+  if [ "$restore_failed" = 0 ]; then
+    rm -f "$STATE/restore.sql" || cleanup_failed=1
+  else
+    echo "e2e-slow: cleanup could not restore GUCs; recovery SQL: $STATE/restore.sql" >&2
+    cleanup_failed=1
+  fi
+  if [ "$cleanup_status" = 0 ] && [ "$cleanup_failed" = 0 ] && [ -n "$FB_DIR" ]; then
+    docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL" || cleanup_failed=1
+  fi
+  rm -f "$STATE/delay" || cleanup_failed=1
+  if [ "$restore_failed" = 0 ]; then
+    rmdir "$STATE" || cleanup_failed=1
+  fi
+  if [ "$cleanup_failed" != 0 ]; then
+    echo "e2e-slow: cleanup failed" >&2
+    [ "$cleanup_status" != 0 ] || cleanup_status=1
+  fi
+  exit "$cleanup_status"
 }
 trap cleanup EXIT
 # A hard-killed prior run cannot execute its trap; discard its sink because it
@@ -54,8 +84,22 @@ backlog_now() {
   docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery"
 }
 
-FB_DIR=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory")
-docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL"
+FB_DIR=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory") \
+  || fail "slow receiver: could not read data directory"
+# Save every setting this suite changes, before even a partial setup can fail.
+# current_setting preserves units; format quotes regexes and URLs as SQL values.
+docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -Atc "
+  SELECT format('ALTER SYSTEM SET %s = %L;', name, current_setting(name))
+    FROM unnest(ARRAY[
+      'pg_logtap.pattern', 'pg_logtap.pattern_exclude', 'pg_logtap.redact_pattern',
+      'pg_logtap.level_min', 'pg_logtap.flush_interval', 'pg_logtap.export_slow_ms',
+      'pg_logtap.export_timeout_ms', 'pg_logtap.export_backlog_max',
+      'pg_logtap.export_fallback_file', 'pg_logtap.fallback_max_mb',
+      'pg_logtap.export_gzip', 'pg_logtap.metrics_port', 'pg_logtap.export_url'
+    ]) AS gucs(name)" > "$STATE/restore.sql" \
+  || fail "slow receiver: could not snapshot GUCs"
+restore_ready=1
+docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL" || fail "slow receiver: could not clear suite fallback"
 setguc pg_logtap.pattern '' || fail "slow receiver: could not reset pattern"
 setguc pg_logtap.pattern_exclude '' || fail "slow receiver: could not reset exclude pattern"
 setguc pg_logtap.redact_pattern '' || fail "slow receiver: could not reset redact pattern"
@@ -128,7 +172,7 @@ done
 [ "$decreased" = 1 ] || fail "slow receiver: backlog never decreased after sink recovery"
 [ "$drained_while_live" = 1 ] || fail "slow receiver: backlog did not reach zero under continuous input"
 
-stop_producer
+stop_producer || fail "slow receiver: could not stop producer"
 drain_ring
 n=0
 while [ "$n" -lt 20 ]; do
@@ -145,14 +189,3 @@ lost=$(( $(statf events_lost) - blost ))
 [ "$dropped" = 0 ] || fail "slow receiver: events_dropped increased by $dropped"
 [ "$lost" = 0 ] || fail "slow receiver: events_lost increased by $lost"
 ok "backlog $queued_before→0 while producer stayed active; queued=$queued replayed=$replayed lost=0 dropped=0"
-
-setguc pg_logtap.export_url "http://$VEC:8686"
-setguc pg_logtap.export_fallback_file ''
-setguc pg_logtap.export_slow_ms 250
-setguc pg_logtap.export_timeout_ms 5000
-setguc pg_logtap.flush_interval 1000
-setguc pg_logtap.level_min 15
-setguc pg_logtap.metrics_port 0
-reload
-sleep 1
-docker exec "$PG_CT" rm -f "$FB_DIR/$FB_REL"
