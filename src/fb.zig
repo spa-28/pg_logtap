@@ -108,6 +108,21 @@ var queue_dev: i64 = 0;
 var queue_ino: u64 = 0;
 var queue_identity_valid = false;
 
+// Fully credited contents, not just an inode: a trusted directory can still
+// receive an external append or same-size rewrite. fchmod changes ctime on
+// every secure open, so compare content mtime instead.
+var credited_stat: ?worker.FileStat = null;
+
+fn sameContents(a: worker.FileStat, b: worker.FileStat) bool {
+    return a.st_dev == b.st_dev and a.st_ino == b.st_ino and a.st_size == b.st_size and
+        a.st_mtim.tv_sec == b.st_mtim.tv_sec and a.st_mtim.tv_nsec == b.st_mtim.tv_nsec;
+}
+
+fn fbStat(file_fd: c_int) ?worker.FileStat {
+    var file_stat: worker.FileStat = undefined;
+    return if (c.fstat(file_fd, &file_stat) == 0) file_stat else null;
+}
+
 var fb_path_buf: [4096]u8 = undefined;
 var fb_path_len: usize = 0;
 
@@ -190,35 +205,48 @@ fn adoptPath(full: []const u8) void {
     fb_path_buf[full.len] = 0;
     offset = 0;
     queue_identity_valid = false;
+    credited_stat = null;
     broken = false;
     // Publish the choice and invalidate A's cursor before scanning/crediting B.
     capture.setFallbackPath(full);
 }
 
-fn reopen(alloc: std.mem.Allocator) void {
+fn reopen(alloc: std.mem.Allocator, healthy: bool) void {
     if (path() == null) return;
     const file_fd = fbOpen() orelse return;
     {
         defer _ = c.close(file_fd);
         const size = fbSize(file_fd) orelse {
+            credited_stat = null;
             broken = true;
             return;
         };
         // A short foreign file is not an empty queue. Never silently adopt
         // another path because size <= magic_len happened to hide its bytes.
         if (size != 0 and readFormat(file_fd) == null) {
+            credited_stat = null;
             broken = true;
             elog.Warning(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
             return;
         }
-        offset = capture.fallbackOffset(queue_dev, queue_ino, size);
+        const resume_offset = capture.fallbackOffset(queue_dev, queue_ino, size);
+        const file_stat = fbStat(file_fd) orelse {
+            credited_stat = null;
+            return;
+        };
+        const known = if (credited_stat) |credited| sameContents(credited, file_stat) else false;
+        const skip_credit = healthy and known and resume_offset == offset;
+        offset = resume_offset;
+        if (skip_credit) return;
     }
+    credited_stat = null;
     creditBacklog(alloc);
 }
 
 /// Worker start restores the ACTIVE choice even if a deferred configured B
 /// is already in postgresql.auto.conf. Full postmaster restart clears shmem.
 pub fn boot(alloc: std.mem.Allocator) void {
+    credited_stat = null;
     if (capture.fallbackPath(&fb_path_buf)) |len| {
         fb_path_len = len;
     } else {
@@ -228,7 +256,7 @@ pub fn boot(alloc: std.mem.Allocator) void {
     if (path() == null) return;
     var tmp_buf: [4096]u8 = undefined;
     if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
-    reopen(alloc);
+    reopen(alloc, false);
 }
 
 /// Explicit HUP is the repair/reconfiguration boundary. Changing or disabling
@@ -237,8 +265,9 @@ pub fn reload(alloc: std.mem.Allocator) void {
     var buf: [4096]u8 = undefined;
     const full = configuredPath(&buf) orelse return;
     if (std.mem.eql(u8, fb_path_buf[0..fb_path_len], full)) {
+        const healthy = !broken;
         broken = false;
-        reopen(alloc);
+        reopen(alloc, healthy);
         return;
     }
     if (path() != null and !drained()) {
@@ -246,7 +275,7 @@ pub fn reload(alloc: std.mem.Allocator) void {
         return;
     }
     adoptPath(full);
-    reopen(alloc);
+    reopen(alloc, false);
 }
 
 fn drained() bool {
@@ -275,11 +304,13 @@ fn fbOpen() ?c_int {
     // entry. Existing files must pass the same private descriptor policy.
     var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), flags | 128, @as(c_uint, 0o600));
     const created = file_fd >= 0;
+    defer if (created) fsyncDirOf(fb_path_buf[0..fb_path_len]);
     if (file_fd < 0 and std.c._errno().* == @intFromEnum(std.c.E.EXIST)) {
         file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), flags, @as(c_uint, 0o600));
     }
     const checked = if (file_fd >= 0) worker.privateFd(file_fd) else null;
     const file_stat = checked orelse {
+        credited_stat = null;
         const err = std.c._errno().*;
         if (file_fd >= 0) _ = c.close(file_fd);
         broken = true;
@@ -289,13 +320,16 @@ fn fbOpen() ?c_int {
     };
     // String checks cannot catch /./ aliases to a regular single-link inode.
     if (worker.queueFdAliasesFileUrl(file_fd)) {
+        credited_stat = null;
         _ = c.close(file_fd);
         broken = true;
         capture.noteWarn(.fallback_open);
         elog.Warning(@src(), "pg_logtap fallback queue and the file:// export_url name one file (inode alias): fallback disabled: {s}", .{path() orelse ""});
         return null;
     }
-    if (created) fsyncDirOf(fb_path_buf[0..fb_path_len]);
+    if (credited_stat) |credited| {
+        if (!sameContents(credited, file_stat)) credited_stat = null;
+    }
     const dev: i64 = @bitCast(@as(u64, file_stat.st_dev));
     if (queue_identity_valid and (queue_dev != dev or queue_ino != file_stat.st_ino)) offset = 0;
     queue_dev = dev;
@@ -406,6 +440,7 @@ fn storedEventCount(event_count: ?u32) ?u32 {
 /// Sync the repair so an OS crash cannot resurrect the torn bytes behind a
 /// later append.
 fn repairTail(file_fd: c_int, at: u64) bool {
+    credited_stat = null;
     if (c.ftruncate(file_fd, @intCast(at)) == 0) {
         _ = fbDatasync(file_fd, false);
         return true;
@@ -456,6 +491,12 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, events: usize, sync: b
         elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
         return .failed;
     };
+    const prior_credit: ?worker.FileStat = if (credited_stat) |credited| blk: {
+        const before_write = fbStat(file_fd) orelse break :blk null;
+        break :blk if (sameContents(credited, before_write) and credited.st_size >= 0 and
+            @as(u64, @intCast(credited.st_size)) == size) credited else null;
+    } else null;
+    credited_stat = null;
     if (size == 0) {
         if (!worker.writeAll(file_fd, format.magic(), false, null)) {
             // Roll the fresh file back to empty. A short write can stop
@@ -507,7 +548,15 @@ pub fn append(alloc: std.mem.Allocator, body: []const u8, events: usize, sync: b
     // compaction is tmp+rename where every failure leaves the original
     // file untouched, so it can only enforce the cap — never worsen the
     // not-durable state or drop a member the failed sync left in place.
-    compact(alloc, file_fd, (if (size == 0) fb_magic_len else size) + format.headerLen() + comp.len, format);
+    const end = (if (size == 0) fb_magic_len else size) + format.headerLen() + comp.len;
+    if (prior_credit) |prior| {
+        if (fbStat(file_fd)) |st| {
+            if (st.st_dev == prior.st_dev and st.st_ino == prior.st_ino and
+                st.st_size >= 0 and @as(u64, @intCast(st.st_size)) == end)
+                credited_stat = st;
+        }
+    }
+    compact(alloc, file_fd, end, format);
     return if (durable) .appended else .not_durable;
 }
 
@@ -690,9 +739,13 @@ pub fn truncate() void {
     // The next queue generation reuses this inode. Fail closed to replay from
     // byte zero if the worker exits before publishing that generation's cursor.
     capture.invalidateFallbackCursor();
+    credited_stat = null;
     if (c.ftruncate(file_fd, 0) == 0) {
         offset = 0;
         _ = fbDatasync(file_fd, false);
+        if (fbStat(file_fd)) |st| {
+            if (st.st_size == 0) credited_stat = st;
+        }
     }
 }
 
@@ -702,6 +755,11 @@ pub fn truncate() void {
 /// normally credits zero; if the old worker died after an append but before
 /// publishing its cycle counters, only that uncounted suffix is credited.
 fn creditBacklog(alloc: std.mem.Allocator) void {
+    const before = blk: {
+        const file_fd = fbOpen() orelse return;
+        defer _ = c.close(file_fd);
+        break :blk fbStat(file_fd) orelse return;
+    };
     const saved_offset = offset;
     const saved_lost = lost;
     const saved_discarded = discarded;
@@ -716,6 +774,9 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
         // the real drain later folds its exact count into lost + discarded.
         .skipped => |skip| events += skip.events,
     };
+    // .none also means transient IO/allocation failure, not necessarily EOF.
+    const complete = !broken and (before.st_size <= fb_magic_len or
+        offset >= @as(u64, @intCast(before.st_size)));
     offset = saved_offset;
     lost = saved_lost;
     discarded = saved_discarded;
@@ -723,6 +784,13 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
     const backlog = snap.queueBacklog();
     const due = events -| backlog;
     if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0, 0);
+    if (complete) {
+        const file_fd = fbOpen() orelse return;
+        defer _ = c.close(file_fd);
+        if (fbStat(file_fd)) |after| {
+            if (sameContents(before, after)) credited_stat = after;
+        }
+    }
 }
 
 fn countFrameEvents(alloc: std.mem.Allocator, file_fd: c_int, format: FrameFormat, off: u64, header: FrameHeader) ?u64 {
@@ -845,6 +913,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFor
         _ = c.unlink(tmp_path);
         return;
     }
+    credited_stat = null;
     fsyncDirOf(fb_path_buf[0..fb_path_len]);
     queue_dev = @bitCast(@as(u64, tmp_st.st_dev));
     queue_ino = tmp_st.st_ino;

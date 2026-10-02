@@ -10,6 +10,10 @@
  * - write on /tmp/writefail-target writes a 17-byte prefix once, then fails
  *   with ENOSPC until the target is removed (regular-file rollback test).
  *   Injected chmod/write faults are recorded in /tmp/fsyncfail.log.
+ * - fsync on /tmp/dirsyncobserve-target records a directory sync attempt;
+ * - pread/pread64 on /tmp/preadobserve-target record frame/payload offsets;
+ * - fdatasync on /tmp/datasyncobserve-target records successful data syncs.
+ *   These observers pass through unchanged and use the same log.
  *
  * Everything else — WAL, the data dir, every other file — passes through to
  * libc. Targets arrive via files because PGDATA is known only after container
@@ -29,6 +33,9 @@
 #include <unistd.h>
 
 static int (*real_fdatasync)(int);
+static int (*real_fsync)(int);
+static ssize_t (*real_pread)(int, void *, size_t, off_t);
+static ssize_t (*real_pread64)(int, void *, size_t, off64_t);
 static int (*real_open)(const char *, int, ...);
 static int (*real_open64)(const char *, int, ...);
 static int (*real_fchmod)(int, mode_t);
@@ -38,6 +45,12 @@ static void resolve_symbols(void)
 {
     if (!real_fdatasync)
         real_fdatasync = dlsym(RTLD_NEXT, "fdatasync");
+    if (!real_fsync)
+        real_fsync = dlsym(RTLD_NEXT, "fsync");
+    if (!real_pread)
+        real_pread = dlsym(RTLD_NEXT, "pread");
+    if (!real_pread64)
+        real_pread64 = dlsym(RTLD_NEXT, "pread64");
     if (!real_open)
         real_open = dlsym(RTLD_NEXT, "open");
     if (!real_open64)
@@ -187,7 +200,65 @@ int fdatasync(int fd)
             return -1;
         }
     }
-    return real_fdatasync(fd);
+    int result = real_fdatasync(fd);
+    int saved_errno = errno;
+    if (result == 0 && fd_matches(fd, "/tmp/datasyncobserve-target"))
+        note_fault("fdatasync OK\n");
+    errno = saved_errno;
+    return result;
+}
+
+int fsync(int fd)
+{
+    resolve_symbols();
+    if (!real_fsync)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    int saved_errno = errno;
+    struct stat st;
+    if (fd_matches(fd, "/tmp/dirsyncobserve-target") &&
+        fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+        note_fault("fsync directory\n");
+    errno = saved_errno;
+    return real_fsync(fd);
+}
+
+static void observe_pread(int fd, size_t count, long long offset)
+{
+    int saved_errno = errno;
+    if (offset >= 8 && fd_matches(fd, "/tmp/preadobserve-target"))
+    {
+        char message[96];
+        snprintf(message, sizeof message, "pread %lld %zu\n", offset, count);
+        note_fault(message);
+    }
+    errno = saved_errno;
+}
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    resolve_symbols();
+    if (!real_pread)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    observe_pread(fd, count, (long long)offset);
+    return real_pread(fd, buf, count, offset);
+}
+
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
+{
+    resolve_symbols();
+    if (!real_pread64)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    observe_pread(fd, count, (long long)offset);
+    return real_pread64(fd, buf, count, offset);
 }
 
 int fchmod(int fd, mode_t mode)

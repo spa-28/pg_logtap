@@ -693,9 +693,9 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 [ "$(statf events_lost)" = "$lost_want" ] \
   || fail "corrupt member: events_lost=$(statf events_lost), want stored count $lost_want"
 skip=$(statf warn_fallback_skipped)
-# Three observations per frame here: boot credit scan, explicit same-path
-# reload credit scan, then the real drain. Only the drain accounts the loss.
-[ "$skip" = $((3 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((3 * nhits))"
+# Boot credit scan and the real drain each observe the frame. Healthy
+# same-path HUP revalidates but does not rescan. Only drain accounts the loss.
+[ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
 [ "$(statf fallback_broken)" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
 backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
 [ "$backlog" = 0 ] || fail "corrupt member: queue_backlog=$backlog after physical drain"
@@ -764,12 +764,12 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for bombA 10
 [ "$(received bombA)" = 10 ] || fail "bomb member: later members not replayed (bombA=$(received bombA)/10)"
 [ "$(received bombX)" = 0 ] || fail "bomb member: bomb content delivered?? (bombX=$(received bombX))"
-# Fresh shmem at restart: boot and same-path reload credit scans each observe
-# every bomb frame without accounting loss. The real drain accounts the exact
-# stored counts once and truncates the file after the skipped final frame.
+# Fresh shmem at restart: boot observes every bomb frame without accounting
+# loss; healthy same-path HUP skips the redundant scan. The real drain counts
+# the exact loss once and truncates after the skipped final frame.
 [ "$(statf events_lost)" = "$bomb_lost" ] \
   || fail "bomb member: events_lost=$(statf events_lost), want stored count $bomb_lost"
-[ "$(statf warn_fallback_skipped)" = $((3 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((3 * nb))"
+[ "$(statf warn_fallback_skipped)" = $((2 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((2 * nb))"
 [ "$(statf fallback_broken)" = 0 ] || fail "bomb member: overflow escalated to a framing error"
 backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
 [ "$backlog" = 0 ] || fail "bomb member: queue_backlog=$backlog after final-frame skip"

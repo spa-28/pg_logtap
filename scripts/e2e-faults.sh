@@ -109,6 +109,34 @@ setguc pg_logtap.metrics_port 9187; reload
 docker exec "$CT" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 "$(dirname "$0")/e2e-require-ext.sh" "$CT"
 
+echo "== near-capacity HTTP tuple survives real postmaster startup =="
+# With a 1906-byte path the worst-case gzip head is exactly 2048 bytes for
+# JSON, but 2052 for the boot-default NDJSON type. GUC registration must not
+# reject that intermediate default before restoring the configured JSON type.
+startup_url=$(python3 -c 'print("http://h:1/" + "p" * 1905)')
+setguc pg_logtap.export_http_content_type application/json || fail "startup: could not configure JSON"
+reload; sleep 1
+setguc pg_logtap.export_url "$startup_url" || fail "startup: valid full head refused"
+docker restart "$CT" >/dev/null || fail "startup: restart failed"
+wait_ready
+[ "$(docker exec "$CT" psql -U postgres -Atc 'SHOW pg_logtap.export_url')" = "$startup_url" ] \
+  && [ "$(docker exec "$CT" psql -U postgres -Atc 'SHOW pg_logtap.export_http_content_type')" = application/json ] \
+  || fail "startup: valid persisted tuple not restored"
+n=0; while [ "$n" -lt 20 ] && [ -z "$(worker_pid)" ]; do n=$((n + 1)); sleep 1; done
+[ -n "$(worker_pid)" ] || fail "startup: export worker did not start"
+if setguc pg_logtap.export_http_content_type application/x-ndjson >"$OUT/startup-reject.log" 2>&1; then
+  fail "startup: overflowing default Content-Type accepted"
+fi
+grep -q 'invalid value for parameter' "$OUT/startup-reject.log" || fail "startup: unrelated rejection"
+[ "$(docker exec "$CT" psql -U postgres -Atc 'SHOW pg_logtap.export_http_content_type')" = application/json ] \
+  || fail "startup: rejected type changed configuration"
+# Clear URL first, apply it, then restore defaults; reset startup noise/counters.
+setguc pg_logtap.export_url ''; reload; sleep 1
+setguc pg_logtap.export_http_content_type application/x-ndjson
+setguc pg_logtap.export_http_extra_headers ''
+docker restart "$CT" >/dev/null; wait_ready
+ok "2048-byte configured head boots; 2052-byte default head still rejected"
+
 # Markers in a file:// sink: count distinct events and duplicate seqs there.
 sink_lines() { docker exec "$CT" sh -c "grep -oE 'logtap fault $1 [0-9]+' /tmp/$2.log 2>/dev/null" | sort -u | wc -l; }
 sink_dups() { docker exec "$CT" sh -c "grep 'logtap fault' /tmp/$1.log 2>/dev/null" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l; }
@@ -378,6 +406,41 @@ done
   || fail "queue chmod-fail: repaired queue failed complete lossless replay"
 ok "foreign fd refused before fchmod; injected EPERM refused sink/queue before IO; secure retry and same-path HUP delivered 50/50 once"
 
+echo "== fresh queue refusal still syncs its new directory entry =="
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+FRESHDIR="$PGDATA_C/fresh-create-$SUF"
+FRESHQ="$FRESHDIR/queue.bin"
+docker exec -u postgres "$CT" sh -c "umask 077; mkdir '$FRESHDIR'; test ! -e '$FRESHQ'" \
+  || fail "fresh create: fixture was not nonexistent"
+set_chmod_target "$FRESHQ"
+docker exec "$CT" sh -c "printf '%s' '$FRESHDIR' > /tmp/dirsyncobserve-target; printf '%s' '$FRESHQ' > /tmp/datasyncobserve-target; rm -f /tmp/fsyncfail.log"
+q0=$(statf events_queued); lost0=$(statf events_lost); sync0=$(statf fb_sync_failures)
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.export_fallback_file "$FRESHQ"; reload; sleep 1
+gen "fresh-$SUF" 20; sleep 1
+[ "$(statf fallback_broken)" = 1 ] && [ "$(statf events_queued)" = "$q0" ] \
+  && [ "$(docker exec "$CT" stat -c %s "$FRESHQ")" = 0 ] \
+  && [ "$(docker exec "$CT" stat -c %a "$FRESHQ")" = 600 ] \
+  || fail "fresh create: refusal wrote payload or did not retain the empty inode"
+if ! docker exec "$CT" grep -q '^fchmod EPERM$' /tmp/fsyncfail.log \
+  || ! docker exec "$CT" grep -q '^fsync directory$' /tmp/fsyncfail.log; then
+  fail "fresh create: refused new inode missed its directory sync attempt"
+fi
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "fresh create: refusal counted as data sync failure"
+clear_chmod_target
+reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] && [ "$(statf events_queued)" -gt "$q0" ] \
+  || fail "fresh create: same-path repair did not park"
+docker exec "$CT" grep -q '^fdatasync OK$' /tmp/fsyncfail.log \
+  || fail "fresh create: repaired queue missed data sync"
+setguc pg_logtap.export_url 'file:///tmp/fresh-replay.log'; reload
+n=0; while [ "$n" -lt 15 ] && [ "$(sink_lines "fresh-$SUF" fresh-replay)" -lt 20 ]; do n=$((n + 1)); sleep 1; done
+[ "$(sink_lines "fresh-$SUF" fresh-replay)" = 20 ] && [ "$(sink_dups fresh-replay)" = 0 ] \
+  && [ "$(docker exec "$CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] && [ "$(statf events_lost)" = "$lost0" ] \
+  || fail "fresh create: repaired queue did not replay losslessly once"
+docker exec "$CT" rm -f /tmp/dirsyncobserve-target /tmp/datasyncobserve-target
+ok "refused fresh inode received directory sync; same-path repair synced and replayed 20/20 once"
+
 echo "== regular sink: partial write + ENOSPC -> unchanged prefix, whole RAM retry =="
 # /dev/full is now refused as a special file before write. A regular private
 # sink and the target-controlled shim exercise the actual torn-tail rollback.
@@ -411,5 +474,126 @@ docker cp "$CT:/tmp/partial.log" "$OUT/partial.log" >/dev/null
 [ "$(json_check "partial1-$SUF" "$OUT/partial.log")" = 20 ] || fail "partial write: retry left invalid JSON or incomplete lines"
 [ "$(head -n 1 "$OUT/partial.log")" = '{"canary":"partial"}' ] || fail "partial write: pre-existing prefix changed"
 ok "17-byte write then ENOSPC rolled back to the intact sink; same-file RAM retry delivered 20/20 valid JSON, no dups"
+
+echo "== healthy HUP revalidates without rescanning fully credited contents =="
+setguc pg_logtap.export_fallback_file ''
+setguc pg_logtap.export_url ''
+setguc pg_logtap.level_min 23
+# HTTP connections do not wake the worker. Keep its scrape cycle short while
+# the disabled URL prevents replay from mixing with observed credit reads.
+setguc pg_logtap.flush_interval 100; reload; sleep 1
+OBSQ="$PGDATA_C/observe-$SUF.bin"
+write_observed_queue() { # path, frame count, new|append
+  queue_redirect='>'
+  [ "$3" = append ] && queue_redirect='>>'
+  python3 - "$2" "$3" <<'PY' | docker exec -i -u postgres "$CT" sh -c "umask 077; cat $queue_redirect '$1'"
+import gzip, json, struct, sys
+count, mode = sys.argv[1:]
+out = bytearray(b"PGLTFB02" if mode == "new" else b"")
+for i in range(int(count)):
+    body = (json.dumps({"seq": 830000 + i, "message": "observed queue frame " + str(i)}) + "\n").encode()
+    member = gzip.compress(body, mtime=0)
+    out += struct.pack("<II", len(member), 1) + member
+sys.stdout.buffer.write(out)
+PY
+}
+observe_port=9187
+observe_hup() { # new listener is a worker-side barrier AFTER fb.reload
+  [ "${1:-}" = keep ] || docker exec "$CT" rm -f /tmp/fsyncfail.log
+  observe_port=$((observe_port + 1))
+  setguc pg_logtap.metrics_port "$observe_port" || fail "HUP observer: port rejected"
+  reload
+  n=0
+  while [ "$n" -lt 20 ]; do
+    docker exec "$CT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$observe_port; printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3; timeout 2 cat <&3" 2>/dev/null \
+      | grep -q 'HTTP/1.1 200' && return
+    n=$((n + 1)); sleep 1
+  done
+  fail "HUP observer: worker did not apply new listener"
+}
+scan_seen() { docker exec "$CT" grep -q '^pread ' /tmp/fsyncfail.log 2>/dev/null; }
+queue_backlog() { docker exec "$CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery'; }
+assert_credit() { # scan|cached, expected backlog
+  if [ "$1" = scan ]; then
+    scan_seen || fail "HUP observer: necessary credit scan absent"
+  else
+    scan_seen && fail "HUP observer: unchanged credited queue scanned"
+  fi
+  [ "$(queue_backlog)" = "$2" ] || fail "HUP observer: backlog=$(queue_backlog), expected $2"
+}
+write_observed_queue "$OBSQ" 3 new || fail "HUP observer: could not prepare frames"
+docker exec "$CT" sh -c "printf '%s' '$OBSQ' > /tmp/preadobserve-target"
+q0=$(statf events_queued)
+setguc pg_logtap.export_fallback_file "$OBSQ"
+observe_hup; assert_credit scan 3
+[ "$(statf events_queued)" = "$((q0 + 3))" ] || fail "HUP observer: initial credit drift"
+observe_hup; assert_credit cached 3
+observe_hup; assert_credit cached 3
+[ "$(statf events_queued)" = "$((q0 + 3))" ] || fail "HUP observer: repeated credit drift"
+# Normal worker-owned inflow must keep the fast path, not invalidate it on
+# every append. Disable ordinary replay again before observing the next HUP.
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.level_min 19
+setguc pg_logtap.flush_interval 100; observe_hup
+gen "observeown-$SUF" 3
+n=0; while [ "$n" -lt 20 ] && [ "$(queue_backlog)" != 6 ]; do n=$((n + 1)); sleep 1; done
+[ "$(queue_backlog)" = 6 ] || fail "HUP observer: own append did not park"
+setguc pg_logtap.export_url ''; setguc pg_logtap.level_min 23
+# A send under the old URL can still read before this HUP is applied. First
+# acknowledge the disabled URL, then observe a separate healthy HUP.
+observe_hup
+observe_hup; assert_credit cached 6
+# External growth before a subsequent own append must NOT be blessed by
+# that append's new stat. Only the next explicit HUP credits the unknown frame.
+setguc pg_logtap.export_url 'http://127.0.0.1:1'; setguc pg_logtap.level_min 19; observe_hup
+write_observed_queue "$OBSQ" 1 append || fail "HUP observer: external append failed"
+gen "observeunknown-$SUF" 3
+n=0; while [ "$n" -lt 20 ] && [ "$(queue_backlog)" != 9 ]; do n=$((n + 1)); sleep 1; done
+[ "$(queue_backlog)" = 9 ] || fail "HUP observer: own append accounting changed before credit"
+setguc pg_logtap.export_url ''; setguc pg_logtap.level_min 23
+observe_hup; assert_credit scan 10
+observe_hup; assert_credit cached 10
+# Change a gzip MTIME byte, not its valid body/CRC, and force a different
+# content mtime. Neither the inode nor the byte size changes.
+old_size=$(docker exec "$CT" stat -c %s "$OBSQ")
+old_inode=$(docker exec "$CT" stat -c %i "$OBSQ")
+old_hash=$(docker exec "$CT" sha256sum "$OBSQ")
+docker exec -u postgres "$CT" sh -c "printf '\001' | dd of='$OBSQ' bs=1 seek=20 count=1 conv=notrunc 2>/dev/null; touch -d '2001-01-01 UTC' '$OBSQ'"
+[ "$(docker exec "$CT" stat -c %s "$OBSQ")" = "$old_size" ] \
+  && [ "$(docker exec "$CT" stat -c %i "$OBSQ")" = "$old_inode" ] \
+  && [ "$(docker exec "$CT" sha256sum "$OBSQ")" != "$old_hash" ] \
+  || fail "HUP observer: same-size rewrite fixture invalid"
+observe_hup; assert_credit scan 10
+observe_hup; assert_credit cached 10
+docker exec -u postgres "$CT" sh -c "cp '$OBSQ' '$OBSQ.swap'; chmod 0600 '$OBSQ.swap'; mv '$OBSQ.swap' '$OBSQ'"
+[ "$(docker exec "$CT" stat -c %i "$OBSQ")" != "$old_inode" ] || fail "HUP observer: inode not replaced"
+observe_hup; assert_credit scan 10
+observe_hup; assert_credit cached 10
+open_warn0=$(statf warn_fallback_open)
+set_chmod_target "$OBSQ"; observe_hup
+# With export disabled flushAll does not publish worker gauges. The direct
+# warning and syscall observer still prove refusal before any payload read.
+[ "$(statf warn_fallback_open)" -gt "$open_warn0" ] \
+  || fail "HUP observer: chmod refusal not reported"
+docker exec "$CT" grep -q '^fchmod EPERM' /tmp/fsyncfail.log \
+  || fail "HUP observer: chmod refusal not observed"
+scan_seen && fail "HUP observer: refused queue payload was read"
+clear_chmod_target; observe_hup; assert_credit scan 10
+observe_hup; assert_credit cached 10
+postmaster0=$(docker exec "$CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')
+wpid=$(worker_pid); [ -n "$wpid" ] || fail "HUP observer: worker missing"
+docker exec "$CT" rm -f /tmp/fsyncfail.log
+docker exec "$CT" kill -TERM "$wpid"
+n=0; new_wpid=$wpid
+while [ "$n" -lt 20 ] && { [ -z "$new_wpid" ] || [ "$new_wpid" = "$wpid" ]; }; do
+  n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
+done
+[ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] \
+  && [ "$(docker exec "$CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')" = "$postmaster0" ] \
+  || fail "HUP observer: worker replacement failed or restarted postmaster"
+observe_hup keep; assert_credit scan 10
+observe_hup; assert_credit cached 10
+docker exec "$CT" rm -f /tmp/preadobserve-target
+ok "healthy HUP/known append avoid scans; external growth/rewrite/inode/repair/replacement still credit exactly"
 
 echo "e2e-faults: all scenarios passed"

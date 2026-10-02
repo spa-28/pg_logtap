@@ -483,9 +483,19 @@ expect_update_fail "$DB_HISTORICAL" 'historical type dependency'
 query "$DB_HISTORICAL" "SELECT count(*) FROM public.keep_stats" >/dev/null \
   || fail "upgrade: type-dependency failure lost external table"
 
-psql_db "$DB_HISTORICAL" >/dev/null <<SQL
+psql_db "$DB_HISTORICAL" >/dev/null <<SQL || fail "upgrade: historical normalization with quote_all_identifiers=off failed"
+BEGIN;
+SET LOCAL quote_all_identifiers = off;
 DROP TABLE public.keep_stats;
 ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+DO \$check\$
+BEGIN
+    IF current_setting('quote_all_identifiers') IS DISTINCT FROM 'off' THEN
+        RAISE EXCEPTION 'historical normalization changed quote_all_identifiers';
+    END IF;
+END
+\$check\$;
+COMMIT;
 SQL
 [ "$(object_ids "$DB_HISTORICAL")" != "$historical_before" ] \
   || fail "upgrade: historical normalization preserved stale OIDs"
@@ -571,7 +581,39 @@ SELECT * FROM jsonb_populate_record(
   $SCHEMA.pg_logtap_stats_json()::jsonb
 ) WHERE false;
 SQL
-expect_update_fail "$DB_041" 'custom view definition'
+expect_update_fail "$DB_041" 'custom view definition' 'pg_logtap_delivery has a custom definition; restore the released view and retry the update'
+custom_view_fingerprint=$(fingerprint "$DB_041") \
+  || fail "upgrade: could not fingerprint custom view"
+for quote_identifiers in off on; do
+  psql_db "$DB_041" >/dev/null <<SQL || fail "upgrade: custom view rejection with quote_all_identifiers=$quote_identifiers failed"
+BEGIN;
+SET LOCAL quote_all_identifiers = $quote_identifiers;
+DO \$check\$
+BEGIN
+    BEGIN
+        ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+        RAISE EXCEPTION 'custom view definition was accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM <> 'pg_logtap_delivery has a custom definition; restore the released view and retry the update' THEN
+            RAISE;
+        END IF;
+    END;
+    IF current_setting('quote_all_identifiers') IS DISTINCT FROM '$quote_identifiers' THEN
+        RAISE EXCEPTION 'custom view rejection changed quote_all_identifiers';
+    END IF;
+END
+\$check\$;
+COMMIT;
+SQL
+  [ "$(extversion "$DB_041")" = 0.6.0 ] \
+    || fail "upgrade: custom view rejection with quote_all_identifiers=$quote_identifiers changed extversion"
+  [ "$(object_ids "$DB_041")" = "$oids_041" ] \
+    || fail "upgrade: custom view rejection with quote_all_identifiers=$quote_identifiers changed OIDs"
+  [ "$(column_order "$DB_041")" = "$order_041" ] \
+    || fail "upgrade: custom view rejection with quote_all_identifiers=$quote_identifiers changed column order"
+  [ "$(fingerprint "$DB_041")" = "$custom_view_fingerprint" ] \
+    || fail "upgrade: custom view rejection with quote_all_identifiers=$quote_identifiers changed SQL API fingerprint"
+done
 psql_db "$DB_041" >/dev/null <<SQL
 CREATE OR REPLACE VIEW $SCHEMA.pg_logtap_delivery AS
 SELECT * FROM jsonb_populate_record(
@@ -596,7 +638,19 @@ query "$DB_041" "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM $PROBE_RO
   || fail "upgrade: rejected metadata changed 0.4.1-chain OIDs"
 [ "$(column_order "$DB_041")" = "$order_041" ] \
   || fail "upgrade: rejected metadata changed 0.4.1-chain order"
-query "$DB_041" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.1'" >/dev/null
+psql_db "$DB_041" >/dev/null <<SQL || fail "upgrade: 0.4.1 normalization with quote_all_identifiers=on failed"
+BEGIN;
+SET LOCAL quote_all_identifiers = on;
+ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+DO \$check\$
+BEGIN
+    IF current_setting('quote_all_identifiers') IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION '0.4.1 normalization changed quote_all_identifiers';
+    END IF;
+END
+\$check\$;
+COMMIT;
+SQL
 [ "$(object_ids "$DB_041")" != "$oids_041" ] \
   || fail "upgrade: 0.4.1-chain normalization preserved stale OIDs"
 check_final "$DB_041" || fail "upgrade: 0.4.1 chain shape check failed"

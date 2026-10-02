@@ -25,6 +25,7 @@ DECLARE
     actual_view_definition text;
     expected_view_tail text;
     saved_search_path text;
+    saved_quote_all_identifiers text;
     canonical_order constant text[] := ARRAY[
         'events_captured',
         'events_dropped',
@@ -253,13 +254,15 @@ BEGIN
             'pg_logtap SQL objects have nonbaseline ownership or array metadata; restore extension-owner defaults and retry';
     END IF;
 
+    saved_search_path := current_setting('search_path');
+    saved_quote_all_identifiers := current_setting('quote_all_identifiers');
+    PERFORM pg_catalog.set_config('quote_all_identifiers', 'off', true);
     SELECT string_agg(pg_catalog.format('%I', u.attribute_name), ', '
                       ORDER BY u.ordinality),
            string_agg(pg_catalog.format('jsonb_populate_record.%I', u.attribute_name), ', '
                       ORDER BY u.ordinality)
       INTO column_list, qualified_column_list
       FROM unnest(stats_order) WITH ORDINALITY AS u(attribute_name, ordinality);
-    saved_search_path := current_setting('search_path');
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
     /* Normalize only whitespace outside quoted identifiers. PG15 qualifies
        projection columns; accept that spelling without rewriting schema names. */
@@ -276,6 +279,7 @@ BEGIN
     expected_view_tail := pg_catalog.format(
         ' FROM jsonb_populate_record(NULL::%I.pg_logtap_stats_t, (%I.pg_logtap_stats_json())::jsonb) jsonb_populate_record(%s);',
         extension_schema, extension_schema, column_list);
+    PERFORM pg_catalog.set_config('quote_all_identifiers', saved_quote_all_identifiers, true);
     IF actual_view_definition NOT IN (
         'SELECT ' || column_list || expected_view_tail,
         'SELECT ' || qualified_column_list || expected_view_tail
