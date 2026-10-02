@@ -23,7 +23,6 @@ cp pg_logtap.control sql/*.sql "$TEMP/runtime/extension/"
 cp "dist/pg$PG/lib/pg_logtap.so.debug" "$TEMP/debug/lib/"
 tar -C "$TEMP/runtime" -czf "$OUT/$PACKAGE.tar.gz" .
 tar -C "$TEMP/debug" -czf "$OUT/$PACKAGE-debug.tar.gz" .
-python3 scripts/archive-smoke.py --self-test
 python3 scripts/archive-smoke.py "$OUT/$PACKAGE.tar.gz" "$OUT/$PACKAGE-debug.tar.gz" "$ARCH" "$VERSION"
 # Unique per invocation: neither smoke builds nor runs touch developer stands.
 IMAGE=pglogtap-archive-el8-pg$PG-$(basename "$TEMP" | tr '[:upper:]' '[:lower:]')

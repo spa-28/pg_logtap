@@ -102,6 +102,59 @@ def elf_pair(runtime, debug, arch):
     link.unlink()
 
 
+def elf_negative_test(runtime, debug, arch):
+    cases = [("runtime ELF", None), ("debug ELF", None),
+             ("debuglink filename", "wrong debuglink filename"),
+             ("debuglink CRC", "debuglink CRC mismatch")]
+    cases += [(section, "debug archive has no complete DWARF")
+              for section in (".debug_info", ".debug_abbrev", ".debug_line")]
+    for case, diagnostic in cases:
+        # Keep fixtures outside the extraction root and start each from a valid pair.
+        with tempfile.TemporaryDirectory(prefix="elf-negative-") as temp:
+            root = Path(temp)
+            rt, dt = root / runtime.name, root / debug.name
+            shutil.copyfile(str(runtime), str(rt))
+            shutil.copyfile(str(debug), str(dt))
+            header_command = None
+            if case in ("runtime ELF", "debug ELF"):
+                bad = rt if case == "runtime ELF" else dt
+                with bad.open("r+b") as target:
+                    target.write(b"BAD!")
+                header_command = ["readelf", "-W", "-h", str(bad)]
+            else:
+                link, output = root / "link.bin", root / "mutated.so"
+                subprocess.check_call(["objcopy", "--dump-section", ".gnu_debuglink=" + str(link),
+                                       str(rt), str(output)])
+                output.unlink()
+                data = bytearray(link.read_bytes())
+                crc_offset = (data.find(b"\0") + 4) & ~3
+                if case == "debuglink filename":
+                    data[:len(b"pg_logtap.so.debug")] = b"pg_logtap.so.wrong"
+                elif case == "debuglink CRC":
+                    data[crc_offset] ^= 1
+                else:
+                    subprocess.check_call(["objcopy", "--remove-section=" + case, str(dt), str(output)])
+                    output.replace(dt)
+                    # Isolate the DWARF check: the modified debug file still has a matching CRC.
+                    data[crc_offset:] = struct.pack("<I", zlib.crc32(dt.read_bytes()) & 0xffffffff)
+                link.write_bytes(data)
+                subprocess.check_call(["objcopy", "--update-section", ".gnu_debuglink=" + str(link),
+                                       str(rt), str(output)])
+                output.replace(rt)
+            # Preparation failures must never count as successful rejection.
+            try:
+                elf_pair(rt, dt, arch)
+            except ValueError as error:
+                require(diagnostic is not None and str(error) == diagnostic,
+                        "wrong rejection for " + case + ": " + str(error))
+            except subprocess.CalledProcessError as error:
+                require(header_command is not None and error.cmd == header_command and error.returncode != 0,
+                        "unexpected subprocess failure for " + case + ": " + str(error))
+            else:
+                raise AssertionError("accepted unsafe ELF fixture: " + case)
+    print("temporary negative ELF fixtures: 7/7 OK (headers, debuglink name/CRC, required DWARF)")
+
+
 def validate(runtime, debug, arch, version, destination):
     # Open both once: validation and extraction use the same file descriptors.
     with tarfile.open(runtime, "r:gz") as rt, tarfile.open(debug, "r:gz") as dt:
@@ -115,7 +168,14 @@ def validate(runtime, debug, arch, version, destination):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     with archive.extractfile(member) as source, path.open("wb") as target:
                         shutil.copyfileobj(source, target)
-            elf_pair(root / "lib/pg_logtap.so", root / "lib/pg_logtap.so.debug", arch)
+            runtime_path, debug_path = root / "lib/pg_logtap.so", root / "lib/pg_logtap.so.debug"
+            original = (runtime_path.read_bytes(), debug_path.read_bytes())
+            elf_pair(runtime_path, debug_path, arch)
+            self_test()
+            elf_negative_test(runtime_path, debug_path, arch)
+            elf_pair(runtime_path, debug_path, arch)
+            require(original == (runtime_path.read_bytes(), debug_path.read_bytes()),
+                    "ELF validation changed the release binaries")
             if destination:
                 # Only publish an entirely validated pair to a fresh directory.
                 shutil.copytree(str(root), destination)
