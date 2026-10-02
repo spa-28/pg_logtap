@@ -23,8 +23,31 @@
   rendered request head exceeds 2048 bytes are rejected at configuration time;
   runtime sending uses the same renderer and limits.
 
+- Failed fallback `fdatasync` calls increment the shared counter immediately;
+  `fb_sync_failures` no longer regresses on a soft export-worker restart.
+- Explicit reload revalidates a repaired fallback queue at the same path.
+  Changing or disabling the path waits until the active queue is proven drained;
+  a replacement worker retains that active path even if a different path is
+  already configured. Repeat reload after drain to apply the change.
+
+### Added
+
+- `pg_logtap_queue_backlog` exposes the exact fallback event backlog to
+  Prometheus, subtracting replay, cap trimming and counted unreadable-frame
+  skips from the same locked snapshot used by SQL.
+- `/livez` aliases `/healthz`; `/readyz` reports the last real delivery attempt
+  for the current export URL. Startup, disabled export, URL changes and failed
+  attempts are unready; successful slow sends remain ready even with backlog.
+- Release archive checks validate member paths/types, architecture, glibc
+  requirements and detached debug symbols. Native PG15–18 builds smoke the
+  exact runtime/debug archives on glibc 2.28 before uploading those bytes.
+
 ### Security
 
+- `file://` sinks, fallback queues and compaction temporary files require
+  worker-owned regular single-link descriptors with verified `0600` permissions
+  before IO. Final-component symlinks, hardlinks, foreign-owned files and
+  special files are refused; permission failures no longer permit export.
 - `export_http_extra_headers` is superuser-only, hiding bearer tokens and other
   credentials from ordinary roles. Superusers and trusted settings readers
   (`pg_read_all_settings`, including `pg_monitor`) can still read it.

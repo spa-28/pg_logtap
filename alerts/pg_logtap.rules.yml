@@ -46,12 +46,12 @@ groups:
         annotations:
           summary: "pg_logtap fallback queue disabled on {{ $labels.instance }}"
           description: >-
-            The fallback file has foreign or corrupt framing and is no longer
-            appended to or replayed: durability quietly degraded to the RAM
-            backlog bound. Remove or fix the file, then repoint
-            pg_logtap.export_fallback_file to a different path (a path-string
-            change re-checks the file and clears the flag) or restart the
-            worker.
+            The fallback file failed private-file validation or has foreign
+            or corrupt framing and is no longer appended to or replayed:
+            durability degraded to the RAM backlog bound. Repair the active
+            file and explicitly reload to revalidate it. An unread or
+            uncheckable queue blocks path changes, including disabling
+            fallback; after it drains, repeat reload to apply a new path.
       - alert: PgLogtapDnsFailing
         expr: pg_logtap_dns_fail_streak > 10
         for: 5m

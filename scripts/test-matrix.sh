@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,upgrade,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,upgrade,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide,archive}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e # the shared stand's root; per-major dirs live under it
 mkdir -p "$OUT"
@@ -312,6 +312,10 @@ phase_wide() { # <v>: pg_logtap.message_max=8192 (POSTMASTER): whole messages
   scripts/e2e-wide.sh "pglogtap-mx$1"
 }
 
+phase_archive() { # <v>: exact runtime/debug release archives on actual EL8.
+  scripts/archive-smoke.sh "$1"
+}
+
 phase_bench() { # <v> <secs>: formal overhead benchmark (docs/bench.md) —
   # pgbench before/after the extension, TPS/CPU/events/s/latency report. Not
   # in the default PHASES: benchmark numbers from shared CI runners are
@@ -369,6 +373,9 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
   fi
   if [ "$ok" = 1 ] && has_phase wide; then
     phase_wide "$v" || { echo "pg$v: wide FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase archive; then
+    phase_archive "$v" || { echo "pg$v: archive/glibc-2.28 FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase bench; then
     phase_bench "$v" "$SECS" || { echo "pg$v: bench FAILED"; STATUS=1; ok=0; }

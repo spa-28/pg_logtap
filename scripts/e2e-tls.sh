@@ -63,6 +63,24 @@ set -u
 e2e_init tls "${1:-}"
 N="${2:-10}"
 e2e_gate
+METRICS_PORT0=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.metrics_port") \
+  || fail "could not snapshot metrics port"
+http_code() {
+  docker exec "$PG_CT" bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/9187 || exit
+    printf "GET %s HTTP/1.0\r\n\r\n" "$1" >&3
+    IFS= read -r -t 8 line <&3 || exit
+    set -- $line; printf "%s\n" "$2"
+  ' bash "$1" 2>/dev/null
+}
+expect_ready() {
+  n=0
+  while [ "$n" -lt 15 ]; do
+    [ "$(http_code /readyz)" = "$1" ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "TLS receiver readyz did not become $1"
+}
 DIR=$OUT/tls # per-major under E2E_OUT: certs and sinks are rm'd/regenerated per run
 OUT=$DIR/https-out.jsonl
 TCPS_OUT=$DIR/tcps-out.jsonl
@@ -374,7 +392,14 @@ httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 PYEOF
 RECV=$!
-trap 'kill $RECV 2>/dev/null' EXIT INT TERM
+cleanup() {
+  cleanup_status=$?
+  trap - EXIT INT TERM
+  kill "$RECV" 2>/dev/null || true
+  setguc pg_logtap.metrics_port "$METRICS_PORT0" && reload || cleanup_status=1
+  exit "$cleanup_status"
+}
+trap cleanup EXIT INT TERM
 i=0
 until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1); socket.create_connection(('127.0.0.1', $PORT_T12), 1); socket.create_connection(('127.0.0.1', $PORT_WDRIB), 1); socket.create_connection(('127.0.0.1', $PORT_TDRIB), 1)" 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
@@ -413,7 +438,7 @@ set_gucs() { # each ALTER SYSTEM its own -c: a multi-statement -c silently fails
 # this suite's deliberate failure phases would park to it, and the tiny
 # inherited cap compacts the parked batches away — disk noise the TLS
 # asserts do not want. RAM backlog only.
-set_gucs "pg_logtap.export_fallback_file = ''"
+set_gucs "pg_logtap.export_fallback_file = ''" "pg_logtap.metrics_port = '9187'"
 
 # --- phase 1: verified https. server_name exercises the GUC AND the std
 # limitation it exists for: verifyHostName matches dNSName SANs only, an
@@ -424,7 +449,8 @@ set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_tls_verify = on"
 gen p1 "$N"
 wait_for p1 "$N" "$OUT"
-echo "phase 1 ok: verified https delivered $N/$N"
+expect_ready 200
+echo "phase 1 ok: verified https delivered $N/$N, readyz=200"
 
 # --- phase 2: no CA → handshake must fail, then recover with replay
 set_gucs "pg_logtap.export_tls_ca = ''"
@@ -433,11 +459,15 @@ sleep 3 # a couple of flush cycles of guaranteed failures
 FAILED=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
 [ "$FAILED" -gt 0 ] 2>/dev/null || { echo "e2e-tls: phase 2 expected failed cycles with the ca cleared, got $FAILED"; exit 1; }
 [ "$(received p2fail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2 leaked $(received p2fail "$OUT") events through an unverified handshake"; exit 1; }
+expect_ready 503
+[ "$(http_code /healthz)" = 200 ] && [ "$(http_code /livez)" = 200 ] \
+  || fail "TLS CA failure broke liveness"
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen p2re "$N" # live events join the buffered ones on recovery
 wait_for p2fail "$N" "$OUT"
 wait_for p2re "$N" "$OUT"
-echo "phase 2 ok: $FAILED failed cycles, nothing delivered unverified, $N buffered + $N live replayed"
+expect_ready 200
+echo "phase 2 ok: $FAILED failed cycles, nothing delivered unverified, $N buffered + $N live replayed; same URL readyz=503→200"
 
 # --- phase 2b: a CA file that exists but holds no certificates (created
 # empty, or the wrong file pointed at) must fail the handshake the same way
@@ -469,10 +499,12 @@ FAILED2C=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"
 [ "$(received p2cfail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2c leaked $(received p2cfail "$OUT") events through an unverified handshake"; exit 1; }
 qsz=$(docker exec "$PG_CT" stat -c %s "$PGD/$FB_TLS" 2>/dev/null || echo 0)
 [ "$qsz" -gt 8 ] || { echo "e2e-tls: phase 2c nothing parked on the fallback file ($qsz bytes — RAM backlog only?)"; exit 1; }
+expect_ready 503
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen p2cre "$N"
 wait_for p2cfail "$N" "$OUT"
 wait_for p2cre "$N" "$OUT"
+expect_ready 200
 qsz=$(docker exec "$PG_CT" stat -c %s "$PGD/$FB_TLS" 2>/dev/null || echo 0)
 [ "$qsz" = 0 ] || { echo "e2e-tls: phase 2c queue not drained after replay ($qsz bytes left)"; exit 1; }
 set_gucs "pg_logtap.export_fallback_file = ''" # later failure phases stay RAM-only

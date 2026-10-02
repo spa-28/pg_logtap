@@ -39,6 +39,15 @@ writer: the rollback truncates to the last full batch boundary, so
 another process appending concurrently loses whatever it landed after
 that point — keep the file pg_logtap's own.
 
+Local sink/queue/compaction files must be regular, owned by the worker's
+effective UID, single-link and verified `0600` before IO. Existing wider
+worker-owned files are tightened; failed chmod or verification refuses IO.
+Final-component symlinks, hardlinks, FIFOs, devices and foreign-owned files are
+unsupported. A refused sink retries through fallback/RAM; a refused queue sets
+`fallback_broken=1`. These failures do not increase `fb_sync_failures`.
+Parent directories must be trusted: `O_NOFOLLOW` does not protect ancestor
+components, and single-link ownership does not make concurrent writers safe.
+
 Measured end-to-end (v0.3.0, pg_logtap → Vector http → VictoriaLogs
 jsonline insert, docker stand, warning-size lines): a 1000-event batch
 becomes queryable in VictoriaLogs ~2 s after generation — one
@@ -365,6 +374,24 @@ point, and until one does the affected member sits in the OS-crash window
 that `fb_sync_failures` names. Events replay throughout either way; only
 crash-durability is at stake.
 
+### Reload and path changes
+
+The active path is resolved explicitly at startup/reload, not when a flush
+reads the GUC. Changing `export_fallback_file` from A to B (or `''` to disable)
+requires proof that A is drained. An unread, broken or uncheckable A is not
+empty: the worker retains A and warns, without moving/deleting its file or
+resetting queue accounting. Recover the receiver or repair A, let it drain,
+then repeat `SELECT pg_reload_conf()` to apply B. There is no automatic pending
+switch. A pre-existing B is scanned and credited before replay.
+
+`SHOW pg_logtap.export_fallback_file` reports the configured value B even while
+A remains active. The deferred-change warning identifies A. A soft worker
+replacement restores A from shared memory, together with its cursor, rather
+than adopting configured B. A **full postmaster restart clears that choice**:
+drain A or restore configured A before restarting, otherwise the new worker
+opens B and A requires operator recovery. There is no on-disk active-path
+journal or automatic discovery of old queues.
+
 ### Size cap: `fallback_max_mb`
 
 The queue grows without bound through an outage — by default until the disk
@@ -399,13 +426,14 @@ endpoint — the debug-storm profile): 0.82 MB/s of queue at ~12.2k ev/s,
 reached after ~10 minutes of that storm; ordinary production rates (tens
 to hundreds of events/s) fill it over hours to days.
 
-A file the worker cannot open at all (a symlink at the path, `EACCES`,
-`EROFS`), did not write (foreign/corrupt framing), or cannot count exactly
-(an unreadable legacy v1 member), sets `fallback_broken=1` with one WARNING:
-the queue is disabled — neither appended to nor replayed — and durability
-degrades to the RAM-backlog bound until the GUC points at a **different** path
-or the worker restarts (the repoint re-checks the file; pointing back at the
-same bad path changes nothing). Unreadable v2 payloads do not break the queue:
+A file the worker cannot safely open (symlink, foreign owner, hardlink,
+failed `0600` enforcement, `EACCES`, `EROFS`), did not write (foreign/corrupt
+framing), or cannot count exactly (an unreadable legacy v1 member), sets
+`fallback_broken=1`: the queue is disabled — neither appended to nor replayed —
+and durability degrades to the RAM-backlog bound. Repair the file/permissions
+and explicitly reload; a same-path reload securely revalidates the queue and
+restores its published cursor without resetting counters. Unreadable v2
+payloads do not break the queue:
 the stored count lets the worker skip them exactly and continue replay. If the
 payload remains readable but its count metadata differs, the payload's NDJSON
 line count is authoritative and all readable events are replayed.
@@ -467,6 +495,26 @@ sustained capture past export capacity, a full disk, cap trimming, or an
 unreadable counted member. An unreadable legacy member instead breaks the
 queue; later live events then take the RAM-backlog path.
 
+## Liveness, readiness and backlog
+
+With `metrics_port` enabled, `/healthz` and its `/livez` alias return 200 when
+the export worker serves the request. They do not prove receiver availability.
+`/readyz` returns 200 after the latest actual delivery attempt for the current
+export URL succeeded; it returns 503 at startup before an attempt, while
+export is disabled, after an actual URL change until success, or after a failed
+attempt. Both live sends and fallback replay update readiness. Idle cycles and
+unrelated reloads preserve the result; HTTP probes never initiate a receiver
+connection. The ACK/transport semantics above still apply: readiness is not
+proof of downstream persistence. Slow successful sends and nonzero backlog do
+not make a receiver unready. A blocked worker can still delay all probe replies.
+
+Use `pg_logtap_queue_backlog` for the same exact fallback-event count as SQL
+`queue_backlog`: queued minus replayed, cap-trimmed and counted unreadable-frame
+skips, with saturating subtraction. Do not derive it from only queued minus
+replayed; that overstates discarded members. It excludes ring/RAM events and
+bytes and does not assert fsync durability. Monitor it alongside
+`pg_logtap_fallback_broken`, `pg_logtap_fb_sync_failures` and loss counters.
+
 ## Alerting
 
 Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules.yml):
@@ -474,7 +522,7 @@ Ready-to-apply rules in [`alerts/pg_logtap.rules.yml`](../alerts/pg_logtap.rules
 - `PgLogtapEventsLost` — `increase(pg_logtap_events_lost_total[5m]) > 0`: backlog overflow — capture sustained past export capacity (receiver too slow or down longer than export_backlog_max/r).
 - `PgLogtapRingDropped` — `increase(pg_logtap_events_dropped_total[5m]) > 0`: capture-time ring overflow (worker stalled or r above drain rate).
 - `PgLogtapExportFailing` — `increase(pg_logtap_send_cycles_failed_total[5m]) > 0` for 5m: sends failing right now (benign while the fallback file absorbs, but the receiver is not keeping up).
-- `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file cannot be opened (a symlink at its path, permissions, a read-only disk) or failed its framing check (foreign content, two clusters sharing one file) — delivery degraded to the RAM bound; needs an operator: point the GUC at a different path or restart.
+- `PgLogtapFallbackQueueBroken` — `pg_logtap_fallback_broken == 1` for 5m: the fallback file cannot be opened (a symlink at its path, permissions, a read-only disk) or failed its framing check (foreign content, two clusters sharing one file) — delivery degraded to the RAM bound; needs an operator: repair the active file and explicitly reload; an unread or uncheckable queue blocks repointing.
 - `PgLogtapDnsFailing` — `pg_logtap_dns_fail_streak > 10` for 5m: the worker's DNS lookups keep failing (streak, not count — 10 consecutive flush cycles); events park on the fallback file meanwhile. Not an outage by itself: delivery continues via the last-known-good address while it stays valid.
 - `PgLogtapFbSyncFailing` — `increase(pg_logtap_fb_sync_failures[5m]) > 0` for 5m: the fallback queue's `fdatasync` keeps failing — the disk is not making parked events durable. Events still replay (the members are in the file), so this is the dying-disk signal, not a loss signal.
 - `PgLogtapRedactPatternFailed` — `pg_logtap_redact_pattern_failed == 1`: `redact_pattern` passed validation but unexpectedly failed assign-time compilation; the previous compiled redactor remains active, if one existed. Check the server log and retry the assignment. Ordinary invalid patterns are rejected without changing this gauge.
@@ -490,7 +538,8 @@ events_dropped + events_lost + in-flight/ring`: `queue_backlog` removes
 replayed events, cap-trimmed events, and exact-count unreadable v2 frames, so
 none are double-counted with delivery or loss. Names are identical in
 `pg_logtap_stats()` text, the `pg_logtap_delivery` view and the Prometheus
-exposition; the view adds derived `queue_backlog` and `delivered`.
+exposition; the view adds derived `queue_backlog` and `delivered`, and
+Prometheus exposes that same backlog as `pg_logtap_queue_backlog`.
 
 `events_replayed ≤ events_queued` remains stable across a soft export-worker
 restart: the replacement validates and restores the shared-memory replay
@@ -510,9 +559,9 @@ replay; it is not required for truthful soft-restart accounting.
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while undelivered (also in `events_lost`; never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow with no fallback file, an unreadable counted (v2) queue member skipped by its stored count, or a `fallback_max_mb` compaction dropping undelivered members; readable v2 payloads use their actual NDJSON line count even if count metadata differs |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
-| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this counter is monotonic — a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth (`PgLogtapFbSyncFailing` uses `increase()`), not its level |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this shared counter is monotonic across reloads, fallback reconfiguration and soft worker replacement, resetting only with the postmaster — a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth (`PgLogtapFbSyncFailing` uses `increase()`), not its level |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life): https/tcps is shipping unauthenticated. The server-log line is edge-triggered; this is its cumulative copy |
 | `warn_fallback_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
-| `warn_fallback_skipped` | **lines** | an unreadable counted (v2) queue member was skipped (twice per member after a postmaster restart: the boot credit scan, then the drain; not repeated by a soft worker restart after cursor/accounting publication); its stored event count enters `events_lost` and leaves `queue_backlog` |
+| `warn_fallback_skipped` | **lines** | an unreadable counted (v2) queue member was observed during a boot/reload credit scan or replay. Explicit same-path reload scans unread members again; a soft worker restart resumes after the published cursor. Only actual replay accounts the stored event count in `events_lost` and removes it from `queue_backlog`, not the credit scans |
 | `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

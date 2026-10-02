@@ -415,6 +415,33 @@ pub fn bumpExportCursor(sent: u64, queued: u64, replayed: u64, failed: u64, lost
     unlockRing();
 }
 
+/// Copy the active queue path, not necessarily the latest configured path.
+/// null is first boot; an empty initialized path is deliberately disabled.
+pub fn fallbackPath(buf: *[4096]u8) ?usize {
+    if (!ready) return null;
+    lockRing();
+    defer unlockRing();
+    if (state.fallback_path_initialized == 0) return null;
+    const len: usize = state.fallback_path_len;
+    @memcpy(buf[0..len], state.fallback_path[0..len]);
+    buf[len] = 0;
+    return len;
+}
+
+/// Only the worker adopts a path, after the old queue is proven drained.
+/// Publish before crediting the new file: a replacement must resume that file.
+pub fn setFallbackPath(path: []const u8) void {
+    if (!ready) return;
+    std.debug.assert(path.len < state.fallback_path.len);
+    lockRing();
+    @memcpy(state.fallback_path[0..path.len], path);
+    state.fallback_path[path.len] = 0;
+    state.fallback_path_len = @intCast(path.len);
+    state.fallback_path_initialized = 1;
+    state.fallback_cursor_valid = 0;
+    unlockRing();
+}
+
 /// A successful drain reuses the inode after truncation, so its old EOF must
 /// stop being a resumable boundary before that inode can hold a new queue.
 pub fn invalidateFallbackCursor() void {
@@ -443,12 +470,20 @@ pub fn fallbackOffset(dev: i64, ino: u64, size: u64) u64 {
 /// Worker-owned gauges, republished every flush cycle: the worker-local
 /// originals (dns_fail_streak, fb_broken) die with the process, so a restart
 /// must overwrite possibly-stale copies here within one cycle.
-pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8, fb_sync_fails: u64) void {
+pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8) void {
     if (!ready) return;
     lockRing();
     state.dns_fail_streak = dns_fail;
     state.fallback_broken = fb_broken;
-    state.fb_sync_failures = fb_sync_fails;
+    unlockRing();
+}
+
+/// Publish each actual failed queue fdatasync immediately, not a worker-local
+/// absolute total: shared memory outlives a replacement export worker.
+pub fn bumpFbSyncFailure() void {
+    if (!ready) return;
+    lockRing();
+    state.fb_sync_failures += 1;
     unlockRing();
 }
 
@@ -562,7 +597,7 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.queued,
         snap.replayed,
         snap.compacted,
-        snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded,
+        snap.queueBacklog(),
         snap.sent +| snap.replayed,
         snap.export_lost,
         snap.send_failed,

@@ -96,6 +96,11 @@ pub const ShmState = extern struct {
     fallback_ino: u64 = 0,
     fallback_offset: u64 = 0,
     fallback_cursor_valid: u8 = 0,
+    /// A deferred path change must not orphan this queue on worker replacement.
+    /// Empty + initialized means deliberately disabled, not first boot.
+    fallback_path: [4096]u8 = @splat(0),
+    fallback_path_len: u32 = 0,
+    fallback_path_initialized: u8 = 0,
     send_failed: u64 = 0,
     export_lost: u64 = 0,
     /// Consecutive failed getaddrinfo lookups in the export worker; 0 after
@@ -172,6 +177,10 @@ pub const Stats = struct {
     count: u32,
     capacity: u32,
     seq_next: u64,
+
+    pub fn queueBacklog(snap: Stats) u64 {
+        return snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded;
+    }
 };
 
 /// Append an event: head + message bytes. Caller holds the lock. On overflow

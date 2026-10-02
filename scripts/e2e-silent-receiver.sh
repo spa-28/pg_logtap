@@ -14,6 +14,14 @@ e2e_init silent "${1:-}"
 PORT="${2:-9499}"
 SINK=pglogtap-silent
 e2e_gate
+http_code() {
+  docker exec "$PG_CT" bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/9187 || exit
+    printf "GET %s HTTP/1.0\r\n\r\n" "$1" >&3
+    IFS= read -r -t 8 line <&3 || exit
+    set -- $line; printf "%s\n" "$2"
+  ' bash "$1" 2>/dev/null
+}
 
 # 1s timeout, fallback file on: failed sends must divert, not lose.
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_timeout_ms = 1000" \
@@ -87,13 +95,14 @@ fail=$((fail - bfail)); que=$((que - bque)); drp=$((drp - bdrp)); lost=$((lost -
 # whole cluster when it reaps an unknown signalled child: a container
 # footgun that looks exactly like an extension crash. On unfixed code the
 # read times out (status >128, no signal escapes).
-healthz=$(docker exec "$PG_CT" bash -c \
-  'exec 3<>/dev/tcp/127.0.0.1/9187 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && IFS= read -r -t 8 line <&3 && echo "$line"' \
-  2>/dev/null)
+healthz=$(http_code /healthz)
+livez=$(http_code /livez)
+readyz=$(http_code /readyz)
 
-echo "first_failed_ms=$elapsed_ms failed_cycles=$fail queued=$que dropped=$drp lost=$lost healthz=${healthz:-none}"
-[ "$fail" -ge 1 ] && [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] && [ -n "$healthz" ] \
-  || fail "silent receiver: timeout, parking or healthz assertion failed"
+echo "first_failed_ms=$elapsed_ms failed_cycles=$fail queued=$que dropped=$drp lost=$lost healthz=${healthz:-none} livez=${livez:-none} readyz=${readyz:-none}"
+[ "$fail" -ge 1 ] && [ "$que" -ge 1 ] && [ "$drp" -eq 0 ] && [ "$lost" -eq 0 ] \
+  && [ "$healthz" = 200 ] && [ "$livez" = 200 ] && [ "$readyz" = 503 ] \
+  || fail "silent receiver: timeout, parking or liveness/readiness assertion failed"
 
 # Drain this queue before a later suite selects another fallback path: lifecycle
 # counters still include events left in the old file after a path switch.
@@ -106,6 +115,8 @@ while [ "$n" -lt 30 ]; do
 done
 [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] \
   || fail "silent receiver: queue did not drain after receiver recovery"
+[ "$(http_code /readyz)" = 200 ] || fail "silent receiver: successful replay did not restore readiness"
+ok "silent failure keeps healthz/livez=200, readyz=503; successful replay restores readyz=200"
 setguc pg_logtap.export_fallback_file '' || fail "silent receiver: could not disable fallback"
 setguc pg_logtap.export_timeout_ms 5000 || fail "silent receiver: could not restore timeout"
 setguc pg_logtap.metrics_port 0 || fail "silent receiver: could not disable metrics"

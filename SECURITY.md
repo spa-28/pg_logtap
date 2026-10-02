@@ -34,6 +34,25 @@ contains bearer tokens. Ordinary roles cannot read it through `SHOW`,
 boundary, not encrypted secret storage: the value also exists in PostgreSQL
 configuration files and process memory.
 
+## Local export files
+
+`file://` sinks, fallback queues and compaction temporary files must be regular
+files owned by the worker's effective UID, with exactly one hard link. The
+worker checks the opened descriptor before changing permissions or doing IO,
+applies `0600` and verifies it. A failed check or chmod fails closed: the sink
+send fails, or the fallback queue becomes broken; no log payload is written.
+Existing worker-owned files with wider modes can be tightened, but foreign-owned
+files are never chmodded. Permission rejection is not a failed `fdatasync` and
+does not increment `fb_sync_failures`.
+
+Final-component symlinks, hardlinks, FIFOs and devices are unsupported.
+`O_NOFOLLOW` protects the final component only: parent directories must remain
+trusted and not writable by untrusted users. Keep each sink and queue private
+to one cluster and one writer; descriptor checks do not make shared-directory
+races or concurrent writers safe. Repair a broken queue in place and explicitly
+reload to revalidate it; an unread or uncheckable active queue blocks a path
+change, including disabling fallback.
+
 ## Supported versions
 
 The latest released minor (see [releases](https://github.com/spa-28/pg_logtap/releases)).

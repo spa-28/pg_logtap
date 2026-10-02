@@ -25,7 +25,6 @@ const c = struct {
     extern "c" fn close(conn_fd: c_int) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
     extern "c" fn fsync(fd: c_int) c_int;
-    extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
     extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
     extern "c" fn unlink(path: [*:0]const u8) c_int;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
@@ -90,15 +89,8 @@ const fb_no_follow: c_int = 0o400000;
 /// "magic not verified yet". Read and advanced by the worker's drain loop.
 pub var offset: u64 = 0;
 /// Foreign or corrupt framing — never append to or replay such a file; the
-/// RAM backlog takes over until the GUC is repointed or the server restarts.
+/// RAM backlog takes over until an explicit reload securely revalidates it.
 pub var broken = false;
-/// Cumulative failed fdatasync calls on the fallback queue — the counter
-/// behind the shmem gauge (the WARNING below is edge-triggered on purpose).
-/// Cumulative means historical, not a current-state claim: a non-zero value
-/// does not say the queue NOW holds undurable data — the next successful
-/// sync (or a landing compaction, fdatasynced before its rename) makes it
-/// durable while the counter stays. Alert on growth, not level.
-pub var sync_failures: u64 = 0;
 /// Warned-once latch for a failing fdatasync: a dying disk fails every cycle
 /// and a per-cycle WARNING would bury the server log, but one silent failure
 /// streak means queued events nobody knows are not durable. Cleared by the
@@ -165,9 +157,6 @@ fn checkFile(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callcon
     return resolved.len + 9 <= 4096;
 }
 
-/// Resolve the GUC (relative → data directory, the log_directory convention;
-/// the queue belongs with the data). Repointing the GUC orphans the old queue
-/// (its events stay on disk for a manual drain) and resets consumer state.
 /// "<fallback>.compact" — compact's rewrite target. A crash between its
 /// creation and the rename leaves it behind (up to cap/2 of litter nothing
 /// ever reads); boot() unlinks it at start.
@@ -179,124 +168,138 @@ fn compactPath(tmp_buf: *[4096]u8) ?[*:0]const u8 {
     return @ptrCast(tmp_buf);
 }
 
+/// Active path only: reading it never adopts a changed GUC or resets a cursor.
 fn path() ?[]const u8 {
-    if (guc_file == null) return null;
-    const raw = std.mem.span(@as([*:0]const u8, @ptrCast(guc_file)));
-    if (raw.len == 0 or raw.len + 1 > fb_path_buf.len) return null;
-    var tmp: [4096]u8 = undefined;
-    const full = blk: {
-        if (raw[0] == '/') break :blk raw;
-        if (pg.DataDir == null) return null;
-        const dd = std.mem.span(@as([*:0]const u8, @ptrCast(pg.DataDir)));
-        break :blk std.fmt.bufPrint(&tmp, "{s}/{s}", .{ dd, raw }) catch return null;
-    };
-    if (full.len != fb_path_len or !std.mem.eql(u8, fb_path_buf[0..fb_path_len], full)) {
-        fb_path_len = full.len;
-        @memcpy(fb_path_buf[0..full.len], full);
-        fb_path_buf[full.len] = 0;
-        offset = 0;
-        queue_identity_valid = false;
-        broken = false;
-    }
-    return fb_path_buf[0..fb_path_len];
+    return if (fb_path_len == 0) null else fb_path_buf[0..fb_path_len];
 }
 
-/// Worker start: remove a crashed compaction's litter, restore the cursor a
-/// previous worker published in shmem, then credit any uncounted suffix.
-pub fn boot(alloc: std.mem.Allocator) void {
+fn configuredPath(buf: *[4096]u8) ?[]const u8 {
+    const raw = fileGucRaw();
+    if (raw.len == 0) return "";
+    const full = if (raw[0] == '/') raw else blk: {
+        const dd_c = pg.DataDir orelse return null;
+        const dd = std.mem.span(@as([*:0]const u8, @ptrCast(dd_c)));
+        break :blk std.fmt.bufPrint(buf, "{s}/{s}", .{ dd, raw }) catch return null;
+    };
+    return if (full.len + 9 <= buf.len) full else null;
+}
+
+fn adoptPath(full: []const u8) void {
+    fb_path_len = full.len;
+    @memcpy(fb_path_buf[0..full.len], full);
+    fb_path_buf[full.len] = 0;
+    offset = 0;
+    queue_identity_valid = false;
+    broken = false;
+    // Publish the choice and invalidate A's cursor before scanning/crediting B.
+    capture.setFallbackPath(full);
+}
+
+fn reopen(alloc: std.mem.Allocator) void {
     if (path() == null) return;
-    var tmp_buf: [4096]u8 = undefined;
-    if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
-    if (fbOpen()) |file_fd| {
+    const file_fd = fbOpen() orelse return;
+    {
         defer _ = c.close(file_fd);
-        if (fbSize(file_fd)) |size| {
-            if (queue_identity_valid)
-                offset = capture.fallbackOffset(queue_dev, queue_ino, size);
+        const size = fbSize(file_fd) orelse {
+            broken = true;
+            return;
+        };
+        // A short foreign file is not an empty queue. Never silently adopt
+        // another path because size <= magic_len happened to hide its bytes.
+        if (size != 0 and readFormat(file_fd) == null) {
+            broken = true;
+            elog.Warning(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
+            return;
         }
+        offset = capture.fallbackOffset(queue_dev, queue_ino, size);
     }
     creditBacklog(alloc);
 }
 
-/// True when the given inode is the file the queue path names (through
-/// symlinks — the file:// sink follows them when it opens, so that shared
-/// inode is exactly the alias worker.sendFile catches with this).
+/// Worker start restores the ACTIVE choice even if a deferred configured B
+/// is already in postgresql.auto.conf. Full postmaster restart clears shmem.
+pub fn boot(alloc: std.mem.Allocator) void {
+    if (capture.fallbackPath(&fb_path_buf)) |len| {
+        fb_path_len = len;
+    } else {
+        var buf: [4096]u8 = undefined;
+        adoptPath(configuredPath(&buf) orelse return);
+    }
+    if (path() == null) return;
+    var tmp_buf: [4096]u8 = undefined;
+    if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    reopen(alloc);
+}
+
+/// Explicit HUP is the repair/reconfiguration boundary. Changing or disabling
+/// A requires proof it is drained; a failed open is never proof of emptiness.
+pub fn reload(alloc: std.mem.Allocator) void {
+    var buf: [4096]u8 = undefined;
+    const full = configuredPath(&buf) orelse return;
+    if (std.mem.eql(u8, fb_path_buf[0..fb_path_len], full)) {
+        broken = false;
+        reopen(alloc);
+        return;
+    }
+    if (path() != null and !drained()) {
+        elog.Warning(@src(), "pg_logtap fallback path change deferred: active queue {s} is not proven drained; retaining it, repeat reload after drain to apply '{s}'", .{ path().?, full });
+        return;
+    }
+    adoptPath(full);
+    reopen(alloc);
+}
+
+fn drained() bool {
+    const file_fd = fbOpen() orelse return false;
+    defer _ = c.close(file_fd);
+    const size = fbSize(file_fd) orelse return false;
+    if (capture.snapshot().queueBacklog() != 0) return false;
+    if (size == 0) return true;
+    if (readFormat(file_fd) == null) return false;
+    return size == fb_magic_len or (offset >= fb_magic_len and offset == size);
+}
+
+/// True when the given inode is the file the active queue path names.
+/// Path spelling can differ even for a regular single-link file.
 pub fn aliasesQueueInode(st: worker.FileStat) bool {
     if (path() == null) return false;
     var qst: worker.FileStat = undefined;
     if (c.stat(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), &qst) != 0) return false;
-    return st.dev == qst.dev and st.ino == qst.ino;
+    return st.st_dev == qst.st_dev and st.st_ino == qst.st_ino;
 }
-
-/// Warned-once latch for a pre-existing queue whose permissions could not
-/// be pulled down to 0600 — the compressed log stream stays readable by
-/// whoever the operator's mode left in. Same edge-triggered shape as
-/// dir_sync_warned: a successful tighten re-arms it.
-var perm_warned = false;
 
 fn fbOpen() ?c_int {
     if (path() == null) return null;
-    // O_RDWR|O_CREAT|O_APPEND (Linux: 2|64|1024) — reads go through pread,
-    // immune to the append position. 0600: not world-readable (C2).
-    // Create via O_EXCL|O_CREAT (Linux: 128|64) first: its success is the
-    // only reliable "the file just came into existence" signal — the moment
-    // to fsync the directory, so the creation itself (not just the data,
-    // which fdatasync covers) survives a power loss. O_EXCL|O_CREAT also
-    // never follows a symlink (POSIX), so the create branch needs no
-    // O_NOFOLLOW of its own.
-    var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | 128, @as(c_uint, 0o600));
-    if (file_fd >= 0) {
-        fsyncDirOf(fb_path_buf[0..fb_path_len]);
-    } else if (std.c._errno().* == @intFromEnum(std.c.E.EXIST)) { // the usual case
-        // fb_no_follow: the queue lives in the data directory, and anything
-        // able to write there must not aim the queue at another file — the
-        // rule compact already enforces for its temp. ELOOP (the path IS
-        // a symlink) just fails the open: the caller parks in RAM instead.
-        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), 2 | 64 | 1024 | fb_no_follow, @as(c_uint, 0o600));
-        // The mode argument only covers creation; a pre-existing queue may
-        // sit wider (operator-made 0644). Best-effort tighten — see sendFile;
-        // a tighten that fails leaves the queue readable and says so, once
-        // per streak.
-        if (file_fd >= 0) {
-            if (c.fchmod(file_fd, @as(c_uint, 0o600)) == 0) {
-                perm_warned = false;
-            } else if (!perm_warned) {
-                perm_warned = true;
-                elog.Warning(@src(), "pg_logtap fallback queue permissions could not be tightened to 0600 (errno={d}): local users may read the compressed log stream in {s}", .{ std.c._errno().*, path() orelse "" });
-            }
-        }
+    const flags = 2 | 64 | 1024 | fb_no_follow | 0o4000; // O_RDWR|CREAT|APPEND|NOFOLLOW|NONBLOCK
+    // Exclusive creation is the reliable signal to sync the new directory
+    // entry. Existing files must pass the same private descriptor policy.
+    var file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), flags | 128, @as(c_uint, 0o600));
+    const created = file_fd >= 0;
+    if (file_fd < 0 and std.c._errno().* == @intFromEnum(std.c.E.EXIST)) {
+        file_fd = c.open(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), flags, @as(c_uint, 0o600));
     }
-    // Any other errno (EACCES, EROFS, ENOTDIR, …) fails as is — a retrying
-    // open would only mask the real reason. An unopenable queue is as
-    // unusable as a foreign one: mark it broken so the fallback_broken gauge
-    // says so, and say it once — broken stops the re-opens; repointing
-    // the GUC or a restart re-checks, the same recovery as a foreign file.
-    if (file_fd < 0) {
+    const checked = if (file_fd >= 0) worker.privateFd(file_fd) else null;
+    const file_stat = checked orelse {
+        const err = std.c._errno().*;
+        if (file_fd >= 0) _ = c.close(file_fd);
         broken = true;
         capture.noteWarn(.fallback_open);
-        elog.Warning(@src(), "pg_logtap fallback queue cannot be opened (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, path() orelse "" });
+        elog.Warning(@src(), "pg_logtap fallback queue refused: requires a regular single-link worker-owned 0600 file (errno={d}), fallback disabled: {s}", .{ err, path() orelse "" });
         return null;
-    }
-    // A hardlink at the queue path (O_NOFOLLOW passes those) can name the
-    // same inode the file:// sink writes — the queue's side of the inode
-    // alias check; same latch and warning shape as the unopenable queue.
+    };
+    // String checks cannot catch /./ aliases to a regular single-link inode.
     if (worker.queueFdAliasesFileUrl(file_fd)) {
         _ = c.close(file_fd);
         broken = true;
         capture.noteWarn(.fallback_open);
-        elog.Warning(@src(), "pg_logtap fallback queue and the file:// export_url name one file (symlink/hardlink alias): fallback disabled: {s}", .{path() orelse ""});
+        elog.Warning(@src(), "pg_logtap fallback queue and the file:// export_url name one file (inode alias): fallback disabled: {s}", .{path() orelse ""});
         return null;
     }
-    var file_stat: worker.FileStat = undefined;
-    if (c.fstat(file_fd, &file_stat) != 0) {
-        _ = c.close(file_fd);
-        broken = true;
-        capture.noteWarn(.fallback_open);
-        elog.Warning(@src(), "pg_logtap fallback queue identity could not be read (errno={d}), fallback disabled: {s}", .{ std.c._errno().*, path() orelse "" });
-        return null;
-    }
-    if (queue_identity_valid and (queue_dev != file_stat.dev or queue_ino != file_stat.ino)) offset = 0;
-    queue_dev = file_stat.dev;
-    queue_ino = file_stat.ino;
+    if (created) fsyncDirOf(fb_path_buf[0..fb_path_len]);
+    const dev: i64 = @bitCast(@as(u64, file_stat.st_dev));
+    if (queue_identity_valid and (queue_dev != dev or queue_ino != file_stat.st_ino)) offset = 0;
+    queue_dev = dev;
+    queue_ino = file_stat.st_ino;
     queue_identity_valid = true;
     return file_fd;
 }
@@ -415,9 +418,6 @@ fn repairTail(file_fd: c_int, at: u64) bool {
 /// True while the fallback file holds undelivered events — flushAll then
 /// routes everything through it to keep global order.
 pub fn queued() bool {
-    // path() FIRST: while broken, short-circuiting on it would never
-    // re-resolve the GUC, and the reset inside path() (path-string change)
-    // is the one way a broken queue recovers without a restart.
     if (path() == null) return false;
     if (broken) return false;
     const file_fd = fbOpen() orelse return false;
@@ -522,15 +522,16 @@ fn fbDatasync(file_fd: c_int, compaction: bool) bool {
         fb_sync_warned = false;
         return true;
     }
+    const err = std.c._errno().*;
+    capture.bumpFbSyncFailure();
     if (!fb_sync_warned) {
         fb_sync_warned = true;
         if (compaction) {
-            elog.Warning(@src(), "pg_logtap fallback compaction fdatasync failed (errno={d}): rewrite abandoned, the original queue stands — the disk cannot make the queue durable", .{std.c._errno().*});
+            elog.Warning(@src(), "pg_logtap fallback compaction fdatasync failed (errno={d}): rewrite abandoned, the original queue stands — the disk cannot make the queue durable", .{err});
         } else {
-            elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): the queue's latest change is written but not durable", .{std.c._errno().*});
+            elog.Warning(@src(), "pg_logtap fallback fdatasync failed (errno={d}): the queue's latest change is written but not durable", .{err});
         }
     }
-    sync_failures += 1;
     return false;
 }
 
@@ -679,7 +680,7 @@ pub fn nextMember(alloc: std.mem.Allocator) Next {
 /// full drain can resurrect members the receiver already has — the documented
 /// at-least-once duplicates, but the window stays open exactly when the
 /// outage ends and nothing parks again to sync it shut. Best effort one way:
-/// a failed sync (counted in sync_failures) only re-opens that duplicate
+/// a failed sync (counted in fb_sync_failures) only re-opens that duplicate
 /// window; the events are already delivered.
 pub fn truncate() void {
     if (broken) return;
@@ -719,7 +720,7 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
     lost = saved_lost;
     discarded = saved_discarded;
     const snap = capture.snapshot();
-    const backlog = snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded;
+    const backlog = snap.queueBacklog();
     const due = events -| backlog;
     if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0, 0);
 }
@@ -811,6 +812,13 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFor
         tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
         if (tmp_fd < 0) return;
     }
+    if (worker.privateFd(tmp_fd) == null) {
+        const err = std.c._errno().*;
+        _ = c.close(tmp_fd);
+        _ = c.unlink(tmp_path);
+        elog.Warning(@src(), "pg_logtap fallback compaction temp refused (errno={d}): original queue retained", .{err});
+        return;
+    }
     var copied_ok = worker.writeAll(tmp_fd, format.magic(), false, null);
     var pos: u64 = off;
     var copy_buf: [64 * 1024]u8 = undefined;
@@ -838,8 +846,8 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFor
         return;
     }
     fsyncDirOf(fb_path_buf[0..fb_path_len]);
-    queue_dev = tmp_st.dev;
-    queue_ino = tmp_st.ino;
+    queue_dev = @bitCast(@as(u64, tmp_st.st_dev));
+    queue_ino = tmp_st.st_ino;
     queue_identity_valid = true;
     offset = @max(fb_magic_len, offset -| dropped);
     if (lost_events > 0) capture.bumpExport(0, 0, 0, 0, lost_events, lost_events, 0);

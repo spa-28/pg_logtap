@@ -28,6 +28,7 @@ const c = struct {
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
     extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
+    extern "c" fn geteuid() c_uint;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
     extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
@@ -35,28 +36,9 @@ const c = struct {
     extern "c" fn stat(path: [*:0]const u8, buf: *FileStat) c_int;
 };
 
-/// struct stat as glibc/musl build it on LP64 (kernel asm-generic layout,
-/// 144 bytes on amd64/arm64): the full size so libc writes stay in bounds;
-/// only dev/ino are read (the alias checks below). std dropped its linux
-/// Stat wrapper in 0.16 (only statx remains — syscall plumbing for two
-/// numbers).
-pub const FileStat = extern struct {
-    dev: i64,
-    ino: u64,
-    nlink: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    pad0: u32 = 0,
-    rdev: i64,
-    size: i64,
-    blksize: i64,
-    blocks: i64,
-    atim: [16]u8 = @splat(0),
-    mtim: [16]u8 = @splat(0),
-    ctim: [16]u8 = @splat(0),
-    unused: [24]u8 = @splat(0),
-};
+/// Use the translated target headers: mode/nlink have different offsets on
+/// amd64 and arm64, even though dev/ino agree. Zig's std.c.Stat is void on Linux.
+pub const FileStat = pg.struct_stat;
 const net = std.c;
 
 /// Message staging for ring drains (capture.messageMax() bytes, allocated
@@ -82,6 +64,8 @@ var guc_export_backlog_max: c_int = 65_536;
 /// this monotonic deadline; a fast answer clears both fields.
 var receiver_slow = false;
 var next_slow_probe_us: i64 = 0;
+/// Latest real delivery attempt for the current URL, not idle-cycle health.
+var receiver_ready = false;
 var guc_metrics_port: c_int = 0;
 var guc_metrics_addr: [*c]u8 = null;
 
@@ -142,6 +126,7 @@ fn netNowUs() i64 {
 /// fallback/RAM backlog path. Saturating arithmetic keeps extreme configured
 /// timeouts from wrapping the monotonic deadline.
 fn finishReceiverAttempt(started_us: i64, succeeded: bool) void {
+    receiver_ready = succeeded;
     const finished_us = netNowUs();
     const duration_us = if (finished_us > started_us) finished_us - started_us else 0;
     if (guc_export_slow_ms <= 0) {
@@ -194,7 +179,7 @@ pub fn compactAborted() bool {
 }
 
 pub fn init() void {
-    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, assignUrl, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default). Values longer than 256 bytes are cut — a label, not data.", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
@@ -254,6 +239,7 @@ pub fn workerMain() void {
         if (got_sighup.isSet()) {
             got_sighup.clear();
             pg.ProcessConfigFile(pg.PGC_SIGHUP);
+            fbq.reload(alloc);
             syncMetricsListener();
             refreshSourceId();
             // A new URL (or a re-set threshold) must not inherit the
@@ -304,9 +290,13 @@ pub fn workerMain() void {
 /// file — parking is local-disk work, runs without a deadline, and loses
 /// nothing that the RAM backlog would otherwise carry into the restart.
 fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, final: bool) void {
-    if (guc_export_url == null or guc_export_url[0] == 0) return;
+    if (guc_export_url == null or guc_export_url[0] == 0) {
+        receiver_ready = false;
+        return;
+    }
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
     const dest = dest_mod.parseUrl(url) orelse {
+        receiver_ready = false;
         warnUrlOnce(url);
         return;
     };
@@ -494,7 +484,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
-    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fbq.broken), fbq.sync_failures);
+    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fbq.broken));
     logTransitions(sent + replayed, failed, lost);
 }
 
@@ -715,6 +705,32 @@ fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv
     return !fileUrlAliasesFallback(raw, fbq.fileGucRaw());
 }
 
+/// The assign hook runs before guc.c replaces the old string. Borrow both
+/// values only for this comparison; an unrelated reload keeps readiness.
+fn assignUrl(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
+    _ = extra;
+    if (!std.mem.eql(u8, gucSpan(newval), gucSpan(guc_export_url))) receiver_ready = false;
+}
+
+/// Validate before chmod or IO: never change a foreign/shared/special inode.
+/// Parent directories remain trusted; O_NOFOLLOW covers the final component.
+pub fn privateFd(fd: c_int) ?FileStat {
+    const before = fdStat(fd) orelse return null;
+    if ((before.st_mode & 0o170000) != 0o100000 or before.st_uid != c.geteuid() or before.st_nlink != 1) {
+        std.c._errno().* = @intFromEnum(std.c.E.PERM);
+        return null;
+    }
+    if (c.fchmod(fd, @as(c_uint, 0o600)) != 0) return null;
+    const after = fdStat(fd) orelse return null;
+    if ((after.st_mode & 0o177777) != 0o100600 or after.st_uid != c.geteuid() or after.st_nlink != 1 or
+        before.st_dev != after.st_dev or before.st_ino != after.st_ino)
+    {
+        std.c._errno().* = @intFromEnum(std.c.E.PERM);
+        return null;
+    }
+    return after;
+}
+
 /// Inode of an open fd (null when fstat fails).
 fn fdStat(fd: c_int) ?FileStat {
     var sbuf: FileStat = undefined;
@@ -732,8 +748,7 @@ fn fdStat(fd: c_int) ?FileStat {
 /// land both writers on one inode — same shape as the same-reload double-flip
 /// residual; the foreign-content latch keeps it from silent corruption.
 /// True when an open file:// sink fd is the same inode as the fallback queue
-/// (the queue's own path stat'ed through symlinks — the sink follows them,
-/// that shared inode is exactly the alias being caught).
+/// (the active queue's path stat'ed independently of the sink's spelling).
 fn fdAliasesFallback(fd: c_int) bool {
     const sink_st = fdStat(fd) orelse return false;
     return fbq.aliasesQueueInode(sink_st);
@@ -750,7 +765,7 @@ pub fn queueFdAliasesFileUrl(fd: c_int) bool {
     const zpath = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{dest_v.file}, 0) catch return false;
     var ust: FileStat = undefined;
     if (c.stat(zpath, &ust) != 0) return false;
-    return qst.dev == ust.dev and qst.ino == ust.ino;
+    return qst.st_dev == ust.st_dev and qst.st_ino == ust.st_ino;
 }
 
 // --- source identity (multi-host → one Vector): stamped into every event ------
@@ -913,7 +928,7 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) b
 }
 
 /// A GUC string as a plain slice; null (unset) reads as empty.
-fn gucSpan(v: [*c]u8) []const u8 {
+fn gucSpan(v: [*c]const u8) []const u8 {
     return if (v == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(v)));
 }
 
@@ -1054,34 +1069,27 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
 var file_sync_warned = false;
 var file_rollback_warned = false; // same shape: a torn write whose rollback failed or is not durable
 var sink_alias_warned = false; // same shape: a sink fd sharing the queue's inode
-var sink_perm_warned = false; // same shape: a pre-existing sink left more-readable than 0600
+var sink_perm_warned = false; // same shape: an unsafe or inaccessible sink
 
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
     var pbuf: [4096]u8 = undefined;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    // O_WRONLY|O_CREAT|O_APPEND (Linux: 1|64|1024 — 512 is O_TRUNC, which
-    // silently keeps only the last batch), 0600: not world-readable (C2).
-    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
-    if (conn_fd < 0) return false;
-    defer _ = c.close(conn_fd);
-    // 0600 above applies at creation only — pull a pre-existing file (an
-    // operator may have made it world-readable) down to it. Best-effort: a
-    // chmod failing here means a filesystem that would fail the writes too,
-    // so the send proceeds — but the left-open window says so, once. The
-    // latch re-arms only on a SUCCESSFUL tighten (like fbOpen's), never on a
-    // clean batch: an un-tightenable but working sink sends fine, and a
-    // per-batch re-arm would warn per send — each warning itself an event,
-    // the stream would feed itself.
-    if (c.fchmod(conn_fd, @as(c_uint, 0o600)) != 0) {
+    // O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW|O_NONBLOCK. Nonblock prevents
+    // a FIFO open waiting for a reader before the descriptor is rejected.
+    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024 | 0o400000 | 0o4000, @as(c_uint, 0o600));
+    if (conn_fd < 0 or privateFd(conn_fd) == null) {
+        const err = std.c._errno().*;
+        if (conn_fd >= 0) _ = c.close(conn_fd);
         if (!sink_perm_warned) {
             sink_perm_warned = true;
-            elog.Warning(@src(), "pg_logtap file:// sink permissions could not be tightened to 0600 (errno={d}): local users may read the log stream in {s}", .{ std.c._errno().*, path });
+            elog.Warning(@src(), "pg_logtap file:// sink refused: requires a regular single-link worker-owned 0600 file (errno={d}): {s}", .{ err, path });
         }
-    } else {
-        sink_perm_warned = false;
+        return false;
     }
+    defer _ = c.close(conn_fd);
+    sink_perm_warned = false;
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
     // Inode-level alias with the fallback queue (see fdAliasesFallback):
@@ -1518,7 +1526,7 @@ fn serveOne(conn_fd: c_int) void {
     // renders the body into its own body_cap buffer, then copies it here).
     var resp_buf: [metrics.body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
-    metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
+    metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot(), receiver_ready) catch return;
     _ = writeAll(conn_fd, resp_w.buffered(), true, null);
 }
 

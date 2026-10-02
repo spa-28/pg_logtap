@@ -19,9 +19,12 @@
 #   compact-sync-fail  : the compaction temp's fdatasync fails -> rewrite
 #                        abandoned (queue whole, nothing lost) and counted in
 #                        fb_sync_failures; the cap lands once syncs heal
-#   dev-full           : file:///dev/full write fails mid-batch -> torn line
-#                       rolled back, events held in the RAM backlog, delivered
-#                       whole on the next receiver
+#   chmod-fail         : otherwise secure sink/queue/temp fchmod fails -> no IO,
+#                        RAM retry or intact queue; same-path HUP repairs queue
+#   partial-write      : worker-owned regular sink takes a prefix then ENOSPC ->
+#                        torn tail rolled back, RAM retry delivers one whole copy
+#   sync-soft-restart  : shared fb_sync_failures survives TERM/replacement and
+#                        reload; the next real EIO increases SQL and Prometheus
 # Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -u
 . "$(dirname "$0")/e2e-common.sh"
@@ -38,6 +41,8 @@ SO=dist/pg$V/lib/pg_logtap.so
 fail_extra() { # shim-specific post-mortem
   echo "sync target: $(docker exec "$CT" cat /tmp/fsyncfail-target 2>/dev/null || echo '<unset>')" >&2
   echo "open target: $(docker exec "$CT" cat /tmp/openfail-target 2>/dev/null || echo '<unset>')" >&2
+  echo "chmod target: $(docker exec "$CT" cat /tmp/chmodfail-target 2>/dev/null || echo '<unset>')" >&2
+  echo "write target: $(docker exec "$CT" cat /tmp/writefail-target 2>/dev/null || echo '<unset>')" >&2
   docker exec "$CT" sh -c 'sort /tmp/fsyncfail.log 2>/dev/null | uniq -c' >&2
   docker exec "$CT" sh -c "ls -la '${PGDATA_C:-}/$FB_REL' '${PGDATA_C:-}/$FB_REL.compact' 2>/dev/null" >&2
 }
@@ -70,6 +75,21 @@ set_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/fsyncfail-target
 clear_target() { docker exec "$CT" rm -f /tmp/fsyncfail-target; }
 set_open_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/openfail-target"; }
 clear_open_target() { docker exec "$CT" rm -f /tmp/openfail-target; }
+set_chmod_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/chmodfail-target"; }
+clear_chmod_target() { docker exec "$CT" rm -f /tmp/chmodfail-target; }
+set_write_target() { docker exec "$CT" sh -c "printf '%s' '$1' > /tmp/writefail-target"; }
+clear_write_target() { docker exec "$CT" rm -f /tmp/writefail-target; }
+# The image already has bash; no curl install or extra scraper container needed.
+prom_syncfails() {
+  docker exec "$CT" bash -c 'exec 3<>/dev/tcp/127.0.0.1/9187; printf "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; timeout 5 cat <&3' \
+    | tr -d '\r' | awk '$1 == "pg_logtap_fb_sync_failures" { print $2 }'
+}
+assert_syncfails() { # SQL text/JSON and the real HTTP export, same shared total
+  [ "$(statf fb_sync_failures)" = "$1" ] \
+    && [ "$(docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_stats_json()::jsonb->>'fb_sync_failures'")" = "$1" ] \
+    && [ "$(prom_syncfails)" = "$1" ] \
+    || fail "sync counter: expected $1 in SQL/JSON/Prometheus (SQL=$(statf fb_sync_failures), Prom=$(prom_syncfails))"
+}
 
 # Deploy (the stand phase's recipe, minus the stand): library, control, SQL,
 # preload, then the extension itself.
@@ -85,6 +105,7 @@ docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET shared_preload_librarie
 docker restart "$CT" >/dev/null; wait_ready
 docker exec "$CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.flush_interval = 100" \
   -qc "SELECT pg_reload_conf()" >/dev/null
+setguc pg_logtap.metrics_port 9187; reload
 docker exec "$CT" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 "$(dirname "$0")/e2e-require-ext.sh" "$CT"
 
@@ -139,18 +160,49 @@ syncfails=$(statf fb_sync_failures)
 # A duplicate member (the pre-fix bug: sync fail re-appended the batch)
 # would double-deliver at replay; queued past captured is its smoke signal.
 q=$(statf events_queued)
+assert_syncfails "$syncfails"
+# Remove injection before replacing just the worker: the postmaster/shmem must
+# stay alive. Fresh worker BSS is exactly where a local absolute total regressed.
+clear_target
+postmaster0=$(docker exec "$CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')
+wpid=$(worker_pid); [ -n "$wpid" ] || fail "sync soft restart: worker not found"
+docker exec "$CT" kill -TERM "$wpid"
+n=0; new_wpid=$wpid
+while [ "$n" -lt 20 ] && { [ -z "$new_wpid" ] || [ "$new_wpid" = "$wpid" ]; }; do
+  n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
+done
+[ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] || fail "sync soft restart: worker did not restart"
+[ "$(docker exec "$CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')" = "$postmaster0" ] \
+  || fail "sync soft restart: cluster restarted, retention check is invalid"
+sleep 2
+assert_syncfails "$syncfails"
+# A soft reload must not clear history either. Then spend the replacement
+# process's fresh fault budget on genuine queue fdatasync failures.
+reload; sleep 1; assert_syncfails "$syncfails"
+set_target "$PGDATA_C/$FB_REL"
+gen "fb4-$SUF" 20; sleep 1; gen "fb5-$SUF" 20; sleep 2
+syncfails2=$(statf fb_sync_failures)
+[ "$syncfails2" -gt "$syncfails" ] 2>/dev/null \
+  || fail "sync soft restart: next real EIO did not increase $syncfails (got $syncfails2)"
+clear_target
+assert_syncfails "$syncfails2"
 setguc pg_logtap.export_url 'file:///tmp/replay.log'; reload
 n=0; while [ "$n" -lt 15 ]; do
   [ "$(sink_lines "fb1-$SUF" replay)" -ge 20 ] && [ "$(sink_lines "fb2-$SUF" replay)" -ge 20 ] && [ "$(sink_lines "fb3-$SUF" replay)" -ge 20 ] && break
   n=$((n + 1)); sleep 1
 done
 R1=$(sink_lines "fb1-$SUF" replay); R2=$(sink_lines "fb2-$SUF" replay); R3=$(sink_lines "fb3-$SUF" replay)
-[ "$R1" = 20 ] && [ "$R2" = 20 ] && [ "$R3" = 20 ] \
-  || fail "fallback sync-fail: replay delivered $R1/$R2/$R3 of 20/20/20"
+n=0; while [ "$n" -lt 15 ] && [ "$(sink_lines "fb5-$SUF" replay)" -lt 20 ]; do
+  n=$((n + 1)); sleep 1
+done
+R4=$(sink_lines "fb4-$SUF" replay); R5=$(sink_lines "fb5-$SUF" replay)
+[ "$R1" = 20 ] && [ "$R2" = 20 ] && [ "$R3" = 20 ] && [ "$R4" = 20 ] && [ "$R5" = 20 ] \
+  || fail "fallback sync-fail: replay delivered $R1/$R2/$R3/$R4/$R5 of 20 each"
 [ "$(sink_dups replay)" = 0 ] || fail "fallback sync-fail: duplicate seqs in replay — sync-failed member re-appended"
 bl=$(docker exec "$CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
 [ "$bl" = 0 ] || fail "fallback sync-fail: queue_backlog=$bl after replay"
-ok "fb_sync_failures=$syncfails, 60/60 replayed once each, queue drained (queued was $q)"
+assert_syncfails "$syncfails2"
+ok "SQL/Prom sync history $syncfails retained across TERM/reload, next EIO → $syncfails2; 100/100 replayed once (queued was $q)"
 
 echo "== compaction temp: non-EEXIST open failure preserves existing object =="
 # The queue compactor may remove its own stale temp only after open(O_EXCL)
@@ -180,6 +232,21 @@ got_canary=$(docker exec "$CT" cat "$PGDATA_C/$FB_REL.compact" 2>/dev/null || tr
   || fail "compact open-fail: a compaction landed while every exclusive temp open returned EACCES"
 
 clear_open_target
+# The new temp is regular/worker-owned, but fchmod itself can still fail.
+# Refuse before copying any queue data or publishing a compaction loss.
+sync0=$(statf fb_sync_failures)
+set_chmod_target "$PGDATA_C/$FB_REL.compact"
+gen "compact-chmod-$SUF" 20; sleep 2
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "compact chmod-fail: refusal counted as fdatasync failure"
+[ "$(statf events_compacted)" = "$compacted0" ] \
+  || fail "compact chmod-fail: rewrite landed despite failed permission check"
+[ "$(docker exec "$CT" stat -c %s "$PGDATA_C/$FB_REL")" -gt 1048576 ] \
+  || fail "compact chmod-fail: original queue was trimmed"
+docker exec "$CT" grep -q '^fchmod EPERM$' /tmp/fsyncfail.log \
+  || fail "compact chmod-fail: injection never reached the temp fd"
+docker exec "$CT" test ! -e "$PGDATA_C/$FB_REL.compact" \
+  || fail "compact chmod-fail: rejected temp left behind"
+clear_chmod_target
 gen "open-heal-$SUF" 20
 n=0; while [ "$n" -lt 15 ]; do
   compacted_now=$(statf events_compacted)
@@ -238,28 +305,111 @@ got=$(sink_lines "cmp-$SUF" compact)
 setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512
 ok "temp fdatasync EIO counted (fb_sync_failures=$syncfails), queue whole, cap landed after healing, replay drained with 0 dups"
 
-echo "== /dev/full: write fails mid-batch -> torn line rolled back, held in RAM =="
-# Delta, not absolute zero: the compact scenario's landed caps counted their
-# trimmed events lost (legitimately — the outage outlasted the cap), and
-# this container's shmem still carries them.
-lost0=$(statf events_lost)
-# dropped deltas too: the compact scenario's compaction walks stall drain
-# past a 1024-ring on a slow disk (seen on a CI runner: 76 dropped carried
-# from there) — this phase generates 20 events, it cannot overflow the ring.
-drp0=$(statf events_dropped)
-docker exec "$CT" sh -c "rm -f /tmp/replay.log"
-setguc pg_logtap.export_fallback_file '' # no queue: the RAM backlog is the only hold
-setguc pg_logtap.export_url 'file:///dev/full'; reload; sleep 2
-gen "full1-$SUF" 20; sleep 3 # ENOSPC on every write; backlog accumulates
-[ "$(( $(statf events_lost) - lost0 ))" = 0 ] || fail "/dev/full: lost grew without the queue"
-[ "$(( $(statf events_dropped) - drp0 ))" = 0 ] || fail "/dev/full: ring dropped (ring too small?)"
-setguc pg_logtap.export_url 'file:///tmp/full.log'; reload; sleep 2
-n=0; while [ "$n" -lt 15 ]; do
-  [ "$(sink_lines "full1-$SUF" full)" -ge 20 ] && break
+echo "== fchmod failure: sink refused before writing, queue repaired by same-path HUP =="
+clear_target
+setguc pg_logtap.export_fallback_file ''
+# Watching fchmod on a foreign inode proves owner validation precedes chmod,
+# not merely that a real EPERM happened to leave the mode alone.
+docker exec "$CT" sh -c "printf 'FOREIGN-CANARY\n' > /tmp/chmod-foreign.log; chmod 0666 /tmp/chmod-foreign.log; rm -f /tmp/fsyncfail.log"
+foreign_before=$(docker exec "$CT" sha256sum /tmp/chmod-foreign.log)
+set_chmod_target /tmp/chmod-foreign.log
+setguc pg_logtap.export_url 'file:///tmp/chmod-foreign.log'; reload; sleep 1
+failed0=$(statf send_cycles_failed)
+gen "chmodforeign-$SUF" 10; sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] \
+  && [ "$(docker exec "$CT" sha256sum /tmp/chmod-foreign.log)" = "$foreign_before" ] \
+  && [ "$(docker exec "$CT" stat -c '%u:%a' /tmp/chmod-foreign.log)" = '0:666' ] \
+  || fail "foreign fd: not refused intact"
+docker exec "$CT" test ! -e /tmp/fsyncfail.log || fail "foreign fd: fchmod called before owner validation"
+clear_chmod_target
+docker exec -u postgres "$CT" sh -c "printf '{\"canary\":\"chmod\"}\n' > /tmp/chmod-sink.log; chmod 0644 /tmp/chmod-sink.log"
+sink_before=$(docker exec "$CT" sha256sum /tmp/chmod-sink.log)
+sync0=$(statf fb_sync_failures); lost0=$(statf events_lost)
+docker exec "$CT" rm -f /tmp/fsyncfail.log
+set_chmod_target /tmp/chmod-sink.log
+setguc pg_logtap.export_url 'file:///tmp/chmod-sink.log'; reload; sleep 1
+failed0=$(statf send_cycles_failed)
+gen "chmods-$SUF" 20; sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] || fail "sink chmod-fail: send did not fail"
+docker exec "$CT" grep -q '^fchmod EPERM$' /tmp/fsyncfail.log || fail "sink chmod-fail: fault never reached fchmod"
+[ "$(docker exec "$CT" sha256sum /tmp/chmod-sink.log)" = "$sink_before" ] \
+  && [ "$(docker exec "$CT" stat -c %a /tmp/chmod-sink.log)" = 644 ] \
+  || fail "sink chmod-fail: rejected file contents/mode changed"
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "sink chmod-fail: refusal incremented sync failures"
+clear_chmod_target
+n=0; while [ "$n" -lt 15 ] && [ "$(sink_lines "chmods-$SUF" chmod-sink)" -lt 20 ]; do
   n=$((n + 1)); sleep 1
 done
-[ "$(sink_lines "full1-$SUF" full)" = 20 ] || fail "/dev/full: $(sink_lines "full1-$SUF" full)/20 delivered after the outage"
-[ "$(sink_dups full)" = 0 ] || fail "/dev/full: duplicate seqs — torn line not rolled back before the retry"
-ok "write-fail held 20 events in the RAM backlog, delivered 20/20 whole"
+[ "$(sink_lines "chmods-$SUF" chmod-sink)" = 20 ] && [ "$(sink_lines "chmodforeign-$SUF" chmod-sink)" = 10 ] \
+  && [ "$(sink_dups chmod-sink)" = 0 ] \
+  && [ "$(docker exec "$CT" stat -c %a /tmp/chmod-sink.log)" = 600 ] \
+  || fail "sink chmod-fail: secure retry did not deliver 20/20 once"
+
+CHMODQ="$PGDATA_C/chmod-queue.bin"
+docker exec -u postgres "$CT" sh -c "rm -f '$CHMODQ'; : > '$CHMODQ'; chmod 0644 '$CHMODQ'"
+queue_before=$(docker exec "$CT" sha256sum "$CHMODQ")
+docker exec "$CT" rm -f /tmp/fsyncfail.log
+set_chmod_target "$CHMODQ"
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.export_fallback_file "$CHMODQ"; reload; sleep 1
+q0=$(statf events_queued)
+gen "chmodq-$SUF" 20; sleep 2
+docker exec "$CT" grep -q '^fchmod EPERM$' /tmp/fsyncfail.log || fail "queue chmod-fail: fault never reached fchmod"
+[ "$(statf fallback_broken)" = 1 ] && [ "$(statf events_queued)" = "$q0" ] \
+  && [ "$(docker exec "$CT" sha256sum "$CHMODQ")" = "$queue_before" ] \
+  && [ "$(docker exec "$CT" stat -c %a "$CHMODQ")" = 644 ] \
+  || fail "queue chmod-fail: insecure queue used or modified"
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "queue chmod-fail: refusal incremented sync failures"
+clear_chmod_target
+sleep 1
+[ "$(statf fallback_broken)" = 1 ] || fail "queue chmod-fail: broken queue retried without HUP"
+# Same resolved path, not a new pathname or process. HUP must revalidate it.
+reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] && [ "$(statf events_queued)" -gt "$q0" ] \
+  && [ "$(docker exec "$CT" stat -c %a "$CHMODQ")" = 600 ] \
+  || fail "queue chmod-fail: same-path HUP did not reopen/tighten/park"
+setguc pg_logtap.export_url 'file:///tmp/chmod-replay.log'; reload
+n=0; while [ "$n" -lt 15 ] && [ "$(sink_lines "chmodq-$SUF" chmod-replay)" -lt 20 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(sink_lines "chmodq-$SUF" chmod-replay)" = 20 ] && [ "$(sink_dups chmod-replay)" = 0 ] \
+  && [ "$(docker exec "$CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(statf events_lost)" = "$lost0" ] \
+  || fail "queue chmod-fail: repaired queue failed complete lossless replay"
+ok "foreign fd refused before fchmod; injected EPERM refused sink/queue before IO; secure retry and same-path HUP delivered 50/50 once"
+
+echo "== regular sink: partial write + ENOSPC -> unchanged prefix, whole RAM retry =="
+# /dev/full is now refused as a special file before write. A regular private
+# sink and the target-controlled shim exercise the actual torn-tail rollback.
+lost0=$(statf events_lost); drp0=$(statf events_dropped)
+setguc pg_logtap.export_fallback_file ''
+docker exec -u postgres "$CT" sh -c "printf '{\"canary\":\"partial\"}\n' > /tmp/partial.log; chmod 0600 /tmp/partial.log"
+partial_before=$(docker exec "$CT" sha256sum /tmp/partial.log)
+docker exec "$CT" rm -f /tmp/fsyncfail.log
+set_write_target /tmp/partial.log
+setguc pg_logtap.export_url 'file:///tmp/partial.log'; reload; sleep 1
+failed0=$(statf send_cycles_failed)
+gen "partial1-$SUF" 20; sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] || fail "partial write: send did not fail"
+if ! docker exec "$CT" grep -q '^write partial$' /tmp/fsyncfail.log \
+  || ! docker exec "$CT" grep -q '^write ENOSPC$' /tmp/fsyncfail.log; then
+  fail "partial write: no real prefix write followed by ENOSPC"
+fi
+[ "$(docker exec "$CT" sha256sum /tmp/partial.log)" = "$partial_before" ] \
+  || fail "partial write: rollback left a torn tail or changed the original sink"
+[ "$(statf events_lost)" = "$lost0" ] && [ "$(statf events_dropped)" = "$drp0" ] \
+  || fail "partial write: RAM backlog lost/dropped events"
+# Heal the SAME sink: a surviving torn prefix would break JSON and the copy
+# count here (switching sinks would never observe whether rollback worked).
+clear_write_target
+n=0; while [ "$n" -lt 15 ] && [ "$(sink_lines "partial1-$SUF" partial)" -lt 20 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(sink_lines "partial1-$SUF" partial)" = 20 ] && [ "$(sink_dups partial)" = 0 ] \
+  || fail "partial write: RAM retry did not deliver 20/20 exactly once"
+docker cp "$CT:/tmp/partial.log" "$OUT/partial.log" >/dev/null
+[ "$(json_check "partial1-$SUF" "$OUT/partial.log")" = 20 ] || fail "partial write: retry left invalid JSON or incomplete lines"
+[ "$(head -n 1 "$OUT/partial.log")" = '{"canary":"partial"}' ] || fail "partial write: pre-existing prefix changed"
+ok "17-byte write then ENOSPC rolled back to the intact sink; same-file RAM retry delivered 20/20 valid JSON, no dups"
 
 echo "e2e-faults: all scenarios passed"

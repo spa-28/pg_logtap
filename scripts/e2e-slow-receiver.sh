@@ -83,6 +83,14 @@ docker rm -f "$SINK" >/dev/null 2>&1
 backlog_now() {
   docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery"
 }
+http_code() {
+  docker exec "$PG_CT" bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/9187 || exit
+    printf "GET %s HTTP/1.0\r\n\r\n" "$1" >&3
+    IFS= read -r -t 8 line <&3 || exit
+    set -- $line; printf "%s\n" "$2"
+  ' bash "$1" 2>/dev/null
+}
 
 FB_DIR=$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW data_directory") \
   || fail "slow receiver: could not read data directory"
@@ -146,10 +154,12 @@ while [ "$n" -lt 20 ]; do
 done
 [ "$backlog" -gt 0 ] || fail "slow receiver: live traffic never entered the fallback queue"
 kill -0 "$producer_pid" 2>/dev/null || fail "slow receiver: producer ended before recovery transition"
-healthz=$(docker exec "$PG_CT" bash -c \
-  'exec 3<>/dev/tcp/127.0.0.1/9187 && printf "GET /healthz HTTP/1.0\r\n\r\n" >&3 && IFS= read -r -t 8 line <&3 && echo "$line"' \
-  2>/dev/null)
-[ -n "$healthz" ] || fail "slow receiver: worker stopped serving healthz while parking"
+[ "$(http_code /healthz)" = 200 ] && [ "$(http_code /livez)" = 200 ] \
+  || fail "slow receiver: worker stopped serving liveness while parking"
+[ "$(http_code /readyz)" = 200 ] || fail "slow receiver: successful slow send reported unready"
+backlog=$(backlog_now)
+[ "$backlog" -gt 0 ] || fail "slow receiver: readiness was checked only after backlog drained"
+ok "slow successful receiver readyz=200 with queue_backlog=$backlog"
 
 queued_before=$backlog
 up_sink 0
