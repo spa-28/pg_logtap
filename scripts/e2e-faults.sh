@@ -91,6 +91,21 @@ assert_syncfails() { # SQL text/JSON and the real HTTP export, same shared total
     || fail "sync counter: expected $1 in SQL/JSON/Prometheus (SQL=$(statf fb_sync_failures), Prom=$(prom_syncfails))"
 }
 
+observe_port=9187
+observe_hup() { # new listener is a worker-side barrier AFTER fb.reload
+  [ "${1:-}" = keep ] || docker exec "$CT" rm -f /tmp/fsyncfail.log
+  observe_port=$((observe_port + 1))
+  setguc pg_logtap.metrics_port "$observe_port" || fail "HUP observer: port rejected"
+  reload
+  n=0
+  while [ "$n" -lt 20 ]; do
+    docker exec "$CT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$observe_port; printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3; timeout 2 cat <&3" 2>/dev/null \
+      | grep -q 'HTTP/1.1 200' && return
+    n=$((n + 1)); sleep 1
+  done
+  fail "HUP observer: worker did not apply new listener"
+}
+
 # Deploy (the stand phase's recipe, minus the stand): library, control, SQL,
 # preload, then the extension itself.
 LIBDIR=$(docker exec "$CT" pg_config --pkglibdir)
@@ -264,7 +279,12 @@ clear_open_target
 # Refuse before copying any queue data or publishing a compaction loss.
 sync0=$(statf fb_sync_failures)
 set_chmod_target "$PGDATA_C/$FB_REL.compact"
+compact_wpid=$(worker_pid); [ -n "$compact_wpid" ] || fail "compact chmod-fail: worker missing"
 gen "compact-chmod-$SUF" 20; sleep 2
+# Refusal warnings feed new retries: pause export and acknowledge HUP before
+# checking cleanup. Keep injection active; same-path HUP cannot remove the temp.
+setguc pg_logtap.export_url ''; observe_hup keep
+[ "$(worker_pid)" = "$compact_wpid" ] || fail "compact chmod-fail: worker replaced before cleanup check"
 [ "$(statf fb_sync_failures)" = "$sync0" ] || fail "compact chmod-fail: refusal counted as fdatasync failure"
 [ "$(statf events_compacted)" = "$compacted0" ] \
   || fail "compact chmod-fail: rewrite landed despite failed permission check"
@@ -275,6 +295,8 @@ docker exec "$CT" grep -q '^fchmod EPERM$' /tmp/fsyncfail.log \
 docker exec "$CT" test ! -e "$PGDATA_C/$FB_REL.compact" \
   || fail "compact chmod-fail: rejected temp left behind"
 clear_chmod_target
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.metrics_port 9187; reload
 gen "open-heal-$SUF" 20
 n=0; while [ "$n" -lt 15 ]; do
   compacted_now=$(statf events_compacted)
@@ -496,20 +518,6 @@ for i in range(int(count)):
     out += struct.pack("<II", len(member), 1) + member
 sys.stdout.buffer.write(out)
 PY
-}
-observe_port=9187
-observe_hup() { # new listener is a worker-side barrier AFTER fb.reload
-  [ "${1:-}" = keep ] || docker exec "$CT" rm -f /tmp/fsyncfail.log
-  observe_port=$((observe_port + 1))
-  setguc pg_logtap.metrics_port "$observe_port" || fail "HUP observer: port rejected"
-  reload
-  n=0
-  while [ "$n" -lt 20 ]; do
-    docker exec "$CT" bash -c "exec 3<>/dev/tcp/127.0.0.1/$observe_port; printf 'GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3; timeout 2 cat <&3" 2>/dev/null \
-      | grep -q 'HTTP/1.1 200' && return
-    n=$((n + 1)); sleep 1
-  done
-  fail "HUP observer: worker did not apply new listener"
 }
 scan_seen() { docker exec "$CT" grep -q '^pread ' /tmp/fsyncfail.log 2>/dev/null; }
 queue_backlog() { docker exec "$CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery'; }
