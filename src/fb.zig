@@ -79,11 +79,9 @@ const FrameFormat = enum {
     }
 };
 
-/// Linux O_NOFOLLOW (0o400000) as a raw flag value: std.os.linux.O is a
-/// packed bool struct, unusable with the extern open. Every open of the
-/// queue path (and the compaction temp) passes it — anything able to write
-/// the data directory must not aim the queue at another file.
-const fb_no_follow: c_int = 0o400000;
+/// Target-specific Linux O_NOFOLLOW, converted for libc open. Every queue
+/// and compaction-temp open must refuse final-component symlinks.
+const fb_no_follow: c_int = @bitCast(std.os.linux.O{ .NOFOLLOW = true });
 
 /// Consumed prefix of the queue (magic + members), worker-local. 0 also means
 /// "magic not verified yet". Read and advanced by the worker's drain loop.

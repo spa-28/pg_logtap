@@ -1080,7 +1080,14 @@ fn sendFile(path: []const u8, body: []const u8) bool {
     pbuf[path.len] = 0;
     // O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW|O_NONBLOCK. Nonblock prevents
     // a FIFO open waiting for a reader before the descriptor is rejected.
-    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024 | 0o400000 | 0o4000, @as(c_uint, 0o600));
+    const flags: c_int = @bitCast(std.os.linux.O{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    });
+    const conn_fd = c.open(@ptrCast(&pbuf), flags, @as(c_uint, 0o600));
     if (conn_fd < 0 or privateFd(conn_fd) == null) {
         const err = std.c._errno().*;
         if (conn_fd >= 0) _ = c.close(conn_fd);
