@@ -30,11 +30,11 @@ pass through, so some systems ingest directly without a collector in between.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
-- **Capture-time redaction** — the `password` token in statement text is cut and bind-parameter values in `DETAIL` are masked before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
+- **Capture-time redaction** — the `password` token in statement text is cut and bind-parameter values in translated `DETAIL`/`CONTEXT` fields are masked before anything leaves the server; an opt-in regex masks tokens/PII in every text field ([details](#sensitive-data-in-events)).
 - **Loss-free under load** — ring drain is interleaved with sends; verified exact delivery at ~45k events/s sustained for 5 minutes (OLTP overhead and latency percentiles, measured before/after the extension: [docs/bench.md](docs/bench.md)), and 0 lost across an 11M-event debug storm with a 10-minute receiver outage (full numbers: [docs/delivery.md](docs/delivery.md)).
 - **Delivery guarantees** — bounded retry backlog (oldest-dropped, counted in `events_lost`), optional compressed on-disk queue that survives crashes and replays automatically when the receiver returns, gapless `seq` for receiver-side dedup. The full contract, with loss boundaries per failure scenario: [docs/delivery.md](docs/delivery.md).
 - **TLS export** — `https://` and `tcps://` schemes: the same transports over TLS 1.2/1.3, CA pinning, name/SNI override for IP-literal URLs and TLS-terminating load balancers, auth headers for http(s) ([details](docs/delivery.md#tls-https-tcps)).
-- **Prometheus metrics** — `/metrics` and `/healthz` built into the worker; no extra exporter.
+- **Prometheus metrics** — `/metrics`, liveness `/healthz`/`/livez` and delivery `/readyz` built into the worker; no extra exporter.
 - **Runtime switching** — `export_url` is re-read on SIGHUP: move a cluster from Vector to ClickHouse without restart.
 - **Permanent-standby support** — the exporter starts once hot standby reaches a consistent state and does not bind to a particular database. Each event's source database and user are still resolved independently from PostgreSQL's shared catalogs, including in multi-database clusters.
 
@@ -110,15 +110,39 @@ On PostgreSQL ≤ 16, `ALTER SYSTEM SET pg_logtap.*` before the first restart is
 rejected (GUCs register in `_PG_init`) — enable the preload, restart, then set
 GUCs and restart again.
 
+### Upgrading to 0.6.1
+
+Install the new library, control file and **all** versioned SQL files, restart
+PostgreSQL, then update each database where the extension is installed:
+
+```sql
+ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+```
+
+A fresh 0.6.0 install already has the canonical `pg_logtap_stats_t` /
+`pg_logtap_delivery` column order, so this update preserves their OIDs and
+external dependencies. Older upgrade chains have an append-only historical
+order; 0.6.1 replaces those two objects under `DROP ... RESTRICT`. Before
+updating such a database, remove external objects that depend on the type or
+view and restore baseline ownership/privileges, including the view's implicit
+row type. Remove custom column grants and defaults, comments, security labels
+and relation/column options, including metadata on generated array types;
+restore intentional customizations after the update. Also reset custom
+default privileges for tables/types that apply to the extension schema during
+the migration. A successful normalization changes both OIDs and takes exclusive
+locks, so reconnect or reprepare clients that cache them. Any refusal rolls the
+whole `ALTER EXTENSION` transaction back without changing the old objects or
+`extversion`; the migration never uses `CASCADE`.
+
 ## Configuration
 
 | Option | Default | Context | Description |
 |---|---|---|---|
 | `pg_logtap.level_min` | `15` (LOG) | SIGHUP | Minimum elevel to capture (10=DEBUG5 … 23=PANIC — see the level table below). |
-| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars). Backreferences (`\1`…`\9`) are rejected — they drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and the scan runs over the full `message_max`; matching runs in every logging backend). |
-| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. Backreferences are rejected for the same reason as `pattern`. |
+| `pg_logtap.pattern` | `''` | SIGHUP | POSIX ERE; capture only matching messages. Invalid expressions and backreferences (`\1`…`\9`) are rejected without replacing the active pattern — backreferences drop glibc off its fast matcher (measured ~20 s worst case at a 1 KB message, and matching runs in every logging backend). Plain EREs are linear on glibc/musl (measured ≤3 ms at 1000 chars). |
+| `pg_logtap.pattern_exclude` | `''` | SIGHUP | POSIX ERE; skip matching events — matched against message, detail, hint, context and the captured query. Invalid expressions and backreferences are rejected without replacing the active pattern. |
 | `pg_logtap.field_query` | `false` | SIGHUP | Capture the current query text with each event. ⚠ sensitive — see below. |
-| `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; backreferences are rejected (see `pattern`). |
+| `pg_logtap.redact_pattern` | `''` (off) | SIGHUP | POSIX ERE; every match in `message`/`detail`/`hint`/`context`/`query` is replaced with `<REDACTED>` **at capture** — masked text is what travels the wire, sits in the ring and in the fallback file. Best-effort like any pattern-based masking; invalid expressions and backreferences are rejected without replacing the active redactor (see `pattern`). |
 | `pg_logtap.ring_capacity` | `1024` (128–8192) | postmaster | Ring buffer size in events. |
 | `pg_logtap.message_max` | `1024` (1024–1048576) | postmaster | Slot width for each event's `message` in bytes; longer messages are cut at a UTF-8 character boundary and named in `truncated`. Other fields stay 256 bytes. Shared memory cost is `ring_capacity × (message_max + ~2.4 KB)` — the default keeps the slot byte-identical to 0.3.x (≈3.4 KB); the max width with the max ring is ≈8.6 GB. Capture cost grows with the message's actual length, not the setting (~1.8 µs/KB — a 1 MB message adds ~1.9 ms in the logging backend; short messages pay microseconds as before). Check the receiver's line limit before raising it (see Receivers). |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
@@ -128,14 +152,14 @@ GUCs and restart again.
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
 | `pg_logtap.export_http_content_type` | `application/x-ndjson` | SIGHUP | `Content-Type` value on `http://`/`https://` requests. This changes only the MIME label; the body remains NDJSON. Set `application/json` for receivers such as Fluent Bit 4.0.14. Values must be 1–256 bytes of visible ASCII/space/tab and not whitespace-only. |
-| `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Extra application header line(s) on every http(s) request after `Host` and `Content-Type`, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects raw control bytes, an empty line and sender-owned names including `Content-Type` (use `export_http_content_type`). |
-| `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. New counted frames retain an exact fallback count when a gzip payload is unreadable; when the payload is readable, its NDJSON line count wins over damaged count metadata. Clean legacy queues remain replayable. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). Keep it on local disk, like `export_tls_ca`: appends and the final shutdown parking have no timeout, and a hung network filesystem would block the worker outright. See [docs/delivery.md](docs/delivery.md). |
+| `pg_logtap.export_http_extra_headers` | `''` | SIGHUP | Superuser-only. Extra application header line(s) on every http(s) request after `Host` and `Content-Type`, e.g. `'Authorization: Bearer <token>'` (plain `http://` included; multiple lines separated by the two-character `\n` sequence — a GUC value cannot carry a real newline). Each line is CRLF-terminated on send; SET rejects raw control bytes, an empty line, sender-owned names including `Content-Type`, and any value that would push the complete request head past 2048 bytes. Ordinary roles cannot read it; superusers and `pg_read_all_settings`/`pg_monitor` can, so this is not encrypted secret storage. |
+| `pg_logtap.export_fallback_file` | `''` (off) | SIGHUP | Failed batches (any transport — `http(s)://`, `tcp(s)://`, `file://`) go here instead of being lost: a compressed durable queue (fdatasynced) that the worker replays and truncates itself once the receiver answers — survives restarts. New counted frames retain an exact fallback count when a gzip payload is unreadable; when the payload is readable, its NDJSON line count wins over damaged count metadata. Clean legacy queues remain replayable. Files must be worker-owned, regular, single-link and verified `0600`. Same-path reload revalidates a repaired queue; changing/disabling the path is deferred until the active queue is proven drained, then requires another reload. Soft worker replacement retains the active path; before a full postmaster restart, drain it or restore its configured path. Relative resolves against the data directory; a path equal to a `file://` export_url is rejected (the NDJSON sink and the queue framing cannot share a file). Keep it on local disk, like `export_tls_ca`: appends and the final shutdown parking have no timeout, and a hung network filesystem would block the worker outright. See [docs/delivery.md](docs/delivery.md). |
 | `pg_logtap.flush_interval` | `1000` ms | SIGHUP | Push cycle. |
 | `pg_logtap.export_timeout_ms` | `5000` ms | SIGHUP | connect/send/receive timeout on export sockets — a receiver that accepts but never answers fails the send after this instead of hanging the worker (the batch retries via the usual path). One monotonic absolute deadline per send attempt: every resolved connect address and later stage gets only the remaining budget; plain body writes check it between syscalls, and TLS re-arms it before every socket read/write, so dribbling fragments, stalled reads, EINTR retries, or wall-clock changes cannot stretch the attempt. DNS resolution itself remains blocking, but consumes the budget before connect. |
-| `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | a live send that answers but takes at least this long means the receiver cannot keep up: while it stays this slow, live batches park on the `export_fallback_file` instead of piling up in RAM (a slow round trip would otherwise stall the worker and starve capture); a fast send on the drain path clears the flag. `0` = off. |
+| `pg_logtap.export_slow_ms` | `250` ms | SIGHUP | A live send that answers but takes at least this long means the receiver cannot keep up: live batches park on the `export_fallback_file` instead of piling up in RAM. Under continuous input, the worker periodically probes the oldest queued member; a fast success clears slow mode, while a still-slow/failing attempt backs off again. `0` = off. |
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
-| `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` + `/healthz` port. |
+| `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` and `/healthz`/`/livez`/`/readyz` port. |
 | `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
 
 ### Setting the minimum level
@@ -276,14 +300,16 @@ extends the audience. Three layers mask such text **at capture** — the ring,
 the fallback file and the receiver all hold the masked form only:
 
 - **Password cut, always on.** When the captured `query` field, or a
-  `message` line that embeds a statement — `statement: ...` from
-  `log_statement` / `log_min_duration_statement`, and the extended-protocol
-  phase lines `parse <name>: ...` / `bind ...` / `execute <name>: ...` that
-  JDBC, psycopg and `pgbench -M extended` produce (same GUCs, no
-  `statement:` marker) — contains the standalone word `password`
+  `message` line that PostgreSQL identifies as statement text — `statement:
+  ...` from `log_statement` / `log_min_duration_statement`, and the
+  extended-protocol phase lines `parse <name>: ...` / `bind ...` / `execute
+  <name>: ...` that JDBC, psycopg and `pgbench -M extended` produce (same
+  GUCs, no `statement:` marker) — contains the standalone word `password`
   (case-insensitive, word boundaries respected — `user_passwords` does not
   trigger it), everything after that word is dropped and replaced with
-  `<REDACTED>`:
+  `<REDACTED>`. The exported `message` remains localized; classification uses
+  PostgreSQL's untranslated primary format ID, so masking does not depend on
+  `lc_messages`:
 
   ```
   duration: 3.2 ms  statement: CREATE ROLE app PASSWORD 'hunter2'
@@ -293,14 +319,15 @@ the fallback file and the receiver all hold the masked form only:
   A message that merely mentions the word (a warning, an app-level line) is
   not statement text and passes verbatim. The cut covers the common
   `PASSWORD '...'` shapes, not every way a secret can be encoded in SQL.
-- **Bind-value mask, always on.** With
-  `log_parameter_max_length`/`log_parameter_max_length_on_error` above `-1`,
-  PostgreSQL appends the actual bind values to the statement line's `DETAIL`
-  (`Parameters: $1 = '...'`) — the SQL text carries only `$N` placeholders, so
-  the password cut cannot see them. On that one line every quoted value
-  becomes `<REDACTED>` (`Parameters: $1 = <REDACTED>, $2 = <REDACTED>`);
-  other `DETAIL`s pass verbatim. The values still sit in the server's own
-  log — keep the GUCs at `-1` unless the values are the point.
+- **Bind-value mask, always on.** `log_parameter_max_length` puts bind
+  values in statement `DETAIL`; `log_parameter_max_length_on_error` can put
+  them in error `CONTEXT`. Their surrounding text follows `lc_messages`, but
+  PostgreSQL's payload shape does not: every exact `$N = 'quoted value'` in
+  `DETAIL`/`HINT`/`CONTEXT` becomes `$N = <REDACTED>`, while `$N = NULL` and
+  the localized wrapper stay unchanged. This intentionally also masks an
+  application-supplied auxiliary field with that exact shape. The values
+  still sit in the server's own log: `0` disables each setting, while `-1`
+  logs values in full.
 - **`pg_logtap.redact_pattern`** — a POSIX ERE applied to
   `message`/`detail`/`hint`/`context`/`query`; every match becomes
   `<REDACTED>`:
@@ -311,7 +338,8 @@ the fallback file and the receiver all hold the masked form only:
   ```
 
   Empty (the default) disables the layer. It runs in every logging backend,
-  so backreferences (`\1`…`\9`) are rejected. Treat it as damage reduction:
+  so invalid expressions and backreferences (`\1`…`\9`) are rejected before
+  they can replace the active compiled pattern. Treat it as damage reduction:
   any single pattern can be evaded by a
   determined writer, and a masked field is still evidence that something
   sensitive was there.
@@ -320,9 +348,10 @@ On top of that, the operational knobs:
 
 - keep `field_query` off (the default) and be deliberate about
   `log_min_duration_statement`;
-- keep `log_parameter_max_length`/`log_parameter_max_length_on_error` at
-  `-1` (the default) unless the values are the point: when set, bind values
-  reach `DETAIL` masked (see above) but still expand the event;
+- set `log_parameter_max_length`/`log_parameter_max_length_on_error` to `0`
+  to disable bind-value logging when the values are not needed (`-1` logs
+  them in full); when enabled, values reach `DETAIL`/`CONTEXT` masked in the
+  export (see above) but still expand the event and remain in server logs;
 - `pg_logtap.pattern_exclude` suppresses whole events at capture — the
   pattern is matched against every text field of the event (message,
   detail, hint, context and the captured query), so e.g.
@@ -336,13 +365,17 @@ On top of that, the operational knobs:
 - `https://host:port[/path]` — the same POST over TLS 1.2/1.3 (no client certificates / mTLS); verification is `export_tls_ca` + `export_tls_server_name`, auth is `export_http_extra_headers` — see the GUC table above;
 - `tcp://host:port` — raw JSON lines;
 - `tcps://host:port` — raw JSON lines over TLS 1.2/1.3, same verification GUCs;
-- `file:///abs/path` — append, mode 0600, fdatasync per batch (durable across OS crashes).
+- `file:///abs/path` — append to a worker-owned regular single-link file, verified mode 0600, fdatasync per batch (durable across OS crashes). Final symlinks, hardlinks, special/foreign-owned files and failed chmod are refused; parent directories must be trusted.
 
 IPv6 literal hosts (`https://[::1]:9428`) are not parsed in any network
 scheme — use a hostname or an IPv4 literal (bracket parsing is on the
-roadmap: `docs/TODO.md`). The host and path of a network scheme must be
-plain visible ASCII: a control byte or a space is rejected at `ALTER
-SYSTEM` outright (both would malform the request line).
+roadmap: `docs/TODO.md`). A network host is limited to 255 bytes. The host
+and path must be plain visible ASCII: a control byte or a space is rejected
+at `ALTER SYSTEM` outright. For HTTP(S), the complete rendered request head
+(request line, owned headers, extra headers and framing) must fit 2048 bytes;
+each URL/content-type/header check combines its candidate with the currently
+installed sibling settings, and the runtime renderer remains the final
+backstop.
 
 With `pg_logtap.export_gzip = on` the HTTP body is gzipped
 (`Content-Encoding: gzip`) — same NDJSON after decompression, just less
@@ -464,10 +497,10 @@ replayed, cap-trimmed and unreadable skipped events from `events_queued`):
 | `events_compacted` | events | dropped by the `fallback_max_mb` cap trim while still undelivered (also counted in `events_lost`, never in `delivered`) |
 | `events_lost` | events | permanently gone: RAM backlog overflow — capture sustained past export capacity (or receiver down with no fallback file) — an unreadable counted queue member skipped by its stored event count, or the `fallback_max_mb` cap trimming undelivered members; a readable counted member uses its actual NDJSON line count even if count metadata differs |
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
-| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level |
+| `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable. Monotonic across reloads/reconfiguration and soft worker replacement, reset only on postmaster restart. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life) — https/tcps is shipping unauthenticated |
 | `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` also goes 1) |
-| `warn_fallback_skipped` | **lines** | an unreadable counted queue member was skipped; its stored event count enters `events_lost` and leaves `queue_backlog` |
+| `warn_fallback_skipped` | **lines** | an unreadable counted queue member was observed during a boot/reload credit scan or replay; only actual replay accounts its stored event count in `events_lost` and removes it from `queue_backlog` |
 | `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) queue |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
 
@@ -482,8 +515,14 @@ send_cycles_failed,events_lost}_total` (counters) +
 `pg_logtap_{fb_sync_failures,warn_tls_no_verify,warn_fallback_open,
 warn_fallback_skipped,warn_fallback_unbounded}` (counters, named like their SQL/stats
 fields, no `_total`) + `pg_logtap_ring_{events,capacity}` and
-`pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed}` (gauges),
-plus `/healthz`. Served from the export worker's loop: scraping is capped at
+`pg_logtap_{dns_fail_streak,fallback_broken,redact_pattern_failed,queue_backlog}`
+(gauges). `pg_logtap_queue_backlog` matches SQL, including exact unreadable-frame
+skips; it excludes ring/RAM and bytes and is not a durability guarantee.
+`/healthz` and `/livez` mean worker liveness. `/readyz` is 200 after the latest
+real send/replay for the current URL succeeds, otherwise 503 (startup,
+disabled export, URL change or failed attempt). Idle and unrelated reloads do
+not reset the result; slow success and nonzero backlog remain ready. See the
+[delivery contract](docs/delivery.md#liveness-readiness-and-backlog). Served from the export worker's loop: scraping is capped at
 250 ms per flush cycle, and a client that connects but dribbles its request
 line gets at most 50 ms before its connection is dropped — export work keeps
 the vast majority of every cycle. No TLS/auth — closed networks only. Ready
@@ -563,6 +602,10 @@ concentrated in `capture.zig` / `worker.zig`, the rest (`ring`, `filter`,
 `jsonl`, `export`, `metrics`) is pure and links without postgres symbols — so
 `zig build test` runs standalone and identically across the whole 15–18 matrix.
 Behavior that needs a real server is covered by the e2e scripts instead.
+The final `archive` matrix phase validates and loads the exact runtime/debug
+tarballs on pinned native Rocky 8.10 with glibc 2.28, checks the extension in
+`template1` and exports a marker to a private file. CI uploads those tested
+archives; the release job does not repack them.
 
 Verified on PostgreSQL 15/16/17/18: capture, export, exact delivery under a
 pgbench storm (`dropped=0`), and the failure/robustness classes — receiver
@@ -598,7 +641,7 @@ src/gzip.zig       transport gzip for the HTTP body (Content-Encoding: gzip)
 src/tls.zig        TLS transport for https/tcps: std.crypto.tls handshake + IO
 src/fb.zig         fallback queue: append/replay/compact, owns its GUCs
 src/worker.zig     bgworker exporter: drain, batches, retry backlog, libc IO
-src/metrics.zig    /metrics + /healthz: Prometheus text, HTTP reply (tested)
+src/metrics.zig    Prometheus /metrics, liveness/readiness HTTP replies (tested)
 scripts/           build, dev-deploy, e2e-*, test-matrix
 ```
 

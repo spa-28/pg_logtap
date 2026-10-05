@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+### Fixed
+
+- Built-in password masking identifies statement-bearing primary messages by
+  PostgreSQL's untranslated format ID, so translated `lc_messages` output no
+  longer bypasses the cut and application messages resembling English
+  statement prefixes are no longer misclassified.
+- Bind values are masked by PostgreSQL's structural `$N = '...'` payload in
+  translated `DETAIL`/`HINT`/`CONTEXT` fields, including
+  `log_parameter_max_length_on_error` error context.
+- Auxiliary-field password masking preserves text skipped over non-assignment
+  tokens, keeping bind prefixes recognizable by the following masking pass
+  instead of exposing values containing password tokens and escaped quotes.
+- Invalid `pattern`, `pattern_exclude` and `redact_pattern` assignments are
+  rejected before they replace the active compiled expression; ordinary
+  configuration errors no longer disable filtering or redaction.
+- Slow-receiver mode periodically probes the oldest queued member even under
+  continuous capture, so recovery no longer depends on an idle input window.
+- Network hosts longer than 255 bytes and HTTP configurations whose complete
+  rendered request head exceeds 2048 bytes are rejected at configuration time;
+  runtime sending uses the same renderer and limits.
+
+- Failed fallback `fdatasync` calls increment the shared counter immediately;
+  `fb_sync_failures` no longer regresses on a soft export-worker restart.
+- Explicit reload revalidates a repaired fallback queue at the same path.
+  Changing or disabling the path waits until the active queue is proven drained;
+  a replacement worker retains that active path even if a different path is
+  already configured. Repeat reload after drain to apply the change.
+
+### Added
+
+- `pg_logtap_queue_backlog` exposes the exact fallback event backlog to
+  Prometheus, subtracting replay, cap trimming and counted unreadable-frame
+  skips from the same locked snapshot used by SQL.
+- `/livez` aliases `/healthz`; `/readyz` reports the last real delivery attempt
+  for the current export URL. Startup, disabled export, URL changes and failed
+  attempts are unready; successful slow sends remain ready even with backlog.
+- Release archive checks validate member paths/types, architecture, glibc
+  requirements and detached debug symbols. Native PG15–18 builds smoke the
+  exact runtime/debug archives on glibc 2.28 before uploading those bytes.
+
+### Security
+
+- `file://` sinks, fallback queues and compaction temporary files require
+  worker-owned regular single-link descriptors with verified `0600` permissions
+  before IO. Final-component symlinks, hardlinks, foreign-owned files and
+  special files are refused; permission failures no longer permit export.
+- `export_http_extra_headers` is superuser-only, hiding bearer tokens and other
+  credentials from ordinary roles. Superusers and trusted settings readers
+  (`pg_read_all_settings`, including `pg_monitor`) can still read it.
+
+### Changed
+
+- The next extension version is `0.6.1`. Updating a historical installation
+  normalizes `pg_logtap_stats_t` and `pg_logtap_delivery` to the fresh-install
+  column order. Noncanonical installations must remove external dependencies
+  and custom object metadata before the update; the transactional migration
+  never uses `CASCADE`, and successful normalization changes the type/view OIDs.
+
 ## 0.6.0 (2026-09-30)
 
 ### Added

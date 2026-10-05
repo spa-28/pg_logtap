@@ -28,6 +28,7 @@ const c = struct {
     extern "c" fn gethostname(name: [*]u8, len: usize) c_int;
     extern "c" fn fdatasync(fd: c_int) c_int;
     extern "c" fn fchmod(fd: c_int, mode: c_uint) c_int;
+    extern "c" fn geteuid() c_uint;
     extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64; // SEEK_END=2 → file size
     extern "c" fn ftruncate(fd: c_int, length: i64) c_int;
     extern "c" fn inet_pton(family: c_int, src: [*:0]const u8, dst: *anyopaque) c_int;
@@ -35,28 +36,9 @@ const c = struct {
     extern "c" fn stat(path: [*:0]const u8, buf: *FileStat) c_int;
 };
 
-/// struct stat as glibc/musl build it on LP64 (kernel asm-generic layout,
-/// 144 bytes on amd64/arm64): the full size so libc writes stay in bounds;
-/// only dev/ino are read (the alias checks below). std dropped its linux
-/// Stat wrapper in 0.16 (only statx remains — syscall plumbing for two
-/// numbers).
-pub const FileStat = extern struct {
-    dev: i64,
-    ino: u64,
-    nlink: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    pad0: u32 = 0,
-    rdev: i64,
-    size: i64,
-    blksize: i64,
-    blocks: i64,
-    atim: [16]u8 = @splat(0),
-    mtim: [16]u8 = @splat(0),
-    ctim: [16]u8 = @splat(0),
-    unused: [24]u8 = @splat(0),
-};
+/// Use the translated target headers: mode/nlink have different offsets on
+/// amd64 and arm64, even though dev/ino agree. Zig's std.c.Stat is void on Linux.
+pub const FileStat = pg.struct_stat;
 const net = std.c;
 
 /// Message staging for ring drains (capture.messageMax() bytes, allocated
@@ -75,12 +57,15 @@ var guc_flush_interval: c_int = 1000;
 var guc_export_timeout_ms: c_int = 5000;
 var guc_export_slow_ms: c_int = 250;
 var guc_export_backlog_max: c_int = 65_536;
-/// Receiver liveness probe: set when a live send answered but took at least
-/// export_slow_ms — such a receiver cannot keep up (256 events per slow
-/// round trip), so live batches park on the fallback file instead of piling
-/// up in the RAM backlog and being trimmed. Cleared by a fast send on the
-/// drain path once the receiver recovers.
+/// Set when a send answered but took at least export_slow_ms — such a receiver
+/// cannot keep up (256 events per slow round trip), so live batches park on
+/// the fallback file instead of piling up in the RAM backlog and being
+/// trimmed. Under continuous capture, one oldest queued member is retried at
+/// this monotonic deadline; a fast answer clears both fields.
 var receiver_slow = false;
+var next_slow_probe_us: i64 = 0;
+/// Latest real delivery attempt for the current URL, not idle-cycle health.
+var receiver_ready = false;
 var guc_metrics_port: c_int = 0;
 var guc_metrics_addr: [*c]u8 = null;
 
@@ -136,6 +121,30 @@ fn netNowUs() i64 {
     return @intCast(@divTrunc(timestamp.nanoseconds, 1000));
 }
 
+/// Update slow-receiver state after one real delivery attempt. A failure only
+/// reschedules an already-slow receiver; ordinary outage handling remains the
+/// fallback/RAM backlog path. Saturating arithmetic keeps extreme configured
+/// timeouts from wrapping the monotonic deadline.
+fn finishReceiverAttempt(started_us: i64, succeeded: bool) void {
+    receiver_ready = succeeded;
+    const finished_us = netNowUs();
+    const duration_us = if (finished_us > started_us) finished_us - started_us else 0;
+    if (guc_export_slow_ms <= 0) {
+        receiver_slow = false;
+        next_slow_probe_us = 0;
+        return;
+    }
+    const slow = succeeded and duration_us >= @as(i64, guc_export_slow_ms) * 1000;
+    if (succeeded and !slow) {
+        receiver_slow = false;
+        next_slow_probe_us = 0;
+        return;
+    }
+    if (!succeeded and !receiver_slow) return;
+    receiver_slow = true;
+    next_slow_probe_us = finished_us +| @max(@as(i64, 1_000_000), duration_us *| 10);
+}
+
 /// Arm an EXPLICIT deadline's remainder on a socket — the per-syscall
 /// re-arm inside writeAll. netArmDeadline below is the stage-boundary
 /// version (the send attempt's global deadline).
@@ -170,13 +179,15 @@ pub fn compactAborted() bool {
 }
 
 pub fn init() void {
-    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, null, null);
     pg.DefineCustomStringVariable("pg_logtap.cluster_name", "Cluster label stamped into every event's cluster field. Empty = fall back to the server's cluster_name (postmaster GUC, restart-to-change; empty by default). Values longer than 256 bytes are cut — a label, not data.", null, &guc_cluster_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_ca", "PEM file with the certificate authority (CA) to verify https:// and tcps:// receivers against — for a self-signed receiver, the receiver's own certificate. Empty = the system CA roots. A set file REPLACES the system roots. Applied on reload, from the next handshake.", null, &guc_export_tls_ca, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_tls_verify", "Verify the https:// and tcps:// receiver's certificate (chain and name). false disables both — development only: a man in the middle becomes possible and the logs are readable there.", null, &guc_export_tls_verify, true, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_tls_server_name", "Certificate name to verify and SNI to send when it differs from the URL host (IP-literal URLs, a TLS-terminating load balancer in front of the receiver). Empty = the URL host.", null, &guc_export_tls_server_name, "", pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomStringVariable("pg_logtap.export_http_content_type", "Content-Type value on http(s):// export requests. The default labels the unchanged NDJSON body as application/x-ndjson; set application/json for receivers such as Fluent Bit that require that media type. SIGHUP applies it from the next request. Empty, whitespace-only, control/non-ASCII bytes and values longer than 256 bytes are rejected.", null, &guc_export_http_content_type, "application/x-ndjson", pg.PGC_SIGHUP, 0, checkContentType, null, null);
-    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after Host and Content-Type — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte, an empty line or a sender-owned name such as Content-Type is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, 0, checkHeader, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_http_extra_headers", "Extra header line(s) appended to every http(s):// request after Host and Content-Type — e.g. 'Authorization: Bearer <token>' for VictoriaLogs. Separate lines with the two-character backslash-n sequence (ALTER SYSTEM rejects a real newline in the value); each line is CRLF-terminated on send. A raw carriage return, a control byte, an empty line or a sender-owned name such as Content-Type is rejected at ALTER SYSTEM (all would malform every request; the GUC is SIGHUP, so a session SET never reaches the check). Superuser-only because values commonly contain credentials. Empty = none.", null, &guc_export_http_extra_headers, "", pg.PGC_SIGHUP, pg.GUC_SUPERUSER_ONLY, checkHeader, null, null);
+    // Restore the head fields before URL validation: PostgreSQL checks each
+    // boot default before restoring its configured placeholder value.
+    pg.DefineCustomStringVariable("pg_logtap.export_url", "http://host:port[/path] | https://host:port[/path] | tcp://host:port | tcps://host:port | file:///path; empty = no export worker (restart applies). A file:// path equal to pg_logtap.export_fallback_file is rejected (the NDJSON sink and the queue framing cannot share a file).", null, &guc_export_url, "", pg.PGC_SIGHUP, 0, checkUrl, assignUrl, null);
     pg.DefineCustomBoolVariable("pg_logtap.export_gzip", "Compress http:// export batches (Content-Encoding: gzip). Receiver must accept gzipped request bodies: Vector http_server, VictoriaLogs, Fluent Bit http and Logstash http inputs do; a plain custom endpoint may not.", null, &guc_export_gzip, false, pg.PGC_SIGHUP, 0, null, null, null);
     fbq.defineGucs();
     pg.DefineCustomIntVariable("pg_logtap.flush_interval", "Drain-and-flush interval in milliseconds.", null, &guc_flush_interval, 1000, 10, 3_600_000, pg.PGC_SIGHUP, 0, null, null, null);
@@ -230,6 +241,7 @@ pub fn workerMain() void {
         if (got_sighup.isSet()) {
             got_sighup.clear();
             pg.ProcessConfigFile(pg.PGC_SIGHUP);
+            fbq.reload(alloc);
             syncMetricsListener();
             refreshSourceId();
             // A new URL (or a re-set threshold) must not inherit the
@@ -237,6 +249,7 @@ pub fn workerMain() void {
             // new destination's batches until a quiet cycle re-probed it.
             // A still-slow receiver re-arms the flag on its next answer.
             receiver_slow = false;
+            next_slow_probe_us = 0;
         }
         // Absorb procsignal barriers (see handleUsr1). Errors here have no
         // better handler than the next cycle — the barrier itself doesn't
@@ -279,9 +292,13 @@ pub fn workerMain() void {
 /// file — parking is local-disk work, runs without a deadline, and loses
 /// nothing that the RAM backlog would otherwise carry into the restart.
 fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, final: bool) void {
-    if (guc_export_url == null or guc_export_url[0] == 0) return;
+    if (guc_export_url == null or guc_export_url[0] == 0) {
+        receiver_ready = false;
+        return;
+    }
     const url = std.mem.span(@as([*:0]const u8, @ptrCast(guc_export_url)));
     const dest = dest_mod.parseUrl(url) orelse {
+        receiver_ready = false;
         warnUrlOnce(url);
         return;
     };
@@ -362,10 +379,10 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             // Capture outranks replay: a member send to a slow receiver blocks
             // this loop for hundreds of milliseconds, and at high inflow the
             // ring fills and drops events at capture before the next drain.
-            // While the receiver is slow AND this cycle saw any live inflow,
-            // park-only: fsync and hand the loop back to drainInto; members
-            // resume once inflow quiets or it recovers.
-            if (receiver_slow and drained_total > 0) continue;
+            // Park-only while this cycle sees live inflow, except for one real
+            // oldest-member probe when the monotonic cooldown expires. Quiet
+            // cycles keep replaying without rate limiting.
+            if (receiver_slow and drained_total > 0 and netNowUs() < next_slow_probe_us) break;
             const next = fbq.nextMember(alloc);
             lost += fbq.lost;
             fbq.lost = 0;
@@ -388,13 +405,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
                 .member => |member| member,
             };
             const gzipped = gzipPayload(alloc, dest, member.body, &gzip_buf);
-            const m_sent_at = pg.GetCurrentTimestamp();
-            if (send(dest, url, gzipped.payload, gzipped.enabled)) {
-                // Drain-path round trip is the receiver liveness probe: a slow
-                // answer re-arms the park (receiver_slow), a fast one clears
-                // it — this also arms it after a restart into a slow receiver
-                // where the live-send probe never ran.
-                if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - m_sent_at >= @as(i64, guc_export_slow_ms) * 1000;
+            const attempt_started = netNowUs();
+            const delivered = send(dest, url, gzipped.payload, gzipped.enabled);
+            finishReceiverAttempt(attempt_started, delivered);
+            if (delivered) {
+                // A slow answer re-arms the park and its next probe; a fast one
+                // clears both. This also detects a slow receiver after restart,
+                // where the live-send path may not run first.
                 fbq.logDivert(false);
                 // counted queued at append time; this is its delivery
                 replayed += member.events;
@@ -432,16 +449,13 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
             continue;
         }
         const gzipped = gzipPayload(alloc, dest, chunk.body, &gzip_buf);
-        const sent_at = pg.GetCurrentTimestamp();
-        if (send(dest, url, gzipped.payload, gzipped.enabled)) {
+        const attempt_started = netNowUs();
+        const delivered = send(dest, url, gzipped.payload, gzipped.enabled);
+        finishReceiverAttempt(attempt_started, delivered);
+        if (delivered) {
             fbq.logDivert(false);
             pending.dropFront(chunk.consumed);
             sent += chunk.consumed;
-            // Liveness probe, both ways: an answer this slow cannot keep up
-            // with capture; a fast one clears the park — the live path must
-            // clear it too, or a slow answer with no fallback file set parks
-            // every later batch with no way back.
-            if (guc_export_slow_ms > 0) receiver_slow = pg.GetCurrentTimestamp() - sent_at >= @as(i64, guc_export_slow_ms) * 1000;
         } else if (final) {
             // Send failed during the shutdown flush: without this branch one
             // chunk parked and the rest of the RAM backlog died silently with
@@ -472,7 +486,7 @@ fn flushAll(alloc: std.mem.Allocator, pending: *Backlog, names: *NameCache, fina
     // Every cycle, not on transitions: the worker-local originals die with
     // the process, and a stale shmem copy would otherwise outlive a restart
     // (e.g. fallback_broken=1 from a file the operator already fixed).
-    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fbq.broken), fbq.sync_failures);
+    capture.setWorkerGauges(dns_fail_streak, @intFromBool(fbq.broken));
     logTransitions(sent + replayed, failed, lost);
 }
 
@@ -658,13 +672,24 @@ pub fn fileUrlAliasesFallback(url: []const u8, fb_raw: []const u8) bool {
     return std.mem.eql(u8, full, dest_v.file);
 }
 
+/// Render the worst-case runtime head: gzip enabled and the widest possible
+/// Content-Length. The same renderer and fixed cap are used by sendHttp.
+fn httpHeadFits(dest_v: dest_mod.Dest, content_type: []const u8, extra_headers: []const u8) bool {
+    if (dest_v != .http) return true;
+    var buf: [dest_mod.http_head_cap]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    dest_mod.writeHttpHead(&writer, dest_v.http, content_type, extra_headers, true, std.math.maxInt(usize)) catch return false;
+    return true;
+}
+
 /// SET-time check for export_url: the URL must parse (network schemes
 /// reject control bytes and spaces here — the host and path ride the HTTP
 /// request line verbatim, so they must be plain visible ASCII), and a
 /// file:// dest must not name the fallback queue's file (rule on
-/// fileUrlAliasesFallback). guc.c runs this for ALTER SYSTEM (a session SET
-/// is refused before any value check — PGC_SIGHUP); boot
-/// runs '' through here too — empty means "no export worker", not a bad URL.
+/// fileUrlAliasesFallback). HTTP destinations must fit with the current
+/// content type and extra headers. guc.c runs this for ALTER SYSTEM (a session
+/// SET is refused before any value check — PGC_SIGHUP); boot runs '' through
+/// here too — empty means "no export worker", not a bad URL.
 fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
@@ -673,12 +698,39 @@ fn checkUrl(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv
     const raw = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
     if (raw.len == 0) return true;
     const dest_v = dest_mod.parseUrl(raw) orelse return false;
+    if (!httpHeadFits(dest_v, gucSpan(guc_export_http_content_type), gucSpan(guc_export_http_extra_headers))) return false;
     if (dest_v != .file) return true;
     // sendFile's path buffers are 4096 bytes: a longer path used to load
     // fine and then fail every send silently (no reason, no detail) —
     // reject it here, the fallback GUC's own length rule's twin.
     if (dest_v.file.len >= 4096) return false;
     return !fileUrlAliasesFallback(raw, fbq.fileGucRaw());
+}
+
+/// The assign hook runs before guc.c replaces the old string. Borrow both
+/// values only for this comparison; an unrelated reload keeps readiness.
+fn assignUrl(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
+    _ = extra;
+    if (!std.mem.eql(u8, gucSpan(newval), gucSpan(guc_export_url))) receiver_ready = false;
+}
+
+/// Validate before chmod or IO: never change a foreign/shared/special inode.
+/// Parent directories remain trusted; O_NOFOLLOW covers the final component.
+pub fn privateFd(fd: c_int) ?FileStat {
+    const before = fdStat(fd) orelse return null;
+    if ((before.st_mode & 0o170000) != 0o100000 or before.st_uid != c.geteuid() or before.st_nlink != 1) {
+        std.c._errno().* = @intFromEnum(std.c.E.PERM);
+        return null;
+    }
+    if (c.fchmod(fd, @as(c_uint, 0o600)) != 0) return null;
+    const after = fdStat(fd) orelse return null;
+    if ((after.st_mode & 0o177777) != 0o100600 or after.st_uid != c.geteuid() or after.st_nlink != 1 or
+        before.st_dev != after.st_dev or before.st_ino != after.st_ino)
+    {
+        std.c._errno().* = @intFromEnum(std.c.E.PERM);
+        return null;
+    }
+    return after;
 }
 
 /// Inode of an open fd (null when fstat fails).
@@ -698,8 +750,7 @@ fn fdStat(fd: c_int) ?FileStat {
 /// land both writers on one inode — same shape as the same-reload double-flip
 /// residual; the foreign-content latch keeps it from silent corruption.
 /// True when an open file:// sink fd is the same inode as the fallback queue
-/// (the queue's own path stat'ed through symlinks — the sink follows them,
-/// that shared inode is exactly the alias being caught).
+/// (the active queue's path stat'ed independently of the sink's spelling).
 fn fdAliasesFallback(fd: c_int) bool {
     const sink_st = fdStat(fd) orelse return false;
     return fbq.aliasesQueueInode(sink_st);
@@ -716,7 +767,7 @@ pub fn queueFdAliasesFileUrl(fd: c_int) bool {
     const zpath = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{dest_v.file}, 0) catch return false;
     var ust: FileStat = undefined;
     if (c.stat(zpath, &ust) != 0) return false;
-    return qst.dev == ust.dev and qst.ino == ust.ino;
+    return qst.st_dev == ust.st_dev and qst.st_ino == ust.st_ino;
 }
 
 // --- source identity (multi-host → one Vector): stamped into every event ------
@@ -782,19 +833,29 @@ fn checkContentType(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) 
     _ = source;
     const ptr = newval orelse return true;
     const raw_c = ptr.* orelse return true;
-    return dest_mod.contentTypeValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
+    const content_type = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (!dest_mod.contentTypeValid(content_type)) return false;
+    const url = gucSpan(guc_export_url);
+    if (url.len == 0) return true;
+    const dest_v = dest_mod.parseUrl(url) orelse return false;
+    return httpHeadFits(dest_v, content_type, gucSpan(guc_export_http_extra_headers));
 }
 
-/// SET-time CR/LF check for export_http_extra_headers (discipline in export.zig,
-/// unit-tested there): guc.c runs this for ALTER SYSTEM (a session SET is
-/// refused before any value check — PGC_SIGHUP), and boot
-/// runs the default '' through here too (always accepted).
+/// SET-time CR/LF and complete-head check for export_http_extra_headers
+/// (discipline in export.zig, unit-tested there): guc.c runs this for ALTER
+/// SYSTEM (a session SET is refused before any value check — PGC_SIGHUP), and
+/// boot runs the default '' through here too (always accepted).
 fn checkHeader(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
     _ = extra;
     _ = source;
     const ptr = newval orelse return true;
     const raw_c = ptr.* orelse return true;
-    return dest_mod.headerValid(std.mem.span(@as([*:0]const u8, @ptrCast(raw_c))));
+    const header = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (!dest_mod.headerValid(header)) return false;
+    const url = gucSpan(guc_export_url);
+    if (url.len == 0) return true;
+    const dest_v = dest_mod.parseUrl(url) orelse return false;
+    return httpHeadFits(dest_v, gucSpan(guc_export_http_content_type), header);
 }
 
 // --- oid → name cache (catalog lookups under one short transaction) -----------
@@ -869,7 +930,7 @@ fn send(dest: dest_mod.Dest, url: []const u8, body: []const u8, gzipped: bool) b
 }
 
 /// A GUC string as a plain slice; null (unset) reads as empty.
-fn gucSpan(v: [*c]u8) []const u8 {
+fn gucSpan(v: [*c]const u8) []const u8 {
     return if (v == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(v)));
 }
 
@@ -925,18 +986,11 @@ fn sendHttp(h: anytype, body: []const u8, gzipped: bool) bool {
     // Re-arm post-dial: resolution and connect may have spent most of the
     // attempt, so handshake/writes/status read run only on what remains.
     if (!netArmDeadline(conn_fd)) return false;
-    // Fixed headers (method line, Host, content type/encoding/length) run
-    // ~110 bytes; 2048 leaves room for any realistic path, host and auth
-    // header, and one that still does not fit fails the send with the
-    // reason — not a torn header on the wire.
-    var head_buf: [2048]u8 = undefined;
+    // Configuration checks render the same worst-case head into the same cap;
+    // keep this catch as defense in depth against a cross-GUC reload race.
+    var head_buf: [dest_mod.http_head_cap]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    const content_type = gucSpan(guc_export_http_content_type);
-    head.print("POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: {s}\r\n", .{ h.path, h.host, h.port, content_type }) catch return failSend("head build", 0);
-    const extra_hdr = gucSpan(guc_export_http_extra_headers);
-    if (extra_hdr.len > 0) dest_mod.writeHeaderLines(&head, extra_hdr) catch return failSend("head build", 0);
-    if (gzipped) head.writeAll("Content-Encoding: gzip\r\n") catch return failSend("head build", 0);
-    head.print("Content-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}) catch return failSend("head build", 0);
+    dest_mod.writeHttpHead(&head, h, gucSpan(guc_export_http_content_type), gucSpan(guc_export_http_extra_headers), gzipped, body.len) catch return failSend("head build", 0);
     if (h.tls) return sendHttpTls(conn_fd, h, head.buffered(), body);
     if (!writeAll(conn_fd, head.buffered(), true, net_deadline_us)) return false; // writeAll owns the reason
     if (!writeAll(conn_fd, body, true, net_deadline_us)) return false;
@@ -1017,34 +1071,34 @@ fn sendRaw(fd_opt: ?c_int, body: []const u8, ep: dest_mod.Endpoint) bool {
 var file_sync_warned = false;
 var file_rollback_warned = false; // same shape: a torn write whose rollback failed or is not durable
 var sink_alias_warned = false; // same shape: a sink fd sharing the queue's inode
-var sink_perm_warned = false; // same shape: a pre-existing sink left more-readable than 0600
+var sink_perm_warned = false; // same shape: an unsafe or inaccessible sink
 
 fn sendFile(path: []const u8, body: []const u8) bool {
     if (path.len >= 4096) return false;
     var pbuf: [4096]u8 = undefined;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    // O_WRONLY|O_CREAT|O_APPEND (Linux: 1|64|1024 — 512 is O_TRUNC, which
-    // silently keeps only the last batch), 0600: not world-readable (C2).
-    const conn_fd = c.open(@ptrCast(&pbuf), 1 | 64 | 1024, @as(c_uint, 0o600));
-    if (conn_fd < 0) return false;
-    defer _ = c.close(conn_fd);
-    // 0600 above applies at creation only — pull a pre-existing file (an
-    // operator may have made it world-readable) down to it. Best-effort: a
-    // chmod failing here means a filesystem that would fail the writes too,
-    // so the send proceeds — but the left-open window says so, once. The
-    // latch re-arms only on a SUCCESSFUL tighten (like fbOpen's), never on a
-    // clean batch: an un-tightenable but working sink sends fine, and a
-    // per-batch re-arm would warn per send — each warning itself an event,
-    // the stream would feed itself.
-    if (c.fchmod(conn_fd, @as(c_uint, 0o600)) != 0) {
+    // O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW|O_NONBLOCK. Nonblock prevents
+    // a FIFO open waiting for a reader before the descriptor is rejected.
+    const flags: c_int = @bitCast(std.os.linux.O{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    });
+    const conn_fd = c.open(@ptrCast(&pbuf), flags, @as(c_uint, 0o600));
+    if (conn_fd < 0 or privateFd(conn_fd) == null) {
+        const err = std.c._errno().*;
+        if (conn_fd >= 0) _ = c.close(conn_fd);
         if (!sink_perm_warned) {
             sink_perm_warned = true;
-            elog.Warning(@src(), "pg_logtap file:// sink permissions could not be tightened to 0600 (errno={d}): local users may read the log stream in {s}", .{ std.c._errno().*, path });
+            elog.Warning(@src(), "pg_logtap file:// sink refused: requires a regular single-link worker-owned 0600 file (errno={d}): {s}", .{ err, path });
         }
-    } else {
-        sink_perm_warned = false;
+        return false;
     }
+    defer _ = c.close(conn_fd);
+    sink_perm_warned = false;
     const end_before = c.lseek(conn_fd, 0, 2); // SEEK_END: rollback point
     if (end_before < 0) return false;
     // Inode-level alias with the fallback queue (see fdAliasesFallback):
@@ -1135,7 +1189,7 @@ var dns_fail_streak: u32 = 0;
 // that moves to a new IP while dns also fails in-process stays unreachable
 // until the resolver heals or the worker restarts; recreating the receiver
 // recreates the stand, which restarts postgres too.
-var dns_good_host: [255]u8 = undefined;
+var dns_good_host: [dest_mod.host_max]u8 = undefined;
 var dns_good_host_len: usize = 0;
 // When dns_good_addr was cached (µs); 0 = never.
 var dns_good_at_us: i64 = 0;
@@ -1157,11 +1211,11 @@ var dns_good_port: u16 = 0;
 /// the failure mode is the same as a dead receiver (ring absorbs, then
 /// events_lost), never a permanent hang. IP literals skip resolution.
 fn dialTcp(host: []const u8, port: u16) ?c_int {
-    if (host.len >= 256) {
+    if (host.len > dest_mod.host_max) {
         _ = failSend("host too long", 0);
         return null;
     }
-    var host_buf: [256]u8 = undefined;
+    var host_buf: [dest_mod.host_max + 1]u8 = undefined;
     @memcpy(host_buf[0..host.len], host);
     host_buf[host.len] = 0;
     var port_buf: [6]u8 = undefined;
@@ -1481,7 +1535,7 @@ fn serveOne(conn_fd: c_int) void {
     // renders the body into its own body_cap buffer, then copies it here).
     var resp_buf: [metrics.body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&resp_buf);
-    metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot()) catch return;
+    metrics.writeResponse(&resp_w, req_buf[0..got], capture.snapshot(), receiver_ready) catch return;
     _ = writeAll(conn_fd, resp_w.buffered(), true, null);
 }
 

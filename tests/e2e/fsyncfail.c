@@ -5,7 +5,15 @@
  * - fdatasync fails with EIO only for the fd whose /proc/self/fd link points
  *   at the path in /tmp/fsyncfail-target, for FSYNCFAIL_COUNT calls;
  * - open/open64 fail only an O_CREAT|O_EXCL attempt for the pathname in
- *   /tmp/openfail-target, for OPENFAIL_COUNT calls, with OPENFAIL_ERRNO.
+ *   /tmp/openfail-target, for OPENFAIL_COUNT calls, with OPENFAIL_ERRNO;
+ * - fchmod fails with EPERM for /tmp/chmodfail-target until it is removed;
+ * - write on /tmp/writefail-target writes a 17-byte prefix once, then fails
+ *   with ENOSPC until the target is removed (regular-file rollback test).
+ *   Injected chmod/write faults are recorded in /tmp/fsyncfail.log.
+ * - fsync on /tmp/dirsyncobserve-target records a directory sync attempt;
+ * - pread/pread64 on /tmp/preadobserve-target record frame/payload offsets;
+ * - fdatasync on /tmp/datasyncobserve-target records successful data syncs.
+ *   These observers pass through unchanged and use the same log.
  *
  * Everything else — WAL, the data dir, every other file — passes through to
  * libc. Targets arrive via files because PGDATA is known only after container
@@ -21,20 +29,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int (*real_fdatasync)(int);
+static int (*real_fsync)(int);
+static ssize_t (*real_pread)(int, void *, size_t, off_t);
+static ssize_t (*real_pread64)(int, void *, size_t, off64_t);
 static int (*real_open)(const char *, int, ...);
 static int (*real_open64)(const char *, int, ...);
+static int (*real_fchmod)(int, mode_t);
+static ssize_t (*real_write)(int, const void *, size_t);
 
 static void resolve_symbols(void)
 {
     if (!real_fdatasync)
         real_fdatasync = dlsym(RTLD_NEXT, "fdatasync");
+    if (!real_fsync)
+        real_fsync = dlsym(RTLD_NEXT, "fsync");
+    if (!real_pread)
+        real_pread = dlsym(RTLD_NEXT, "pread");
+    if (!real_pread64)
+        real_pread64 = dlsym(RTLD_NEXT, "pread64");
     if (!real_open)
         real_open = dlsym(RTLD_NEXT, "open");
     if (!real_open64)
         real_open64 = dlsym(RTLD_NEXT, "open64");
+    if (!real_fchmod)
+        real_fchmod = dlsym(RTLD_NEXT, "fchmod");
+    if (!real_write)
+        real_write = dlsym(RTLD_NEXT, "write");
 }
 
 static int read_target(const char *control, char *target, size_t size)
@@ -54,6 +78,30 @@ static int read_target(const char *control, char *target, size_t size)
         return 0;
     target[len] = '\0';
     return 1;
+}
+
+static int fd_matches(int fd, const char *control)
+{
+    char want[PATH_MAX], link[32], target[PATH_MAX];
+    if (!read_target(control, want, sizeof want))
+        return 0;
+    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    ssize_t len = readlink(link, target, sizeof target - 1);
+    if (len <= 0)
+        return 0;
+    target[len] = '\0';
+    return strcmp(target, want) == 0;
+}
+
+static void note_fault(const char *message)
+{
+    int fd = real_open("/tmp/fsyncfail.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0)
+    {
+        if (real_write)
+            (void)real_write(fd, message, strlen(message));
+        close(fd);
+    }
 }
 
 static int configured_count(const char *name)
@@ -134,7 +182,6 @@ int open64(const char *pathname, int flags, ...)
 int fdatasync(int fd)
 {
     static int left = -1;
-    char want[PATH_MAX];
 
     resolve_symbols();
     if (!real_fdatasync)
@@ -142,23 +189,125 @@ int fdatasync(int fd)
         errno = ENOSYS;
         return -1;
     }
-    if (read_target("/tmp/fsyncfail-target", want, sizeof want))
+    if (fd_matches(fd, "/tmp/fsyncfail-target"))
     {
-        char link[32], target[PATH_MAX];
-        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-        ssize_t len = readlink(link, target, sizeof target - 1);
-        if (len > 0)
+        if (left < 0)
+            left = configured_count("FSYNCFAIL_COUNT");
+        if (left > 0)
         {
-            target[len] = '\0';
-            if (left < 0)
-                left = configured_count("FSYNCFAIL_COUNT");
-            if (strcmp(target, want) == 0 && left > 0)
-            {
-                left--;
-                errno = EIO;
-                return -1;
-            }
+            left--;
+            errno = EIO;
+            return -1;
         }
     }
-    return real_fdatasync(fd);
+    int result = real_fdatasync(fd);
+    int saved_errno = errno;
+    if (result == 0 && fd_matches(fd, "/tmp/datasyncobserve-target"))
+        note_fault("fdatasync OK\n");
+    errno = saved_errno;
+    return result;
+}
+
+int fsync(int fd)
+{
+    resolve_symbols();
+    if (!real_fsync)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    int saved_errno = errno;
+    struct stat st;
+    if (fd_matches(fd, "/tmp/dirsyncobserve-target") &&
+        fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+        note_fault("fsync directory\n");
+    errno = saved_errno;
+    return real_fsync(fd);
+}
+
+static void observe_pread(int fd, size_t count, long long offset)
+{
+    int saved_errno = errno;
+    if (offset >= 8 && fd_matches(fd, "/tmp/preadobserve-target"))
+    {
+        char message[96];
+        snprintf(message, sizeof message, "pread %lld %zu\n", offset, count);
+        note_fault(message);
+    }
+    errno = saved_errno;
+}
+
+ssize_t pread(int fd, void *buf, size_t count, off_t offset)
+{
+    resolve_symbols();
+    if (!real_pread)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    observe_pread(fd, count, (long long)offset);
+    return real_pread(fd, buf, count, offset);
+}
+
+ssize_t pread64(int fd, void *buf, size_t count, off64_t offset)
+{
+    resolve_symbols();
+    if (!real_pread64)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    observe_pread(fd, count, (long long)offset);
+    return real_pread64(fd, buf, count, offset);
+}
+
+int fchmod(int fd, mode_t mode)
+{
+    resolve_symbols();
+    if (!real_fchmod)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (fd_matches(fd, "/tmp/chmodfail-target"))
+    {
+        note_fault("fchmod EPERM\n");
+        errno = EPERM;
+        return -1;
+    }
+    return real_fchmod(fd, mode);
+}
+
+ssize_t write(int fd, const void *buf, size_t count)
+{
+    static int partial_written;
+    static int enospc_noted;
+
+    resolve_symbols();
+    if (!real_write)
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (count > 0 && fd_matches(fd, "/tmp/writefail-target"))
+    {
+        if (!partial_written)
+        {
+            ssize_t written = real_write(fd, buf, count < 17 ? count : 17);
+            if (written > 0)
+            {
+                partial_written = 1;
+                note_fault("write partial\n");
+            }
+            return written;
+        }
+        if (!enospc_noted)
+        {
+            enospc_noted = 1;
+            note_fault("write ENOSPC\n");
+        }
+        errno = ENOSPC;
+        return -1;
+    }
+    return real_write(fd, buf, count);
 }

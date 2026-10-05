@@ -34,10 +34,12 @@
 #                        the sink refuses to send (queue framing stays
 #                        intact), the queue latches broken (the live sink
 #                        keeps delivering pure NDJSON)
-#   perms-tighten      : a pre-existing 0644 queue is pulled to 0600 on open;
-#                        a root-owned 0666 queue/sink opens but cannot be
-#                        chmodded by the worker (fchmod EPERM) — warned once,
-#                        the mode stands, delivery is unaffected
+#   private-files      : regular/euid/single-link checked before chmod or IO;
+#                        worker-owned files tightened to 0600, insecure targets
+#                        untouched, refused events recover via queue/RAM retry
+#   fallback-reload    : same-path HUP repairs broken; unread active A survives
+#                        configured B/disable and soft replacement; repeat HUP
+#                        adopts B only after A drains, credits existing B once
 #   worker-crash       : worker kill -9 → postmaster emergency-restarts the
 #                        cluster, delivery resumes
 #   worker-term-midsend: worker SIGTERM inside a blocked send; the shutdown
@@ -54,6 +56,83 @@ set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init kill "${1:-}"
 e2e_gate
+
+echo "== transport configuration boundaries =="
+host255=$(python3 -c 'print("h" * 255)')
+host256=$(python3 -c 'print("h" * 256)')
+url255="http://$host255:8686"
+url256="http://$host256:8686"
+baseline_url="http://$VEC:8686"
+setguc pg_logtap.export_http_content_type 'application/x-ndjson'
+setguc pg_logtap.export_http_extra_headers ''
+setguc pg_logtap.export_url "$baseline_url"; reload; sleep 1
+setguc pg_logtap.export_url "$url255" \
+  || fail "transport validation: 255-byte host was rejected"
+# Do not reload the deliberately unresolvable boundary hostname; overwrite its
+# pending auto.conf value with the working receiver first.
+setguc pg_logtap.export_url "$baseline_url"
+if setguc pg_logtap.export_url "$url256" 2>/dev/null; then
+  fail "transport validation: 256-byte host was accepted"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url" ] \
+  || fail "transport validation: rejected host replaced the active URL"
+
+keep_header='X-Keep: yes'
+long_path="/$(python3 -c 'print("p" * 1600)')"
+wide_type=$(python3 -c 'print("a" * 256)')
+mid_header="X-Fill: $(python3 -c 'print("a" * 250)')"
+wide_header="X-Fill: $(python3 -c 'print("a" * 292)')"
+setguc pg_logtap.export_http_extra_headers "$keep_header"
+setguc pg_logtap.export_url "$baseline_url$long_path"
+setguc pg_logtap.export_http_content_type "$wide_type"
+reload; sleep 1
+if setguc pg_logtap.export_http_extra_headers "$wide_header" 2>/dev/null; then
+  fail "transport validation: HTTP head larger than 2048 bytes was accepted"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url$long_path" ] \
+  || fail "transport validation: rejected head changed export_url"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_content_type")" = "$wide_type" ] \
+  || fail "transport validation: rejected head changed content type"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_extra_headers")" = "$keep_header" ] \
+  || fail "transport validation: rejected head changed extra headers"
+
+# Exercise the same aggregate-head guard through each candidate callback, not
+# only through export_http_extra_headers.
+setguc pg_logtap.export_url "$baseline_url" \
+  || fail "transport validation: could not stage URL candidate baseline"
+reload
+setguc pg_logtap.export_http_content_type "$wide_type" \
+  || fail "transport validation: could not stage wide content type"
+setguc pg_logtap.export_http_extra_headers "$wide_header" \
+  || fail "transport validation: could not stage wide extra header"
+reload; sleep 1
+if setguc pg_logtap.export_url "$baseline_url$long_path" 2>/dev/null; then
+  fail "transport validation: URL candidate made the HTTP head exceed 2048 bytes"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url")" = "$baseline_url" ] \
+  || fail "transport validation: rejected URL candidate replaced the active URL"
+
+setguc pg_logtap.export_http_content_type 'application/x-ndjson' \
+  || fail "transport validation: could not stage content-type baseline"
+setguc pg_logtap.export_http_extra_headers '' \
+  || fail "transport validation: could not clear extra headers"
+reload
+setguc pg_logtap.export_url "$baseline_url$long_path" \
+  || fail "transport validation: could not stage long URL"
+reload
+setguc pg_logtap.export_http_extra_headers "$mid_header" \
+  || fail "transport validation: could not stage medium extra header"
+reload; sleep 1
+if setguc pg_logtap.export_http_content_type "$wide_type" 2>/dev/null; then
+  fail "transport validation: content-type candidate made the HTTP head exceed 2048 bytes"
+fi
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_http_content_type")" = 'application/x-ndjson' ] \
+  || fail "transport validation: rejected content type replaced the active value"
+
+setguc pg_logtap.export_url "$baseline_url"
+setguc pg_logtap.export_http_content_type 'application/x-ndjson'
+setguc pg_logtap.export_http_extra_headers ''; reload; sleep 1
+ok "255-byte host and near-cap head accepted; oversized host and URL/header/content-type tuples rejected"
 
 # Ground truth on the receiver name at failure time: a fresh glibc lookup
 # (what the bash probe uses) vs the worker's wedged one, plus the container's
@@ -258,6 +337,9 @@ sleep 2
 [ "$(statf events_lost)" = 0 ] || fail "legacy corrupt member: fabricated events_lost=$(statf events_lost)"
 [ "$(statf warn_fallback_skipped)" = 0 ] || fail "legacy corrupt member: claimed an unknown-count frame was skipped"
 [ "$(docker exec "$PG_CT" stat -c %s "$FB")" -gt 12 ] || fail "legacy corrupt member: frame was removed"
+# This synthetic unknowable-count fixture is deliberately discarded. Disable
+# cannot bypass unread/broken A; the full postmaster reset below is a manual
+# test cleanup boundary, not a guarantee of discovering old configured paths.
 setguc pg_logtap.export_fallback_file ''; reload; sleep 1
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 docker restart "$PG_CT" >/dev/null; wait_ready
@@ -329,12 +411,26 @@ done
   || fail "count metadata compaction: compacted=$(statf events_compacted), want 30 readable events (not stored 29)"
 [ "$(statf events_lost)" = 30 ] \
   || fail "count metadata compaction: lost=$(statf events_lost), want 30"
+# Dispose of the remaining synthetic oversized fixture at the next testcase's
+# full postmaster reset. An unread active queue cannot be disabled by reload;
+# this manual fixture cleanup is not a delivery/reconfiguration guarantee.
+setguc pg_logtap.level_min 23
 setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512; reload; sleep 1
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 ok "cap trim used readable line counts: compacted=lost=30, not corrupt stored total 29"
 
 
+# This cursor test deliberately waits 30s between bounded replays. Scrapes
+# are served at cycle boundaries, not by a separate listener/latch, so allow
+# one full interval. Scrape only with a dead receiver or an empty queue:
+# waking the worker or waiting on a live unread queue can advance its cursor.
+prom_backlog() {
+  docker exec "$PG_CT" bash -c 'exec 3<>/dev/tcp/127.0.0.1/9187; printf "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n" >&3; timeout 35 cat <&3' \
+    | tr -d '\r' | awk '$1 == "pg_logtap_queue_backlog" { print $2 }'
+}
+
 echo "== soft worker restart: replay cursor survives in shmem =="
+setguc pg_logtap.metrics_port 9187
 python3 - "$E2E_TAG" "$SUF" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "cat > '$FB'"
 import gzip, json, struct, sys
 
@@ -359,6 +455,7 @@ done
 [ "$(statf events_lost)" = 10 ] || fail "soft cursor: initial corrupt frame loss=$(statf events_lost), want 10"
 [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 70 ] \
   || fail "soft cursor: initial backlog not 70"
+[ "$(prom_backlog)" = 70 ] || fail "soft cursor: Prometheus backlog differs from SQL 70 after counted-member skip"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload
 n=0; while [ "$n" -lt 20 ] && [ "$(received cursor)" -lt 64 ]; do
   n=$((n + 1)); sleep 1
@@ -373,11 +470,17 @@ setguc pg_logtap.export_url "http://127.0.0.1:1"; reload
 n=0; while [ "$n" -lt 20 ] && [ "$(statf send_cycles_failed)" -le "$failed_before" ]; do
   n=$((n + 1)); sleep 1
 done
+# Receiver is now dead, so waiting for the next scrape cycle cannot drain the
+# six unread frames we need to carry across TERM. SQL still pins that cursor.
+[ "$(statf send_cycles_failed)" -gt "$failed_before" ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 6 ] \
+  || fail "soft cursor: dead-URL barrier did not preserve backlog 6"
+[ "$(prom_backlog)" = 6 ] || fail "soft cursor: Prometheus backlog differs from SQL 6 after bounded replay"
 wpid=$(worker_pid)
 [ -n "$wpid" ] || fail "soft cursor: worker not found"
 docker exec "$PG_CT" kill -TERM "$wpid"
 n=0; new_wpid=$wpid
-while [ "$n" -lt 20 ] && [ "$new_wpid" = "$wpid" ]; do
+while [ "$n" -lt 20 ] && { [ -z "$new_wpid" ] || [ "$new_wpid" = "$wpid" ]; }; do
   n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
 done
 [ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] || fail "soft cursor: worker did not restart"
@@ -388,18 +491,163 @@ sleep 2
   || fail "soft cursor: replacement worker rescanned the corrupt prefix"
 [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 6 ] \
   || fail "soft cursor: replacement worker drifted backlog from 6"
+[ "$(prom_backlog)" = 6 ] || fail "soft cursor: replacement worker's Prometheus backlog differs from SQL 6"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload
 wait_for cursor 70 "" 40
 cursor_dups=$(seqs_of cursor | sort -n | uniq -d | wc -l)
 [ "$cursor_dups" = 0 ] || fail "soft cursor: replay resent $cursor_dups already-delivered events"
 [ "$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")" = 0 ] \
   || fail "soft cursor: final backlog did not reach 0"
+[ "$(prom_backlog)" = 0 ] || fail "soft cursor: Prometheus backlog differs from SQL 0 after drain"
 [ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
   || fail "soft cursor: queue not truncated after final replay"
 setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.flush_interval 1000
 setguc pg_logtap.level_min 15; reload; sleep 1
 ok "soft restart resumed after the published frame boundary: lost stayed 10, backlog 6→0, duplicates=0"
 
+
+echo "== fallback path reload: active A survives configured B and worker replacement =="
+# Shared active-path state is a SOFT worker-replacement contract. Full
+# postmaster restart resets it: operators must first drain A or restore
+# configured A; old paths require a manual drain, not automatic discovery.
+PATH_A="$FB_DIR/logtap-path-a.bin"
+PATH_B="$FB_DIR/logtap-path-b.bin"
+write_path_queue() { # path, marker, count: private counted fixture, one frame/event
+  docker exec "$PG_CT" rm -f "$1"
+  python3 - "$E2E_TAG" "$E2E_SUF" "$2" "$3" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "umask 077; cat > '$1'"
+import gzip, json, struct, sys
+
+tag, suffix, marker, count = sys.argv[1:]
+base = {"pathA": 730000, "pathB": 740000, "pathDisable": 750000}[marker]
+out = bytearray(b"PGLTFB02")
+for i in range(int(count)):
+    body = (json.dumps({"seq": base + i, "message": f"logtap {tag} {marker}{suffix} {i}"}, separators=(",", ":")) + "\n").encode()
+    compressed = gzip.compress(body, mtime=0)
+    out += struct.pack("<II", len(compressed), 1) + compressed
+sys.stdout.buffer.write(out)
+PY
+}
+# ERROR-only capture suppresses reload/worker boot noise so B's existing
+# backlog credit can be checked exactly without resetting shmem/counters.
+setguc pg_logtap.level_min 23
+setguc pg_logtap.flush_interval 30000
+setguc pg_logtap.export_url 'http://127.0.0.1:1'; reload; sleep 1
+write_path_queue "$PATH_A" pathA 3 || fail "path reload: could not write A"
+write_path_queue "$PATH_B" pathB 5 || fail "path reload: could not write B"
+q0=$(statf events_queued); lost0=$(statf events_lost)
+before_a=$(docker exec "$PG_CT" sha256sum "$PATH_A")
+before_b=$(docker exec "$PG_CT" sha256sum "$PATH_B")
+setguc pg_logtap.export_fallback_file "$PATH_A"; reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 3 ] \
+  && [ "$(statf events_queued)" = "$((q0 + 3))" ] \
+  || fail "path reload: A's existing backlog not credited exactly once"
+setguc pg_logtap.export_fallback_file "$PATH_B"; reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_fallback_file')" = "$PATH_B" ] \
+  || fail "path reload: B request did not land in configured GUC"
+[ "$(docker exec "$PG_CT" sha256sum "$PATH_A")" = "$before_a" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$PATH_B")" = "$before_b" ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 3 ] \
+  && [ "$(statf events_queued)" = "$((q0 + 3))" ] \
+  || fail "path reload: requesting B orphaned A, touched B, or drifted accounting"
+postmaster0=$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')
+wpid=$(worker_pid); [ -n "$wpid" ] || fail "path reload: worker not found"
+docker exec "$PG_CT" kill -TERM "$wpid"
+n=0; new_wpid=$wpid
+while [ "$n" -lt 20 ] && { [ -z "$new_wpid" ] || [ "$new_wpid" = "$wpid" ]; }; do
+  n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
+done
+[ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] || fail "path reload: worker did not restart"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')" = "$postmaster0" ] \
+  || fail "path reload: cluster restarted instead of replacing worker"
+sleep 2
+[ "$(docker exec "$PG_CT" sha256sum "$PATH_B")" = "$before_b" ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 3 ] \
+  && [ "$(statf events_queued)" = "$((q0 + 3))" ] \
+  || fail "path reload: replacement adopted configured B instead of shared active A"
+# This HUP still sees unread A; it changes the receiver but must not activate B.
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for pathA 3
+sleep 1
+[ "$(received pathB)" = 0 ] && [ "$(docker exec "$PG_CT" sha256sum "$PATH_B")" = "$before_b" ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$PATH_A")" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  || fail "path reload: A did not drain alone; B auto-activated without repeat HUP"
+# A is now proven empty. Repeat HUP adopts B and reuses boot credit; hold
+# receiver dead for the exact five-event SQL backlog assertion before drain.
+setguc pg_logtap.export_url 'http://127.0.0.1:1'; reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 5 ] \
+  && [ "$(statf events_queued)" = "$((q0 + 8))" ] \
+  || fail "path reload: existing B backlog not credited once on adoption"
+reload; sleep 1
+[ "$(statf events_queued)" = "$((q0 + 8))" ] || fail "path reload: same-path B reload double-credited existing events"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for pathB 5
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$PATH_B")" = 0 ] \
+  && [ "$(statf events_lost)" = "$lost0" ] \
+  || fail "path reload: B did not drain/account losslessly"
+python3 - "$OUT/vector-out.jsonl" "$E2E_TAG" "$E2E_SUF" <<'PY' || fail "path reload: markers were missing, duplicated, or delivered out of A/B order"
+import json, sys
+
+path, tag, suffix = sys.argv[1:]
+got = []
+for line in open(path, encoding="utf-8"):
+    message = json.loads(line).get("message", "")
+    for marker in ("pathA", "pathB"):
+        prefix = f"logtap {tag} {marker}{suffix} "
+        if message.startswith(prefix):
+            got.append((marker, int(message[len(prefix):])))
+assert got == [("pathA", i) for i in range(3)] + [("pathB", i) for i in range(5)], got
+PY
+ok "configured B/soft replacement retained active A; A then B delivered in order, B credit=5 once, backlog=0"
+
+echo "== fallback disable/B while A is broken: refusal is not proof of empty =="
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+write_path_queue "$PATH_A" pathDisable 3 || fail "path disable: could not write A"
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+q0=$(statf events_queued)
+setguc pg_logtap.export_fallback_file "$PATH_A"; reload; sleep 2
+[ "$(statf events_queued)" = "$((q0 + 3))" ] || fail "path disable: A fixture not credited"
+a_hash=$(docker exec "$PG_CT" sha256sum "$PATH_A")
+# Keep the unread contents, but force secure reopen to fail. No fchmod may
+# touch the foreign-owned inode, and neither requested B nor '' may bypass it.
+docker exec "$PG_CT" sh -c "chown root '$PATH_A'; chmod 0666 '$PATH_A'"
+reload; sleep 1
+[ "$(statf fallback_broken)" = 1 ] || fail "path disable: insecure A did not latch broken"
+for requested in "$PATH_B" ''; do
+  setguc pg_logtap.export_fallback_file "$requested"; reload; sleep 1
+  [ "$(statf fallback_broken)" = 1 ] \
+    && [ "$(docker exec "$PG_CT" sha256sum "$PATH_A")" = "$a_hash" ] \
+    && [ "$(docker exec "$PG_CT" stat -c '%u:%a' "$PATH_A")" = '0:666' ] \
+    && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 3 ] \
+    && [ "$(statf events_queued)" = "$((q0 + 3))" ] \
+    || fail "path disable: requested '$requested' hid/replaced broken unread A"
+done
+# Restore configured A before repair so this is an unambiguous same-path HUP.
+setguc pg_logtap.export_fallback_file "$PATH_A"
+docker exec "$PG_CT" sh -c "chown postgres '$PATH_A'; chmod 0600 '$PATH_A'"
+reload; sleep 1
+[ "$(statf fallback_broken)" = 0 ] && [ "$(statf events_queued)" = "$((q0 + 3))" ] \
+  || fail "path disable: repaired A did not reopen or was double-credited"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for pathDisable 3
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$PATH_A")" = 0 ] \
+  && [ "$(seqs_of pathDisable | sort | uniq -d | wc -l)" = 0 ] \
+  || fail "path disable: repaired A did not drain once"
+# Disable only after proven drain; dead receiver traffic must now stay in RAM,
+# not revive A. This is another explicit request, not a pending-switch loop.
+setguc pg_logtap.export_fallback_file ''
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.flush_interval 1000; setguc pg_logtap.level_min 15; reload; sleep 1
+q0=$(statf events_queued)
+gen pathDisabledRam 10; sleep 2
+[ "$(statf events_queued)" = "$q0" ] && [ "$(docker exec "$PG_CT" stat -c %s "$PATH_A")" = 0 ] \
+  || fail "path disable: repeat HUP after drain did not disable A"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for pathDisabledRam 10
+docker exec "$PG_CT" rm -f "$PATH_A" "$PATH_B"
+ok "broken unread A survived B/disable requests; same-path repair drained it once, repeat HUP then disabled queue"
 
 echo "== corrupt member mid-queue: skipped, later members still replay =="
 # A/CORRUPT/B/C: park four marker batches with the receiver dead, smash
@@ -445,7 +693,8 @@ wait_for cmA 10; wait_for cmB 10; wait_for cmC 10
 [ "$(statf events_lost)" = "$lost_want" ] \
   || fail "corrupt member: events_lost=$(statf events_lost), want stored count $lost_want"
 skip=$(statf warn_fallback_skipped)
-# Twice per frame by design: boot credit scan, then the real drain.
+# Boot credit scan and the real drain each observe the frame. Healthy
+# same-path HUP revalidates but does not rescan. Only drain accounts the loss.
 [ "$skip" = $((2 * nhits)) ] || fail "corrupt member: 'unreadable, skipped' fired $skip times, want $((2 * nhits))"
 [ "$(statf fallback_broken)" = 0 ] || fail "corrupt member: damaged payload escalated to a framing error"
 backlog=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT queue_backlog FROM pg_logtap_delivery")
@@ -505,6 +754,7 @@ docker exec "$PG_CT" sh -c "
     prev=\$e
   done
   tail -c +\$((prev + 1)) '$FB' >> /tmp/fb.new
+  chown postgres /tmp/fb.new; chmod 0600 /tmp/fb.new
   mv /tmp/fb.new '$FB'; rm -f /tmp/bomb.gz
 "
 docker kill "$PG_CT" >/dev/null; docker start "$PG_CT" >/dev/null; wait_ready
@@ -514,8 +764,9 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for bombA 10
 [ "$(received bombA)" = 10 ] || fail "bomb member: later members not replayed (bombA=$(received bombA)/10)"
 [ "$(received bombX)" = 0 ] || fail "bomb member: bomb content delivered?? (bombX=$(received bombX))"
-# Fresh shmem at restart: exact stored counts are lost; boot scan + drain each
-# observe every bomb frame, and the final drain observation truncates the file.
+# Fresh shmem at restart: boot observes every bomb frame without accounting
+# loss; healthy same-path HUP skips the redundant scan. The real drain counts
+# the exact loss once and truncates after the skipped final frame.
 [ "$(statf events_lost)" = "$bomb_lost" ] \
   || fail "bomb member: events_lost=$(statf events_lost), want stored count $bomb_lost"
 [ "$(statf warn_fallback_skipped)" = $((2 * nb)) ] || fail "bomb member: 'unreadable, skipped' fired $(statf warn_fallback_skipped) times, want $((2 * nb))"
@@ -548,10 +799,15 @@ echo "$out" | grep -q ERROR || fail "aliasing: fallback='$al' accepted with url=
   || fail "aliasing: rejected ALTER SYSTEM still changed the fallback GUC"
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$VEC:8686'" >/dev/null
 reload; sleep 2
+# The rejected SET was exported into our NDJSON sink. After deactivating that
+# sink, remove it before reusing the pathname for a fresh fallback queue;
+# foreign content must not strand the active queue in this SET-hook fixture.
+docker exec -u postgres "$PG_CT" rm -f "$al" || fail "aliasing: cannot remove the deactivated test sink"
 # the other direction: fallback first (accepted — the url is http), then
 # the file:// url naming the same file
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = '$al'" >/dev/null
 reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] || fail "aliasing: fresh queue setup left fallback broken"
 out=$(docker exec "$PG_CT" psql -U postgres -c "ALTER SYSTEM SET pg_logtap.export_url = 'file://$al'" 2>&1)
 echo "$out" | grep -q ERROR || fail "aliasing: url=file://$al accepted with fallback='$al'"
 docker exec "$PG_CT" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_fallback_file = ''" >/dev/null
@@ -597,13 +853,9 @@ echo "$out" | grep -q ERROR || fail "bad url: a 4100-byte file:// path accepted 
 ok "space/DEL/CR/overlong-path urls rejected at ALTER SYSTEM; file:// keeps spaces"
 
 echo "== symlink at the queue path: refused, RAM backlog carries the events =="
-# Anything able to write to the data directory must not be able to aim the
-# queue at another file: a symlink at the fallback path is refused
-# (O_NOFOLLOW, like the compaction temp), the file it points at stays
-# byte-identical, and delivery degrades to the RAM backlog — zero loss
-# once the receiver returns. The refusal is visible like any other broken
-# queue: fallback_broken=1 and one WARNING (fb_broken stops the re-opens;
-# repointing the GUC or a restart re-checks — the foreign-file recovery).
+# Refuse a final-component queue symlink (parent directories remain trusted).
+# Its target stays byte-identical; broken latches until explicit HUP, and the
+# RAM backlog delivers all markers once the receiver returns.
 docker exec "$PG_CT" sh -c "rm -f '$FB'; printf 'CANARY-INTACT\n' > '$FB_DIR/pg_logtap-canary'; ln -s pg_logtap-canary '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 warn0=$(statf warn_fallback_open)
@@ -632,11 +884,11 @@ FB3="$FB_DIR/$FB3_REL"
 docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3'; touch '$FB3'; chmod 0644 '$FB3'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
+q0=$(statf events_queued)
 gen perm 20; sleep 3
 mode=$(docker exec "$PG_CT" stat -c %a "$FB3")
 [ "$mode" = 600 ] || fail "queue perms: mode=$mode after open, want 600"
-q0=$(statf events_queued)
-[ "$q0" -gt 0 ] || fail "queue perms: events did not queue through the pre-existing file (queued=$q0)"
+[ "$(statf events_queued)" -gt "$q0" ] || fail "queue perms: events did not queue through the pre-existing file"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for perm 20
 [ "$(received perm)" = 20 ] || fail "queue perms: replay did not drain ($(received perm)/20)"
@@ -644,53 +896,147 @@ docker exec "$PG_CT" sh -c "rm -f '$FB3'"
 setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 ok "pre-existing 0644 queue tightened to 0600 on open, 20/20 queued and replayed"
 
-echo "== pre-existing queue at 0666, root-owned: tighten refused and warned =="
-# The failure twin of the phase above, with no fault shim: a queue file root
-# left world-WRITABLE opens fine for the worker (0666 grants the write) but
-# cannot be chmodded by it — fchmod(2) wants ownership or CAP_FOWNER — so
-# the tighten fails EPERM. The branch's whole contract: one WARNING names
-# the left-open window, the mode stands, delivery is unaffected (the queue
-# still parks and replays).
+echo "== pre-existing queue at 0666, root-owned: refused before chmod/IO =="
 FB4_REL=pg_logtap-fallback4.bin
 FB4="$FB_DIR/$FB4_REL"
-docker exec "$PG_CT" sh -c "rm -f '$FB4'; : > '$FB4'; chmod 0666 '$FB4'"
-w0=$(docker logs "$PG_CT" 2>&1 | grep -c 'fallback queue permissions could not be tightened')
+docker exec "$PG_CT" sh -c "rm -f '$FB4'; printf 'ROOT-QUEUE-CANARY\n' > '$FB4'; chmod 0666 '$FB4'"
+q_before=$(docker exec "$PG_CT" sha256sum "$FB4")
+q_meta=$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$FB4")
+sync0=$(statf fb_sync_failures); lost0=$(statf events_lost)
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB4_REL"; reload; sleep 2
 q0=$(statf events_queued)
-gen tightq 20; sleep 3
-mode=$(docker exec "$PG_CT" stat -c %a "$FB4")
-[ "$mode" = 666 ] || fail "queue tighten-refused: mode=$mode, want 666 — the worker must keep using the queue it cannot chmod"
-[ "$(( $(docker logs "$PG_CT" 2>&1 | grep -c 'fallback queue permissions could not be tightened') - w0 ))" = 1 ] \
-  || fail "queue tighten-refused: the EPERM tighten was not warned exactly once"
-[ "$(statf events_queued)" -gt "$q0" ] || fail "queue tighten-refused: events did not park through the 0666 queue"
-setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
+gen tightq 20; sleep 2
+[ "$(docker exec "$PG_CT" sha256sum "$FB4")" = "$q_before" ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$FB4")" = "$q_meta" ] \
+  || fail "foreign queue: root-owned contents/owner/mode/link count changed"
+[ "$(statf fallback_broken)" = 1 ] && [ "$(statf events_queued)" = "$q0" ] \
+  || fail "foreign queue: insecure target accepted or not marked broken"
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "foreign queue: refusal counted as sync failure"
+# Repair in place, then explicitly reopen the same configured path. Neither
+# replacing the file alone nor an idle cycle may clear the broken latch.
+docker exec "$PG_CT" rm -f "$FB4"
+docker exec -u postgres "$PG_CT" sh -c ": > '$FB4'; chmod 0600 '$FB4'"
+sleep 1
+[ "$(statf fallback_broken)" = 1 ] || fail "foreign queue: repaired without explicit HUP"
+reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] && [ "$(statf events_queued)" -gt "$q0" ] \
+  || fail "foreign queue: same-path reload did not revalidate/park RAM backlog"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
 wait_for tightq 20
-[ "$(received tightq)" = 20 ] || fail "queue tighten-refused: replay did not drain ($(received tightq)/20)"
-docker exec "$PG_CT" sh -c "rm -f '$FB4'"
-setguc pg_logtap.export_fallback_file ''; reload; sleep 2
-ok "0666 root-owned queue: tighten refused (EPERM), warned once, still parked 20/20 and replayed"
+[ "$(received tightq)" = 20 ] && [ "$(statf events_lost)" = "$lost0" ] \
+  || fail "foreign queue: recovery lost the RAM backlog"
+[ "$(docker exec "$PG_CT" stat -c %a "$FB4")" = 600 ] || fail "foreign queue: repaired target not private"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$FB4"
+ok "root-owned 0666 queue unchanged/refused; same-path repair+HUP parked and replayed 20/20 via worker-owned 0600"
 
-echo "== file:// sink at 0666, root-owned: tighten refused and warned =="
-# The sink-side twin: sendFile opens the world-writable file and cannot pull
-# it to 0600 — same EPERM, same one WARNING naming the window, and the
-# events still append (delivery outranks the mode). Repoint before the rm:
-# a file:// worker re-creates a vanished sink (O_CREAT) and would "deliver"
-# the backlog into the fresh file.
+echo "== file:// sink at 0666, root-owned: refused, RAM retry to private sink =="
 SINK6=$FB_DIR/logtap-sink-0666.log
-docker exec "$PG_CT" sh -c "rm -f '$SINK6'; : > '$SINK6'; chmod 0666 '$SINK6'"
-w1=$(docker logs "$PG_CT" 2>&1 | grep -c 'file:// sink permissions could not be tightened')
-setguc pg_logtap.export_url "file://$SINK6"; reload; sleep 2
-gen tights 20; sleep 3
-[ "$(( $(docker logs "$PG_CT" 2>&1 | grep -c 'file:// sink permissions could not be tightened') - w1 ))" = 1 ] \
-  || fail "sink tighten-refused: the EPERM tighten was not warned exactly once"
-nh=$(docker exec "$PG_CT" sh -c "grep -oE 'logtap $E2E_TAG tights$E2E_SUF [0-9]+' '$SINK6' 2>/dev/null" | sort -u | wc -l)
-[ "$nh" = 20 ] || fail "sink tighten-refused: $nh/20 events in the 0666 sink"
-mode=$(docker exec "$PG_CT" stat -c %a "$SINK6")
-[ "$mode" = 666 ] || fail "sink tighten-refused: mode=$mode, want 666"
-setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
-docker exec "$PG_CT" sh -c "rm -f '$SINK6'"
-ok "0666 root-owned sink: tighten refused (EPERM), warned once, 20/20 still delivered"
+PRIVATE_SINK=$FB_DIR/logtap-private-sink.log
+docker exec "$PG_CT" sh -c "rm -f '$SINK6' '$PRIVATE_SINK'; printf 'ROOT-SINK-CANARY\n' > '$SINK6'; chmod 0666 '$SINK6'"
+sink_before=$(docker exec "$PG_CT" sha256sum "$SINK6")
+sink_meta=$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$SINK6")
+sync0=$(statf fb_sync_failures); lost0=$(statf events_lost)
+setguc pg_logtap.export_url "file://$SINK6"; reload; sleep 1
+failed0=$(statf send_cycles_failed)
+gen tights 20; sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] || fail "foreign sink: send did not fail"
+[ "$(docker exec "$PG_CT" sha256sum "$SINK6")" = "$sink_before" ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$SINK6")" = "$sink_meta" ] \
+  || fail "foreign sink: root-owned contents/owner/mode/link count changed"
+[ "$(statf fb_sync_failures)" = "$sync0" ] || fail "foreign sink: refusal counted as sync failure"
+docker exec -u postgres "$PG_CT" sh -c ": > '$PRIVATE_SINK'; chmod 0600 '$PRIVATE_SINK'"
+setguc pg_logtap.export_url "file://$PRIVATE_SINK"; reload
+n=0; while [ "$n" -lt 15 ]; do
+  docker cp "$PG_CT:$PRIVATE_SINK" "$OUT/private-sink.jsonl" >/dev/null
+  [ "$(received tights "$OUT/private-sink.jsonl")" -ge 20 ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "$(received tights "$OUT/private-sink.jsonl")" = 20 ] \
+  && [ "$(json_check tights "$OUT/private-sink.jsonl")" = 20 ] \
+  && [ "$(seqs_of tights "$OUT/private-sink.jsonl" | sort | uniq -d | wc -l)" = 0 ] \
+  && [ "$(statf events_lost)" = "$lost0" ] \
+  || fail "foreign sink: private recovery did not deliver 20/20 whole once"
+[ "$(docker exec "$PG_CT" stat -c '%u:%a:%h' "$PRIVATE_SINK")" = "$(docker exec -u postgres "$PG_CT" id -u):600:1" ] \
+  || fail "foreign sink: recovery target is not worker-owned/private/single-link"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+docker exec "$PG_CT" rm -f "$SINK6" "$PRIVATE_SINK"
+ok "root-owned 0666 sink unchanged/refused; RAM retry delivered 20/20 whole once to worker-owned 0600 sink"
+
+echo "== insecure sink/queue targets: no symlink/hardlink/FIFO/special/directory IO =="
+# Final symlinks and shared inodes are forbidden even when the referenced file
+# belongs to postgres. A FIFO with no peer must fail without blocking the worker.
+SEC_TARGET="$FB_DIR/logtap-insecure-target"
+SEC_CANARY="$FB_DIR/logtap-security-canary"
+for side in sink queue; do
+  for kind in symlink hardlink fifo special directory; do
+    setguc pg_logtap.export_url "http://$VEC:8686"
+    setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+    docker exec "$PG_CT" sh -c "rm -rf '$SEC_TARGET'; rm -f '$SEC_CANARY'"
+    docker exec -u postgres "$PG_CT" sh -c "printf 'PRIVATE-CANARY\n' > '$SEC_CANARY'; chmod 0644 '$SEC_CANARY'" \
+      || fail "$side $kind: could not create private canary"
+    case "$kind" in
+      symlink) docker exec -u postgres "$PG_CT" ln -s "$SEC_CANARY" "$SEC_TARGET" ;;
+      hardlink) docker exec -u postgres "$PG_CT" ln "$SEC_CANARY" "$SEC_TARGET" ;;
+      fifo) docker exec -u postgres "$PG_CT" sh -c "mkfifo '$SEC_TARGET'; chmod 0666 '$SEC_TARGET'" ;;
+      special) docker exec "$PG_CT" sh -c "mknod '$SEC_TARGET' c 1 7; chown postgres '$SEC_TARGET'; chmod 0666 '$SEC_TARGET'" ;;
+      directory) docker exec -u postgres "$PG_CT" mkdir "$SEC_TARGET" ;;
+    esac
+    target_meta=$(docker exec "$PG_CT" stat -c '%F:%u:%a:%h:%s' "$SEC_TARGET")
+    canary_meta=$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$SEC_CANARY")
+    canary_hash=$(docker exec "$PG_CT" sha256sum "$SEC_CANARY")
+    sync0=$(statf fb_sync_failures); lost0=$(statf events_lost)
+    q0=$(statf events_queued)
+    if [ "$side" = sink ]; then
+      setguc pg_logtap.export_url "file://$SEC_TARGET"
+    else
+      setguc pg_logtap.export_url 'http://127.0.0.1:1'
+      setguc pg_logtap.export_fallback_file "$SEC_TARGET"
+    fi
+    reload; sleep 1
+    failed0=$(statf send_cycles_failed)
+    gen "secure-$side-$kind" 10; sleep 2
+    [ "$(statf send_cycles_failed)" -gt "$failed0" ] \
+      || fail "$side $kind: worker blocked or insecure send succeeded"
+    [ "$(docker exec "$PG_CT" stat -c '%F:%u:%a:%h:%s' "$SEC_TARGET")" = "$target_meta" ] \
+      && [ "$(docker exec "$PG_CT" stat -c '%u:%a:%h:%s' "$SEC_CANARY")" = "$canary_meta" ] \
+      && [ "$(docker exec "$PG_CT" sha256sum "$SEC_CANARY")" = "$canary_hash" ] \
+      || fail "$side $kind: refused target/canary changed before validation"
+    [ "$(statf fb_sync_failures)" = "$sync0" ] || fail "$side $kind: refusal counted as sync failure"
+    if [ "$side" = queue ]; then
+      [ "$(statf fallback_broken)" = 1 ] && [ "$(statf events_queued)" = "$q0" ] \
+        || fail "queue $kind: refusal did not preserve accounting/broken gauge"
+    fi
+    # Deliver held events to a known regular 0600 sink, leaving the insecure
+    # inode alone until delivery is proved. Broken A may remain active meanwhile.
+    docker exec -u postgres "$PG_CT" sh -c "rm -f '$PRIVATE_SINK'; : > '$PRIVATE_SINK'; chmod 0600 '$PRIVATE_SINK'"
+    setguc pg_logtap.export_url "file://$PRIVATE_SINK"; reload
+    n=0; while [ "$n" -lt 15 ]; do
+      docker cp "$PG_CT:$PRIVATE_SINK" "$OUT/private-sink.jsonl" >/dev/null
+      [ "$(received "secure-$side-$kind" "$OUT/private-sink.jsonl")" -ge 10 ] && break
+      n=$((n + 1)); sleep 1
+    done
+    [ "$(received "secure-$side-$kind" "$OUT/private-sink.jsonl")" = 10 ] \
+      && [ "$(json_check "secure-$side-$kind" "$OUT/private-sink.jsonl")" = 10 ] \
+      && [ "$(seqs_of "secure-$side-$kind" "$OUT/private-sink.jsonl" | sort | uniq -d | wc -l)" = 0 ] \
+      && [ "$(statf events_lost)" = "$lost0" ] \
+      || fail "$side $kind: recovery lost/corrupted/duplicated held events"
+    [ "$(docker exec "$PG_CT" stat -c %a "$PRIVATE_SINK")" = 600 ] || fail "$side $kind: recovery sink not private"
+    setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+    if [ "$side" = queue ]; then
+      # A refused nonregular active path is not proof of emptiness. Repair A,
+      # explicitly revalidate it, then request disable after it is proven empty.
+      docker exec "$PG_CT" sh -c "rm -rf '$SEC_TARGET'"
+      docker exec -u postgres "$PG_CT" sh -c ": > '$SEC_TARGET'; chmod 0600 '$SEC_TARGET'"
+      reload; sleep 1
+      [ "$(statf fallback_broken)" = 0 ] || fail "queue $kind: secure same-path repair did not reopen"
+      setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+    fi
+    docker exec "$PG_CT" sh -c "rm -rf '$SEC_TARGET'; rm -f '$SEC_CANARY' '$PRIVATE_SINK'"
+  done
+done
+ok "sink and queue refused five insecure target types unchanged; all 100 markers recovered once via worker-owned 0600"
 
 echo "== a 900KB control-byte message at message_max=1MB: parked and replayed whole =="
 # JSON escaping turns a control byte into six bytes (\u00XX): one wide
@@ -721,16 +1067,10 @@ setguc pg_logtap.export_fallback_file ''; reload; sleep 2
 docker restart "$PG_CT" >/dev/null; wait_ready
 ok "control-byte message at message_max=1MB: parked, replayed 1/1, nothing skipped or lost"
 
-echo "== file:// sink via symlink -> the queue's file: refused at the inode =="
-# The SET-time check compares PATH STRINGS; a symlink names the same inode
-# under a different string, so the pair loads. The open-time inode check is
-# what catches it — and it is symmetric (each side stats the other's file),
-# so BOTH refuse: no send lands raw NDJSON in the queue's framing, the queue
-# never appends queue framing into the sink, and the RAM backlog carries the
-# events until the GUC is repointed. A FRESH queue name on purpose: the
-# symlink phase left the old string broken-latched, and path() re-checks
-# only on a string change — fbOpen must actually run to create the file
-# the sink-side stat compares against.
+echo "== file:// final symlink -> queue: sink security and queue alias guards refuse =="
+# The sink now fails O_NOFOLLOW before its inode-alias guard. The regular,
+# single-link queue still needs its mirror alias guard: its peer names this
+# same inode through the symlink. Both files must remain empty/private.
 FB2_REL=pg_logtap-fallback2.bin
 FB2="$FB_DIR/$FB2_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'; ln -s '$FB2_REL' '$FB_DIR/logtap-sink-alias.bin'"
@@ -752,26 +1092,24 @@ asize=$(docker exec "$PG_CT" stat -c %s "$FB2" 2>/dev/null || echo 0)
   || fail "sink alias: raw NDJSON marker lines landed in the queue file"
 setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for salias 20
-docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'"
-setguc pg_logtap.export_fallback_file ''; reload; sleep 2
-ok "symlinked sink refused at the inode: file stayed empty, 20/20 carried by the RAM backlog"
+[ "$(docker exec "$PG_CT" stat -c %a "$FB2")" = 600 ] || fail "sink alias: queue mode changed"
+docker exec "$PG_CT" rm -f "$FB_DIR/logtap-sink-alias.bin"
+reload; sleep 1 # same-path revalidation after removing the alias
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$FB2"
+ok "final symlink sink and queue alias refused: file stayed empty/private, 20/20 carried by RAM"
 
-echo "== fallback path hardlinked to the file:// sink: refused at the inode =="
-# The mirror case through a HARDLINK (O_NOFOLLOW passes those; the SET
-# strings differ): the file:// url names the real path, the fallback GUC
-# names its hardlink. Yet another FRESH queue name — path() re-checks only
-# on a string change, and the symlink scenario left fallback2 latched
-# broken. Same symmetric outcome: the queue latches broken, the sink
-# refuses, the shared file stays empty, recovery is one repoint. Both
-# files live in PGDATA: a hardlink cannot cross filesystems.
+echo "== fallback hardlinked to sink: both refuse shared inode before chmod/IO =="
+# nlink=2 now rejects both fds at the security boundary before alias checks.
+# Keep this no-write guard, and test single-link /./ aliases below so security
+# refusal cannot make the inode-alias regression vacuously pass.
 FB3_REL=pg_logtap-fallback3.bin
 FB3="$FB_DIR/$FB3_REL"
 # -u postgres: docker exec defaults to root, and a root-owned file is EACCES
 # to the worker — the scenario would test permissions, not inodes.
-docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'; : > '$FB_DIR/logtap-real2.bin'; ln '$FB_DIR/logtap-real2.bin' '$FB3'"
-# Same order as the symlink scenario: the fallback loads while the url is
-# still http (fbOpen sees the hardlink, no file:// side to alias yet), then
-# the url lands and both refusals fire before the first write.
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'; : > '$FB_DIR/logtap-real2.bin'; chmod 0644 '$FB_DIR/logtap-real2.bin'; ln '$FB_DIR/logtap-real2.bin' '$FB3'"
+# Same ordering, but the fallback now refuses nlink=2 already under HTTP.
+# Loading the sink later must refuse that shared inode too, without chmod.
 warnB0=$(statf warn_fallback_open)
 setguc pg_logtap.export_fallback_file "$FB3_REL"; reload; sleep 2
 setguc pg_logtap.export_url "file://$FB_DIR/logtap-real2.bin"; reload; sleep 2
@@ -786,11 +1124,37 @@ bsize=$(docker exec "$PG_CT" stat -c %s "$FB_DIR/logtap-real2.bin" 2>/dev/null |
 # Reload before the rm: a file:// worker whose sink path vanishes re-creates
 # it (O_CREAT) and "delivers" the backlog there — the url must point at the
 # vector first, the files go after the drain.
-setguc pg_logtap.export_url "http://$VEC:8686"
-setguc pg_logtap.export_fallback_file ''; reload; sleep 2
+[ "$(docker exec "$PG_CT" stat -c %a "$FB3")" = 644 ] || fail "hardlink queue: validation chmodded the shared inode"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
 wait_for halias 20
-docker exec "$PG_CT" sh -c "rm -f '$FB3' '$FB_DIR/logtap-real2.bin'"
-ok "hardlinked queue refused at the inode: fallback_broken=1 warned, file stayed empty, 20/20 via the RAM backlog"
+docker exec "$PG_CT" rm -f "$FB_DIR/logtap-real2.bin" # nlink becomes one
+reload; sleep 1 # same-path security revalidation now permits the empty queue
+[ "$(statf fallback_broken)" = 0 ] || fail "hardlink queue: removing extra link did not repair on HUP"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$FB3"
+ok "hardlink refused before chmod: shared mode stayed 0644, file empty, 20/20 recovered via RAM"
+
+echo "== regular single-link /./ alias: inode guards remain load-bearing =="
+FB_ALIAS_REL=pg_logtap-dot-alias.bin
+FB_ALIAS="$FB_DIR/$FB_ALIAS_REL"
+docker exec -u postgres "$PG_CT" sh -c "rm -f '$FB_ALIAS'; : > '$FB_ALIAS'; chmod 0600 '$FB_ALIAS'"
+setguc pg_logtap.export_fallback_file "$FB_ALIAS_REL"; reload; sleep 1
+# Different strings, same final regular file; O_NOFOLLOW and the ownership/
+# nlink/mode checks all pass. Removing either inode guard must fail this case.
+setguc pg_logtap.export_url "file://$FB_DIR/./$FB_ALIAS_REL" \
+  || fail "dot alias: valid alternate spelling rejected before inode guards"
+reload; sleep 1
+failed0=$(statf send_cycles_failed)
+gen dotAlias 20; sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] && [ "$(statf fallback_broken)" = 1 ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%a:%h:%s' "$FB_ALIAS")" = '600:1:0' ] \
+  || fail "dot alias: secure single-link alias was sent/queued instead of refused"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for dotAlias 20
+[ "$(seqs_of dotAlias | sort | uniq -d | wc -l)" = 0 ] || fail "dot alias: recovery duplicated markers"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$FB_ALIAS"
+ok "single-link regular alias passed security checks but both inode guards refused IO; 20/20 recovered once"
 
 echo "== worker crash: kill -9, emergency cluster restart =="
 # debug1 makes the postmaster log during the emergency restart — its emit_log
@@ -912,20 +1276,34 @@ wait_for dnsfail 5 # the buffered events ride the recovery
 [ "$(statf dns_fail_streak)" = 0 ] || fail "dns-fail gauge: streak did not reset after recovery ($(statf dns_fail_streak))"
 ok "dns_fail_streak $streak→0, visible in pg_logtap_stats()"
 
-echo "== fallback_broken gauge: foreign file disables the queue, gauge says so =="
-docker exec "$PG_CT" sh -c "echo 'not a pg_logtap queue' > '$FB'"
+echo "== fallback_broken gauge: foreign format repaired by explicit same-path HUP =="
+docker exec -u postgres "$PG_CT" sh -c "printf 'not a pg_logtap queue\n' > '$FB'; chmod 0600 '$FB'"
 setguc pg_logtap.export_url "http://127.0.0.1:1"; reload; sleep 1
-setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2 # queue scan hits the foreign magic → fb_broken
-[ "$(statf fallback_broken)" = 1 ] || fail "fallback_broken gauge: $(statf fallback_broken) with a foreign fallback file"
-# While broken the worker won't touch that path again. The flag (and the
-# queue) recover when the GUC points at a DIFFERENT path — the path-string
-# change resets consumer state and re-checks the file — or on a restart.
-docker exec "$PG_CT" sh -c "rm -f '$FB'"
+setguc pg_logtap.export_fallback_file "$FB_REL"; reload; sleep 2
+[ "$(statf fallback_broken)" = 1 ] || fail "fallback_broken gauge: foreign format not marked broken"
+foreign_before=$(docker exec "$PG_CT" sha256sum "$FB")
+q0=$(statf events_queued)
+gen samePathRepair 10; sleep 1
+[ "$(docker exec "$PG_CT" sha256sum "$FB")" = "$foreign_before" ] && [ "$(statf events_queued)" = "$q0" ] \
+  || fail "fallback_broken gauge: foreign file changed while broken"
+# Operator repair is explicit and discards only this synthetic foreign canary,
+# not a real queue. Repair alone leaves broken latched; HUP revalidates A.
+docker exec -u postgres "$PG_CT" sh -c ": > '$FB'; chmod 0600 '$FB'"
+sleep 1
+[ "$(statf fallback_broken)" = 1 ] || fail "fallback_broken gauge: repaired without HUP"
+reload; sleep 2
+[ "$(statf fallback_broken)" = 0 ] && [ "$(statf events_queued)" -gt "$q0" ] \
+  || fail "fallback_broken gauge: same-path reload failed to reopen and park held events"
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for samePathRepair 10
+[ "$(seqs_of samePathRepair | sort | uniq -d | wc -l)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  || fail "fallback_broken gauge: repaired same-path queue did not drain once"
+# Switch only after the active file has drained; the capped scenario below
+# uses this second queue, not a hidden old active A.
 FB_REL2=pg_logtap-fallback2.bin
-setguc pg_logtap.export_fallback_file "$FB_REL2"; reload; sleep 2
-[ "$(statf fallback_broken)" = 0 ] || fail "fallback_broken gauge: did not clear on repoint to a fresh path ($(statf fallback_broken))"
-setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
-ok "fallback_broken 1→0: foreign file flagged, fresh path recovers the queue"
+setguc pg_logtap.export_fallback_file "$FB_REL2"; reload; sleep 1
+ok "fallback_broken 1→0 on same-path HUP; repaired queue parked/replayed 10/10 once, then safe path switch"
 
 echo "== fallback_max_mb: a capped queue keeps the newest tail, counts the rest lost =="
 # Sizing: this run's queue scenario shows ~15 compressed bytes per event, so

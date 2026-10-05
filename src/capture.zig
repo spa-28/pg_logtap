@@ -41,10 +41,10 @@ var filter_cache = filter.Filter{};
 /// Compiled pg_logtap.redact_pattern; null unless the GUC is set.
 var redactor: ?filter.Redactor = null;
 
-/// Redaction scratch: the password-token cut writes one buffer, the regex
-/// pass the other, so the hook never allocates. One byte over the message
-/// width — the largest text field — so a full-length field still gets its
-/// NUL terminator without losing a byte to it.
+/// Redaction scratch: consecutive layers alternate buffers, so a password
+/// assignment and a bind value can both be masked without in-place copying.
+/// One byte over the message width — the largest text field — keeps the hook
+/// allocation-free and leaves room for the terminating NUL.
 /// Sized at the BSS comptime maximum and sliced to message_max at use:
 /// demand-zero under fork means only touched pages go resident (the
 /// postmaster never touches them — the MyProc gate below exits first), and
@@ -68,9 +68,9 @@ fn ringQ() ring.Ring {
 
 pub fn init() void {
     pg.DefineCustomIntVariable("pg_logtap.level_min", "Minimum elevel to capture (10=DEBUG5, 15=LOG, 19=WARNING, 21=ERROR, 23=PANIC). Filters export only — stderr/log_destination output is governed by the server's own log_min_messages.", null, &guc_level_min, 15, 10, 23, pg.PGC_SIGHUP, 0, null, assignLevel, null);
-    pg.DefineCustomStringVariable("pg_logtap.pattern", "POSIX ERE; capture only matching messages (empty = all).", null, &guc_pattern, "", pg.PGC_SIGHUP, 0, null, assignPattern, null);
-    pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching events — the pattern is matched against the event's whole text: message, detail, hint, context and the captured query (only when field_query is on). pattern_include still matches the message alone.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, null, assignPatternExclude, null);
-    pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting, and so are bind-parameter values (the DETAIL line log_parameter_max_length adds to statement lines). Avoid backreferences: they leave the libc fast matcher and can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, null, assignRedact, null);
+    pg.DefineCustomStringVariable("pg_logtap.pattern", "POSIX ERE; capture only matching messages (empty = all).", null, &guc_pattern, "", pg.PGC_SIGHUP, 0, checkPattern, assignPattern, null);
+    pg.DefineCustomStringVariable("pg_logtap.pattern_exclude", "POSIX ERE; skip matching events — the pattern is matched against the event's whole text: message, detail, hint, context and the captured query (only when field_query is on). pattern_include still matches the message alone.", null, &guc_pattern_exclude, "", pg.PGC_SIGHUP, 0, checkPattern, assignPatternExclude, null);
+    pg.DefineCustomStringVariable("pg_logtap.redact_pattern", "POSIX ERE; every match in message/detail/hint/context/query is replaced with <REDACTED> before the event leaves the server. Best-effort PII masking (a determined writer can evade any pattern) — the password token in logged statements is cut always, independently of this setting, and so are bind-parameter values in DETAIL/CONTEXT. Backreferences (\\1…\\9) are rejected because they can take seconds per message.", null, &guc_redact_pattern, "", pg.PGC_SIGHUP, 0, checkRedactPattern, assignRedact, null);
     pg.DefineCustomBoolVariable("pg_logtap.field_query", "Capture the current query text with each event. SECURITY: queries can embed tokens and personal data beyond passwords (literals in INSERTs) — the standalone password token is cut always and redact_pattern masks its matches, but everything else ships as written; leave off unless the receiver is trusted. log_min_duration_statement puts query text into message regardless of this setting; pattern_exclude suppresses whole events at capture.", null, &guc_field_query, false, pg.PGC_SIGHUP, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.ring_capacity", "Ring buffer capacity in events; restart required.", null, &guc_ring_capacity, 1024, 128, @intCast(ring.max_capacity), pg.PGC_POSTMASTER, 0, null, null, null);
     pg.DefineCustomIntVariable("pg_logtap.message_max", "Width in bytes of each event's message field; longer messages are cut at a UTF-8 character boundary and named in truncated. Other fields stay 256 bytes. Shared memory cost is ring_capacity × (message_max + ~2.4 KB); restart required. Default keeps the slot byte-identical to 0.3.x (3.4 KB).", null, &guc_message_max, 1024, @intCast(ring.default_message), @intCast(ring.max_message), pg.PGC_POSTMASTER, 0, null, null, null);
@@ -90,47 +90,68 @@ fn assignLevel(newval: c_int, extra: ?*anyopaque) callconv(.c) void {
     filter_cache.level_min = newval;
 }
 
+fn checkPattern(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    return regexValid(filter.Regex, newval);
+}
+
+fn checkRedactPattern(newval: [*c][*c]u8, extra: [*c]?*anyopaque, source: c_uint) callconv(.c) bool {
+    _ = extra;
+    _ = source;
+    return regexValid(filter.Redactor, newval);
+}
+
+fn regexValid(comptime T: type, newval: [*c][*c]u8) bool {
+    const ptr = newval orelse return true;
+    const raw_c = ptr.* orelse return true;
+    const pattern = std.mem.span(@as([*:0]const u8, @ptrCast(raw_c)));
+    if (pattern.len == 0) return true;
+    var compiled = T.compileDiag(pattern, null) orelse return false;
+    compiled.deinit();
+    return true;
+}
+
 fn assignPattern(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
-    if (filter_cache.include) |*re| re.deinit();
-    filter_cache.include = compileOrWarn(filter.Regex, newval, "pg_logtap.pattern");
+    _ = replaceCompiled(filter.Regex, &filter_cache.include, newval, "pg_logtap.pattern");
 }
 
 fn assignPatternExclude(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
-    if (filter_cache.exclude) |*re| re.deinit();
-    filter_cache.exclude = compileOrWarn(filter.Regex, newval, "pg_logtap.pattern_exclude");
+    _ = replaceCompiled(filter.Regex, &filter_cache.exclude, newval, "pg_logtap.pattern_exclude");
 }
 
 fn assignRedact(newval: [*c]const u8, extra: ?*anyopaque) callconv(.c) void {
     _ = extra;
-    if (redactor) |*r| r.deinit();
-    const span_len = if (newval == null) 0 else std.mem.span(@as([*:0]const u8, @ptrCast(newval))).len;
-    redactor = compileOrWarn(filter.Redactor, newval, "pg_logtap.redact_pattern");
-    // null also covers "pattern empty = layer off", which is not a failure
-    setRedactPatternFailed(redactor == null and span_len > 0);
+    setRedactPatternFailed(!replaceCompiled(filter.Redactor, &redactor, newval, "pg_logtap.redact_pattern"));
 }
 
-fn compileOrWarn(comptime T: type, pattern: [*c]const u8, guc: [*:0]const u8) ?T {
-    if (pattern == null) return null;
-    const span = std.mem.span(@as([*:0]const u8, @ptrCast(pattern)));
-    if (span.len == 0) return null;
+/// Compile first, then release the active expression. Check hooks should make
+/// failure unreachable during normal assignment, but retaining the old object
+/// keeps filtering/redaction active if libc still fails here (for example OOM).
+fn replaceCompiled(comptime T: type, current: *?T, pattern: [*c]const u8, guc: [*:0]const u8) bool {
+    const span: [:0]const u8 = if (pattern == null) "" else std.mem.span(@as([*:0]const u8, @ptrCast(pattern)));
+    if (span.len == 0) {
+        if (current.*) |*old| old.deinit();
+        current.* = null;
+        return true;
+    }
     var diag = filter.CompileDiag{};
-    return T.compileDiag(span, &diag) orelse {
-        std.log.warn("regex in {s} did not compile, ignoring: {s}", .{ guc, diag.text() }); // no ereport inside GUC machinery
-        return null;
+    const next = T.compileDiag(span, &diag) orelse {
+        std.log.warn("regex in {s} passed validation but did not compile during assignment; keeping the previous expression: {s}", .{ guc, diag.text() });
+        return false;
     };
+    if (current.*) |*old| old.deinit();
+    current.* = next;
+    return true;
 }
 
 fn rebuildFilter() void {
-    filter_cache.deinit();
     filter_cache.level_min = guc_level_min;
-    filter_cache.include = compileOrWarn(filter.Regex, guc_pattern, "pg_logtap.pattern");
-    filter_cache.exclude = compileOrWarn(filter.Regex, guc_pattern_exclude, "pg_logtap.pattern_exclude");
-    if (redactor) |*r| r.deinit();
-    const span_len = if (guc_redact_pattern == null) 0 else std.mem.span(@as([*:0]const u8, @ptrCast(guc_redact_pattern))).len;
-    redactor = compileOrWarn(filter.Redactor, guc_redact_pattern, "pg_logtap.redact_pattern");
-    setRedactPatternFailed(redactor == null and span_len > 0);
+    _ = replaceCompiled(filter.Regex, &filter_cache.include, guc_pattern, "pg_logtap.pattern");
+    _ = replaceCompiled(filter.Regex, &filter_cache.exclude, guc_pattern_exclude, "pg_logtap.pattern_exclude");
+    setRedactPatternFailed(!replaceCompiled(filter.Redactor, &redactor, guc_redact_pattern, "pg_logtap.redact_pattern"));
 }
 
 // --- shared memory -----------------------------------------------------------
@@ -236,24 +257,23 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     const port: ?*pg.Port = @ptrCast(pg.MyProcPort);
     if (port) |p| copyStr(&entry.client_host, &entry, .client_host, p.remote_host);
 
-    // Statement-embedded text (log_statement / log_min_duration_statement
-    // lines, simple AND extended protocol — see filter.stmtLine) carries the
-    // raw SQL, passwords included; the token cut is gated on that marker so
-    // an ordinary message mentioning the word is untouched.
-    const msg_span = std.mem.span(@as([*:0]const u8, @ptrCast(d.message)));
-    const stmt_line = filter.stmtLine(msg_span);
+    // message_id is PostgreSQL's untranslated primary format string. Exact IDs
+    // identify statement-embedded SQL independently of lc_messages while
+    // leaving lookalike application messages untouched.
+    const stmt_line = if (d.message_id != null)
+        filter.statementMessageId(std.mem.span(@as([*:0]const u8, @ptrCast(d.message_id))))
+    else
+        false;
     const msg_bytes = copyMsg(&entry, d.message, if (stmt_line) .tail else .none);
-    // Bind values (log_parameter_max_length) ride DETAIL on statement lines —
-    // the secret sits there, not in the placeholder SQL the token cut sees.
-    // Off statement lines detail/hint/context get the value cut: secrets echo
-    // next to a password token (RAISE ... USING DETAIL, error text) are
-    // masked, PG's own diagnostics text survives.
-    copyText(&entry.detail, &entry, .detail, d.detail, .value, stmt_line);
-    copyText(&entry.hint, &entry, .hint, d.hint, .value, false);
-    copyText(&entry.context, &entry, .context, d.context, .value, false);
+    // Auxiliary fields keep their localized wrappers. Password assignments and
+    // PostgreSQL's structural `$N = 'value'` payloads are masked wherever they
+    // occur, including log_parameter_max_length_on_error CONTEXT lines.
+    copyText(&entry.detail, &entry, .detail, d.detail, .value);
+    copyText(&entry.hint, &entry, .hint, d.hint, .value);
+    copyText(&entry.context, &entry, .context, d.context, .value);
     copyStr(&entry.filename, &entry, .filename, d.filename);
     copyStr(&entry.funcname, &entry, .funcname, d.funcname);
-    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, .tail, false);
+    if (guc_field_query) copyText(&entry.query, &entry, .query, pg.debug_query_string, .tail);
 
     lockRing();
     const was_empty = state.count == 0;
@@ -280,25 +300,30 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
 /// diagnostics survive verbatim).
 const PwCut = enum { none, tail, value };
 
-/// Run text through the redaction layers: the password cut (pw — see PwCut)
-/// or the bind-value mask (bind_params — DETAIL on statement lines; the two
-/// never coexist on one field) into one scratch buffer, then the
-/// redact_pattern regex over the result into the other. Layers that cannot
-/// change the text copy nothing.
-/// Each layer rewrites the text but must not erase the previous layer's
-/// clip: a password value that clipped in the first layer and a regex that
-/// did not clip in the second still left the field shortened by the first —
-/// the event must say so.
+/// Each changed layer writes to the scratch buffer opposite its input. Two
+/// buffers are enough for any number of passes, and avoid overlapping copies
+/// when one auxiliary field contains both password and bind assignments.
+fn scratchFor(text: []const u8) []u8 {
+    const len = messageMax() + 1;
+    return if (text.ptr == redact_a[0..].ptr) redact_b[0..len] else redact_a[0..len];
+}
+
+/// Each layer must preserve clipping reported by an earlier layer.
 fn applyLayer(out: filter.Masked, layer: filter.Masked) filter.Masked {
     return .{ .text = layer.text, .clipped = out.clipped or layer.clipped };
 }
 
-fn maskThroughLayers(text: []const u8, pw: PwCut, bind_params: bool) filter.Masked {
+fn maskThroughLayers(text: []const u8, pw: PwCut) filter.Masked {
     var out = filter.Masked{ .text = text, .clipped = false };
-    if (pw == .tail) out = applyLayer(out, filter.redactPassword(redact_a[0 .. messageMax() + 1], out.text));
-    if (pw == .value) out = applyLayer(out, filter.redactPasswordValue(redact_a[0 .. messageMax() + 1], out.text));
-    if (bind_params) out = applyLayer(out, filter.redactParamValues(redact_a[0 .. messageMax() + 1], out.text));
-    if (redactor) |*red| out = applyLayer(out, red.apply(redact_b[0 .. messageMax() + 1], out.text));
+    switch (pw) {
+        .none => {},
+        .tail => out = applyLayer(out, filter.redactPassword(scratchFor(out.text), out.text)),
+        .value => {
+            out = applyLayer(out, filter.redactPasswordValue(scratchFor(out.text), out.text));
+            out = applyLayer(out, filter.redactParamValues(scratchFor(out.text), out.text));
+        },
+    }
+    if (redactor) |*red| out = applyLayer(out, red.apply(scratchFor(out.text), out.text));
     return out;
 }
 
@@ -306,21 +331,19 @@ fn maskThroughLayers(text: []const u8, pw: PwCut, bind_params: bool) filter.Mask
 /// A layer that had to clip sets the field's redacted bit itself: setStr
 /// cannot, because the clipped result fits the slot — and the cause is the
 /// clip, not the slot.
-fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: PwCut, bind_params: bool) void {
+fn copyText(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: [*c]const u8, pw: PwCut) void {
     if (src == null) return;
-    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, bind_params);
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
     ring.setStr(dst, &entry.truncated_mask, field, masked.text);
     if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(field));
 }
 
-/// The message variant of copyText: same layers (bind values never ride the
-/// message — the Parameters line is DETAIL-only), but the result lands in
-/// msg_hold via setMsg (the slot's message region is variable-width) and the
-/// copied slice is returned for ring.push — it must
-/// survive until push, and the layers' own buffer (redact_b) does not: the
-/// next copyText overwrites it.
+/// The message variant of copyText: its result lands in msg_hold via setMsg
+/// (the slot's message region is variable-width) and the copied slice is
+/// returned for ring.push. It must survive the auxiliary fields reusing the
+/// scratch buffers before push.
 fn copyMsg(entry: *ring.ShmLogEntry, src: [*c]const u8, pw: PwCut) []const u8 {
-    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw, false);
+    const masked = maskThroughLayers(std.mem.span(@as([*:0]const u8, @ptrCast(src))), pw);
     const held = ring.setMsg(&entry.message_len, &entry.truncated_mask, masked.text, msg_hold[0..messageMax()]);
     if (masked.clipped) entry.redacted_mask |= @as(u16, 1) << @intCast(@intFromEnum(ring.TruncField.message));
     return held;
@@ -392,6 +415,33 @@ pub fn bumpExportCursor(sent: u64, queued: u64, replayed: u64, failed: u64, lost
     unlockRing();
 }
 
+/// Copy the active queue path, not necessarily the latest configured path.
+/// null is first boot; an empty initialized path is deliberately disabled.
+pub fn fallbackPath(buf: *[4096]u8) ?usize {
+    if (!ready) return null;
+    lockRing();
+    defer unlockRing();
+    if (state.fallback_path_initialized == 0) return null;
+    const len: usize = state.fallback_path_len;
+    @memcpy(buf[0..len], state.fallback_path[0..len]);
+    buf[len] = 0;
+    return len;
+}
+
+/// Only the worker adopts a path, after the old queue is proven drained.
+/// Publish before crediting the new file: a replacement must resume that file.
+pub fn setFallbackPath(path: []const u8) void {
+    if (!ready) return;
+    std.debug.assert(path.len < state.fallback_path.len);
+    lockRing();
+    @memcpy(state.fallback_path[0..path.len], path);
+    state.fallback_path[path.len] = 0;
+    state.fallback_path_len = @intCast(path.len);
+    state.fallback_path_initialized = 1;
+    state.fallback_cursor_valid = 0;
+    unlockRing();
+}
+
 /// A successful drain reuses the inode after truncation, so its old EOF must
 /// stop being a resumable boundary before that inode can hold a new queue.
 pub fn invalidateFallbackCursor() void {
@@ -420,12 +470,20 @@ pub fn fallbackOffset(dev: i64, ino: u64, size: u64) u64 {
 /// Worker-owned gauges, republished every flush cycle: the worker-local
 /// originals (dns_fail_streak, fb_broken) die with the process, so a restart
 /// must overwrite possibly-stale copies here within one cycle.
-pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8, fb_sync_fails: u64) void {
+pub fn setWorkerGauges(dns_fail: u32, fb_broken: u8) void {
     if (!ready) return;
     lockRing();
     state.dns_fail_streak = dns_fail;
     state.fallback_broken = fb_broken;
-    state.fb_sync_failures = fb_sync_fails;
+    unlockRing();
+}
+
+/// Publish each actual failed queue fdatasync immediately, not a worker-local
+/// absolute total: shared memory outlives a replacement export worker.
+pub fn bumpFbSyncFailure() void {
+    if (!ready) return;
+    lockRing();
+    state.fb_sync_failures += 1;
     unlockRing();
 }
 
@@ -444,8 +502,8 @@ pub fn noteWarn(kind: enum { tls_no_verify, fallback_open, fallback_skipped, fal
 }
 
 /// Redaction compile health. Set from the GUC assign hook (SIGHUP runs in
-/// whichever backend reloads) and the startup rebuild: a pattern that does
-/// not compile leaves that layer OFF (fail-open) — the gauge is the signal.
+/// whichever backend reloads) and the startup rebuild: an unexpected compile
+/// failure retains the previous redactor — the gauge is the signal.
 /// The postmaster also runs assign hooks on its own SIGHUP reload, and it
 /// has no PGPROC: waiting on a contended LWLock there PANICs the whole
 /// cluster. Skip in that process — every backend runs the same assign on
@@ -539,7 +597,7 @@ pub fn statsJson(buf: []u8) ?[]const u8 {
         snap.queued,
         snap.replayed,
         snap.compacted,
-        snap.queued -| snap.replayed -| snap.compacted -| snap.queue_discarded,
+        snap.queueBacklog(),
         snap.sent +| snap.replayed,
         snap.export_lost,
         snap.send_failed,

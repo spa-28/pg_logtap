@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SECS=${1:-5}; shift || true
 if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
-PHASES=${PHASES:-stand,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide}
+PHASES=${PHASES:-stand,upgrade,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide,archive}
 COMPOSE="docker compose -f tests/e2e/compose.yaml"
 OUT=/tmp/logtap-e2e # the shared stand's root; per-major dirs live under it
 mkdir -p "$OUT"
@@ -80,11 +80,16 @@ phase_stand() { # <v>: build, receivers stand (once), per-major pg, deploy.
   exec 7>"$OUT/lock.stand"
   flock -w 3600 7 || { echo "pg$v: timed out waiting for the stand lock" >&2; return 1; }
 
+  local host_pg_major=
   if command -v pg_config >/dev/null 2>&1; then
-    zig build "${FLAGS[@]}" -p "dist/pg$v"   # CI: server-dev for $v is installed
+    host_pg_major=$(pg_config --version | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')
+  fi
+  if [ "$host_pg_major" = "$v" ]; then
+    zig build "${FLAGS[@]}" -p "dist/pg$v" || return 1 # CI: matching server-dev is installed
   else
-    scripts/build.sh "$v" "${FLAGS[@]}" && mkdir -p "dist/pg$v/lib" && \
-      cp zig-out/lib/pg_logtap.so "dist/pg$v/lib/"   # local: build in pgzx-build
+    scripts/build.sh "$v" "${FLAGS[@]}" || return 1 # local: build in pgzx-build
+    mkdir -p "dist/pg$v/lib" || return 1
+    cp zig-out/lib/pg_logtap.so "dist/pg$v/lib/" || return 1
   fi
   split_debug "dist/pg$v/lib/pg_logtap.so" || return 1
 
@@ -170,6 +175,10 @@ phase_stand() { # <v>: build, receivers stand (once), per-major pg, deploy.
   exec 7>&- # release the stand lock: it covers build+bring-up+deploy, not
   # the version's suites — held on an open fd it would serialize the whole
   # matrix again (mx16 waited 11 min behind mx15's tls phase once).
+}
+
+phase_upgrade() { # <v>: direct/current and historical SQL upgrade chains.
+  scripts/e2e-upgrade.sh "pglogtap-mx$1"
 }
 
 phase_cluster_ops() { # <v>: ops that interact with other backends — the
@@ -303,6 +312,10 @@ phase_wide() { # <v>: pg_logtap.message_max=8192 (POSTMASTER): whole messages
   scripts/e2e-wide.sh "pglogtap-mx$1"
 }
 
+phase_archive() { # <v>: exact runtime/debug release archives on actual EL8.
+  scripts/archive-smoke.sh "$1"
+}
+
 phase_bench() { # <v> <secs>: formal overhead benchmark (docs/bench.md) —
   # pgbench before/after the extension, TPS/CPU/events/s/latency report. Not
   # in the default PHASES: benchmark numbers from shared CI runners are
@@ -316,6 +329,9 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
   echo "===== pg$v ====="
   ok=1
   if has_phase stand; then phase_stand "$v" || { echo "pg$v: stand FAILED"; STATUS=1; ok=0; }; fi
+  if [ "$ok" = 1 ] && has_phase upgrade; then
+    phase_upgrade "$v" || { echo "pg$v: upgrade-chain FAILED"; STATUS=1; ok=0; }
+  fi
   if [ "$ok" = 1 ] && has_phase cluster-ops; then
     phase_cluster_ops "$v" || { echo "pg$v: cluster-ops (barrier/signal classes) FAILED"; STATUS=1; ok=0; }
   fi
@@ -357,6 +373,9 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
   fi
   if [ "$ok" = 1 ] && has_phase wide; then
     phase_wide "$v" || { echo "pg$v: wide FAILED"; STATUS=1; ok=0; }
+  fi
+  if [ "$ok" = 1 ] && has_phase archive; then
+    phase_archive "$v" || { echo "pg$v: archive/glibc-2.28 FAILED"; STATUS=1; ok=0; }
   fi
   if [ "$ok" = 1 ] && has_phase bench; then
     phase_bench "$v" "$SECS" || { echo "pg$v: bench FAILED"; STATUS=1; ok=0; }

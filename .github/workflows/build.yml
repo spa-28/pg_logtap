@@ -81,13 +81,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: pg_logtap-pg${{ matrix.pg }}-${{ matrix.arch }}
-          path: |
-            dist/pg${{ matrix.pg }}/lib/pg_logtap.so
-            dist/pg${{ matrix.pg }}/lib/pg_logtap.so.debug
+          # The final matrix phase packages once and smokes these exact tarballs
+          # on native Rocky 8/glibc 2.28 before they can be uploaded.
+          path: dist/pg${{ matrix.pg }}/archives/*.tar.gz
           if-no-files-found: error
 
-  # On a published release: rebuild via the jobs above, then attach a stripped
-  # runtime package and matching detached-symbol package per PG major × arch.
+  # On a published release: attach the exact sixteen archives already smoked
+  # by the native matrix; do not repackage binaries in the release job.
   release:
     needs: [check, matrix]
     if: github.event_name == 'release'
@@ -100,34 +100,23 @@ jobs:
           ref: ${{ github.ref }}
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          pattern: pg_logtap-pg*-*
+          path: rel
+          merge-multiple: true
       - run: |
           set -euo pipefail
           V=${GITHUB_REF_NAME#v}
           ctl=$(sed -n "s/^default_version = '\(.*\)'/\1/p" pg_logtap.control)
           [ "$V" = "$ctl" ] || { echo "tag v$V != control default_version $ctl"; exit 1; }
-          mkdir rel
-          for d in dist/pg_logtap-pg*-*; do
-            rest=${d#dist/pg_logtap-pg}
-            pg=${rest%%-*}
-            arch=${rest##*-}
-            pkg=pg_logtap-$V-pg$pg-$arch
-            runtime=$pkg
-            debug=$pkg-debug
-            [ -f "$d/pg_logtap.so" ] && [ -f "$d/pg_logtap.so.debug" ] || {
-              echo "missing runtime or debug symbols in $d"; exit 1;
-            }
-            mkdir -p "$runtime/lib" "$runtime/extension" "$debug/lib"
-            cp "$d/pg_logtap.so" "$runtime/lib/"
-            cp pg_logtap.control sql/*.sql "$runtime/extension/"
-            cp "$d/pg_logtap.so.debug" "$debug/lib/"
-            tar -C "$runtime" -czf "rel/$runtime.tar.gz" .
-            tar -C "$debug" -czf "rel/$debug.tar.gz" .
-            tar -tzf "rel/$runtime.tar.gz" | grep -Fx './lib/pg_logtap.so' >/dev/null
-            ! tar -tzf "rel/$runtime.tar.gz" | grep -q 'pg_logtap.so.debug'
-            tar -tzf "rel/$debug.tar.gz" | grep -Fx './lib/pg_logtap.so.debug' >/dev/null
-            ! tar -tzf "rel/$debug.tar.gz" | grep -q 'extension/'
+          for pg in 15 16 17 18; do
+            for arch in amd64 arm64; do
+              pkg=pg_logtap-$V-pg$pg-$arch
+              [ -f "rel/$pkg.tar.gz" ] && [ -f "rel/$pkg-debug.tar.gz" ] || {
+                echo "missing smoked archives for pg$pg $arch"; exit 1;
+              }
+            done
           done
+          [ "$(find rel -type f | wc -l)" -eq 16 ]
       - uses: softprops/action-gh-release@v2
         with:
           files: rel/*
