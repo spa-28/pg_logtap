@@ -4,7 +4,12 @@ ARG PG
 RUN case "$PG" in 15|16|17|18) ;; *) exit 1 ;; esac && \
     dnf -y install ca-certificates binutils python3 util-linux && \
     dnf -y module disable postgresql && \
-    printf '[pgdg]\nname=Official PGDG EL8\nbaseurl=https://download.postgresql.org/pub/repos/yum/%s/redhat/rhel-8-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL\n[pgdg-common]\nname=Official PGDG common EL8\nbaseurl=https://download.postgresql.org/pub/repos/yum/common/redhat/rhel-8-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL\n' "$PG" > /etc/yum.repos.d/pgdg-smoke.repo && \
+    case "$(uname -m)" in \
+      x86_64) PGDG_KEY=PGDG-RPM-GPG-KEY-RHEL ;; \
+      aarch64) PGDG_KEY=PGDG-RPM-GPG-KEY-AARCH64-RHEL ;; \
+      *) exit 1 ;; \
+    esac && \
+    printf '[pgdg]\nname=Official PGDG EL8\nbaseurl=https://download.postgresql.org/pub/repos/yum/%s/redhat/rhel-8-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=https://download.postgresql.org/pub/repos/yum/keys/%s\n[pgdg-common]\nname=Official PGDG common EL8\nbaseurl=https://download.postgresql.org/pub/repos/yum/common/redhat/rhel-8-$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=https://download.postgresql.org/pub/repos/yum/keys/%s\n' "$PG" "$PGDG_KEY" "$PGDG_KEY" > /etc/yum.repos.d/pgdg-smoke.repo && \
     dnf -y --enablerepo=powertools --setopt=install_weak_deps=False install "postgresql${PG}-server" "postgresql${PG}-devel" "postgresql${PG}-libs" && \
     dnf clean all
 ENV PG_MAJOR=${PG}
