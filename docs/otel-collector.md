@@ -153,6 +153,11 @@ processors:
   transform/pg_logtap:
     error_mode: propagate
     log_statements:
+      - set(log.severity_number, SEVERITY_NUMBER_DEBUG) where IsString(log.attributes["level"]) and IsMatch(log.attributes["level"], "^DEBUG")
+      - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.attributes["level"] == "LOG" or log.attributes["level"] == "INFO"
+      - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.attributes["level"] == "NOTICE" or log.attributes["level"] == "WARNING"
+      - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.attributes["level"] == "ERROR"
+      - set(log.severity_number, SEVERITY_NUMBER_FATAL) where log.attributes["level"] == "FATAL" or log.attributes["level"] == "PANIC"
       - set(resource.attributes["service.name"], "postgresql")
       - set(resource.attributes["host.name"], log.attributes["host"]) where log.attributes["host"] != nil
       - set(resource.attributes["service.namespace"], log.attributes["cluster"]) where log.attributes["cluster"] != nil
@@ -267,9 +272,18 @@ the commands from any working copy of this repository. The extension runtime
 is downloaded from the v0.5.2 GitHub release, so no Zig or PostgreSQL build
 toolchain is required.
 
+Start a **dedicated Bash session** (`bash`) for all blocks below (`curl`, `tar`, `timeout` and
+Docker are required). No host ports are published; the stand uses a private
+internal network. Each run gets unique names and a run label. Cleanup is armed
+before downloading or creating Docker resources, and checks ownership before
+removal, so a name collision fails without deleting an unrelated resource.
+The historical runtime/image pins and validation claims above are unchanged;
+this example does not claim validation of a development version.
+
 Download the runtime package matching the host architecture:
 
 ```sh
+set -euo pipefail
 VERSION=0.5.2
 PG_MAJOR=18
 case "$(uname -m)" in
@@ -278,9 +292,33 @@ case "$(uname -m)" in
   *) printf 'unsupported architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
 esac
 
-RUNTIME_DIR=$(mktemp -d)
+RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pglogtap-otel.XXXXXXXX")
+RUN=${RUNTIME_DIR##*/}
+NET=$RUN-net
+VL=$RUN-vlogs
+OTEL=$RUN-otel
+HTTP_PG=$RUN-pg-http
+TCP_PG=$RUN-pg-tcp
+PROBE=$RUN-probe
+LABEL="pg_logtap.guide.run=$RUN"
+cleanup() {
+  status=$?
+  trap - EXIT
+  set +e
+  for name in "$PROBE" "$HTTP_PG" "$TCP_PG" "$OTEL" "$VL"; do
+    id=$(timeout 10s docker inspect -f "{{if eq (index .Config.Labels \"pg_logtap.guide.run\") \"$RUN\"}}{{.Id}}{{end}}" "$name" 2>/dev/null) || id=''
+    [ -z "$id" ] || timeout 10s docker rm -fv "$id" >/dev/null
+  done
+  id=$(timeout 10s docker network inspect -f "{{if eq (index .Labels \"pg_logtap.guide.run\") \"$RUN\"}}{{.Id}}{{end}}" "$NET" 2>/dev/null) || id=''
+  [ -z "$id" ] || timeout 10s docker network rm "$id" >/dev/null
+  rm -rf "$RUNTIME_DIR"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 PACKAGE="pg_logtap-${VERSION}-pg${PG_MAJOR}-${ARCH}"
-curl -fL \
+curl -fL --connect-timeout 10 --max-time 120 \
   "https://github.com/spa-28/pg_logtap/releases/download/v${VERSION}/${PACKAGE}.tar.gz" \
   -o "$RUNTIME_DIR/$PACKAGE.tar.gz"
 tar -xzf "$RUNTIME_DIR/$PACKAGE.tar.gz" -C "$RUNTIME_DIR"
@@ -292,31 +330,31 @@ test -f "$RUNTIME_DIR/extension/pg_logtap--${VERSION}.sql"
 Create an isolated Docker network and start VictoriaLogs and Collector:
 
 ```sh
-NET=pglogtap-otel-vlogs-check-net
-VL=pglogtap-otel-vlogs-check
-OTEL=pglogtap-otel-vlogs-check-otel
-HTTP_PG=pglogtap-otel-vlogs-check-pg-http
-TCP_PG=pglogtap-otel-vlogs-check-pg-tcp
 VL_IMAGE='victoriametrics/victoria-logs:v1.52.0@sha256:47b820890d64c4575a2a0a46415dcd8a4fd59a0f1fcd6a377693d7aea639442e'
 OTEL_IMAGE='otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1'
 
-docker network create "$NET"
+docker network create --internal --label "$LABEL" "$NET"
 
-docker run -d --name "$VL" \
+docker run -d --name "$VL" --label "$LABEL" \
   --network "$NET" --network-alias victorialogs \
   "$VL_IMAGE"
 
-docker run -d --name "$OTEL" \
+docker run -d --name "$OTEL" --label "$LABEL" \
   --network "$NET" --network-alias otel-collector \
   -v "$PWD/tests/e2e/otel-victorialogs.yaml:/etc/otelcol-contrib/config.yaml:ro" \
   "$OTEL_IMAGE" \
   --config=/etc/otelcol-contrib/config.yaml
 
-until docker run --rm --network "$NET" alpine:3.20 sh -c \
-  'nc -z victorialogs 9428 && nc -z otel-collector 8088 && nc -z otel-collector 54525'
-do
+ready=0
+for attempt in {1..60}; do
+  if timeout 10s docker run --rm --name "$PROBE" --label "$LABEL" \
+    --network "$NET" alpine:3.20 sh -c \
+    'nc -z -w 2 victorialogs 9428 && nc -z -w 2 otel-collector 8088 && nc -z -w 2 otel-collector 54525'; then
+    ready=1; break
+  fi
   sleep 1
 done
+[ "$ready" -eq 1 ] || { printf 'receiver readiness timed out\n' >&2; exit 1; }
 ```
 
 Start one PostgreSQL sender per transport. Separate senders make the receiver
@@ -327,7 +365,7 @@ path unambiguous. They also avoid a configuration trap: a
 
 ```sh
 start_pg() {
-  docker run -d --name "$1" --network "$NET" \
+  docker run -d --name "$1" --label "$LABEL" --network "$NET" \
     -e POSTGRES_HOST_AUTH_METHOD=trust \
     -v "$RUNTIME_DIR/lib/pg_logtap.so:/usr/lib/postgresql/18/lib/pg_logtap.so:ro" \
     -v "$RUNTIME_DIR/extension/pg_logtap.control:/usr/share/postgresql/18/extension/pg_logtap.control:ro" \
@@ -347,10 +385,15 @@ start_pg "$HTTP_PG" 'http://otel-collector:8088/pg-logtap'
 start_pg "$TCP_PG"  'tcp://otel-collector:54525'
 
 for pg in "$HTTP_PG" "$TCP_PG"; do
-  until docker exec "$pg" pg_isready -U postgres >/dev/null 2>&1; do
+  ready=0
+  for attempt in {1..60}; do
+    if timeout 5s docker exec "$pg" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+      ready=1; break
+    fi
     sleep 1
   done
-  docker exec "$pg" psql -U postgres -v ON_ERROR_STOP=1 \
+  [ "$ready" -eq 1 ] || { printf 'PostgreSQL readiness timed out: %s\n' "$pg" >&2; exit 1; }
+  timeout 10s docker exec "$pg" psql -X -U postgres -v ON_ERROR_STOP=1 \
     -qc 'CREATE EXTENSION pg_logtap'
 done
 ```
@@ -376,8 +419,8 @@ emit_matrix() {
      END \$\$"
 }
 
-HTTP_MARKER="otel-vlogs-http-$(date +%s)"
-TCP_MARKER="otel-vlogs-tcp-$(date +%s)"
+HTTP_MARKER="$RUN-http"
+TCP_MARKER="$RUN-tcp"
 emit_matrix "$HTTP_PG" "$HTTP_MARKER"
 emit_matrix "$TCP_PG" "$TCP_MARKER"
 ```
@@ -390,9 +433,9 @@ query_marker() {
   marker=$1
   attempt=0
   while [ "$attempt" -lt 30 ]; do
-    response=$(docker run --rm --network "$NET" alpine:3.20 \
-      wget -qO- \
-      "http://victorialogs:9428/select/logsql/query?query=%22${marker}%22%20%7C%20limit%201000")
+    response=$(timeout 10s docker run --rm --name "$PROBE" --label "$LABEL" \
+      --network "$NET" alpine:3.20 wget -T 5 -qO- \
+      "http://victorialogs:9428/select/logsql/query?query=%22${marker}%22%20%7C%20limit%201000") || return 1
     count=$(printf '%s\n' "$response" | grep -c "\"_msg\":\"$marker " || true)
     complete=1
     for level in DEBUG1 LOG INFO NOTICE WARNING; do
@@ -445,11 +488,12 @@ docker logs "$HTTP_PG"
 docker logs "$TCP_PG"
 ```
 
-Remove only the isolated stand, its anonymous PostgreSQL volumes and the
-downloaded runtime:
+Exit this dedicated Bash session to invoke the armed cleanup. It removes only
+run-labeled container IDs (including anonymous PostgreSQL volumes), the owned
+network ID and the unique downloaded-runtime directory. Cleanup also runs on
+failure or interruption; a failed Docker removal is reported, not a reason to
+remove another same-name resource.
 
 ```sh
-docker rm -fv "$HTTP_PG" "$TCP_PG" "$OTEL" "$VL"
-docker network rm "$NET"
-rm -rf "$RUNTIME_DIR"
+exit
 ```

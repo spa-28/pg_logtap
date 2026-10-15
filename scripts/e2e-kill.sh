@@ -16,7 +16,9 @@
 #                        publishing a fabricated event count
 #   corrupt-member     : a damaged counted member (framing intact) is skipped
 #                        by its exact event count; later members still replay
-#   count-metadata     : readable NDJSON outranks a damaged v2 event_count in
+#   gzip-footer        : CRC/ISIZE faults with valid DEFLATE never export;
+#                        v2 uses stored loss/trim counts, v1 stays intact/broken
+#   count-metadata     : verified NDJSON outranks a damaged v2 event_count in
 #                        replay and cap-compaction accounting
 #   soft-worker-restart: the shmem replay cursor prevents re-skip/replay drift
 #                        while the postmaster and its counters stay alive
@@ -26,6 +28,9 @@
 #                        still replay
 #   url-fb-aliasing    : a file:// export_url and the fallback path naming
 #                        one file are rejected at SET, in both directions
+#   reserved-compact   : .compact SET aliases rejected symmetrically; active A
+#                        protects absent path/existing inode while B is deferred,
+#                        including soft boot/cap cleanup and sink canary metadata
 #   symlink-queue      : a symlink at the fallback path is refused — the file
 #                        it names stays intact, fallback_broken=1 + one
 #                        WARNING, events ride the RAM backlog
@@ -326,6 +331,86 @@ done
 ok "all partial v1 headers repaired before append; clean v1 frames and later v1 appends replayed"
 
 
+# Footer faults keep valid DEFLATE: parseability alone must not authorize
+# replay or readable-line accounting. Stored counts deliberately differ.
+write_footer_queue() { # replay | compact | legacy-crc | legacy-isize
+  python3 - "$E2E_TAG" "$E2E_SUF" "$1" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "umask 077; cat > '$FB'"
+import base64, gzip, json, random, struct, sys, zlib
+
+tag, suffix, mode = sys.argv[1:]
+legacy = mode.startswith("legacy-")
+frames = [("footerCRC", 2, "crc"), ("footerISIZE", 3, "isize"), ("footerGood", 1, None)]
+if mode == "compact":
+    frames = [("capFooterFirst", 1, None), ("capFooterCRC", 2, "crc"),
+              ("capFooterISIZE", 3, "isize"), ("capFooterGood", 1, None)]
+elif legacy:
+    frames = [("v1Footer" + mode[7:], 1, mode[7:]), ("v1FooterFollowing" + mode[7:], 1, None)]
+out = bytearray(b"PGLTFB01" if legacy else b"PGLTFB02")
+for i, (marker, stored, fault) in enumerate(frames):
+    row = {"seq": 760000 + i, "message": f"logtap {tag} {marker}{suffix} 0"}
+    if mode == "compact":
+        row["pad"] = base64.b64encode(random.Random(8200 + i).randbytes(600000)).decode()
+    body = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+    compressed = bytearray(gzip.compress(body, mtime=0))
+    assert gzip.decompress(compressed) == body
+    if fault:
+        compressed[-8 if fault == "crc" else -4] ^= 1
+        assert zlib.decompress(compressed[10:-8], -15) == body
+        try:
+            gzip.decompress(compressed)
+        except (OSError, EOFError):
+            pass
+        else:
+            raise AssertionError("mutated footer accepted")
+    out += struct.pack("<I", len(compressed))
+    if not legacy:
+        out += struct.pack("<I", stored)
+    out += compressed
+sys.stdout.buffer.write(out)
+PY
+}
+
+echo "== invalid gzip CRC/ISIZE: exact stored v2 losses, intact following frame =="
+docker exec "$PG_CT" rm -f "$FB"
+write_footer_queue replay || fail "gzip footer replay: fixture failed"
+setguc pg_logtap.level_min 23
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file "$FB_REL"
+docker restart "$PG_CT" >/dev/null; wait_ready
+wait_for footerGood 1
+[ "$(received footerCRC)" = 0 ] && [ "$(received footerISIZE)" = 0 ] \
+  && [ "$(received footerGood)" = 1 ] \
+  || fail "gzip footer replay: corrupt payload exported or intact successor missing"
+[ "$(statf events_queued)" = 6 ] && [ "$(statf events_lost)" = 5 ] \
+  && [ "$(statf events_replayed)" = 1 ] && [ "$(statf events_compacted)" = 0 ] \
+  && [ "$(statf fallback_broken)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$FB")" = 0 ] \
+  || fail "gzip footer replay: stored losses/discards or final backlog wrong"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+ok "CRC/ISIZE faults still inflate but never export; queued=6 lost=5 replayed=1 backlog=0"
+
+echo "== legacy bad gzip footer: retain intact bytes, unknown count breaks queue =="
+for fault in crc isize; do
+  docker exec "$PG_CT" rm -f "$FB"
+  write_footer_queue "legacy-$fault" || fail "v1 footer $fault: fixture failed"
+  footer_before=$(docker exec "$PG_CT" sha256sum "$FB")
+  setguc pg_logtap.export_fallback_file "$FB_REL"
+  docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
+  [ "$(statf fallback_broken)" = 1 ] && [ "$(statf events_lost)" = 0 ] \
+    && [ "$(statf warn_fallback_skipped)" = 0 ] \
+    && [ "$(docker exec "$PG_CT" sha256sum "$FB")" = "$footer_before" ] \
+    && [ "$(received "v1Footer$fault")" = 0 ] \
+    && [ "$(received "v1FooterFollowing$fault")" = 0 ] \
+    || fail "v1 footer $fault: bytes removed/exported or fabricated loss"
+  # Manual disposal of synthetic unknown-count A, only at a full reset.
+  setguc pg_logtap.export_fallback_file ''
+  docker exec "$PG_CT" rm -f "$FB"
+  docker restart "$PG_CT" >/dev/null; wait_ready
+done
+setguc pg_logtap.level_min 15; reload; sleep 1
+ok "both v1 footer faults retained byte-for-byte and broke replay without invented loss"
+
 echo "== legacy corrupt member: stop instead of inventing a count =="
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 write_v1_queue "logtap $E2E_TAG v1bad$E2E_SUF 0" 0 || fail "legacy corrupt member: could not write fixture"
@@ -403,6 +488,8 @@ setguc pg_logtap.export_fallback_file "$FB_REL"
 setguc pg_logtap.fallback_max_mb 1
 docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
 setguc pg_logtap.level_min 15; reload; sleep 1
+# Ordinary unrelated EEXIST litter must still be removed during compaction.
+docker exec -u postgres "$PG_CT" sh -c "printf garbage > '$FB.compact'"
 gen compacttrigger 1
 n=0; while [ "$n" -lt 20 ] && [ "$(statf events_compacted)" -eq 0 ]; do
   n=$((n + 1)); sleep 1
@@ -411,6 +498,8 @@ done
   || fail "count metadata compaction: compacted=$(statf events_compacted), want 30 readable events (not stored 29)"
 [ "$(statf events_lost)" = 30 ] \
   || fail "count metadata compaction: lost=$(statf events_lost), want 30"
+docker exec "$PG_CT" test ! -e "$FB.compact" \
+  || fail "count metadata compaction: ordinary stale temp survived successful rewrite"
 # Dispose of the remaining synthetic oversized fixture at the next testcase's
 # full postmaster reset. An unread active queue cannot be disabled by reload;
 # this manual fixture cleanup is not a delivery/reconfiguration guarantee.
@@ -419,6 +508,53 @@ setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.fallback_max_mb 512; 
 docker exec "$PG_CT" sh -c "rm -f '$FB'"
 ok "cap trim used readable line counts: compacted=lost=30, not corrupt stored total 29"
 
+
+echo "== invalid gzip footer cap trim: stored counts, not unverified lines =="
+FOOTER_SINK="$FB_DIR/logtap-footer-sink.jsonl"
+docker exec "$PG_CT" rm -f "$FB" "$FOOTER_SINK"
+write_footer_queue compact || fail "gzip footer compaction: fixture failed"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB")" -gt 2000000 ] \
+  || fail "gzip footer compaction: fixture too small"
+setguc pg_logtap.level_min 23
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.export_fallback_file "$FB_REL"
+setguc pg_logtap.fallback_max_mb 1
+docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
+# First frame is valid and its dead receiver pins offset at the beginning;
+# the two bad footers are thus undelivered when the cap drops the first three.
+[ "$(statf events_queued)" = 7 ] && [ "$(statf events_lost)" = 0 ] \
+  || fail "gzip footer compaction: boot credit/cursor did not preserve seven stored events"
+setguc pg_logtap.level_min 21; reload; sleep 1
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.level_min')" = 21 ] \
+  || fail "gzip footer compaction: ERROR capture threshold not applied"
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'logtap $E2E_TAG capFooterTrigger$E2E_SUF 0'; END \$\$" >/dev/null 2>&1
+n=0; while [ "$n" -lt 20 ] && [ "$(statf events_compacted)" -eq 0 ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(statf events_compacted)" = 6 ] && [ "$(statf events_lost)" = 6 ] \
+  || fail "gzip footer compaction: want exact stored trim six, not three inflated lines"
+setguc pg_logtap.fallback_max_mb 512
+setguc pg_logtap.export_url "file://$FOOTER_SINK"; reload
+n=0; while [ "$n" -lt 20 ]; do
+  [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+docker cp "$PG_CT:$FOOTER_SINK" "$OUT/footer-sink.jsonl" >/dev/null \
+  || fail "gzip footer compaction: missing positive-control sink"
+[ "$(received capFooterGood "$OUT/footer-sink.jsonl")" = 1 ] \
+  && [ "$(received capFooterTrigger "$OUT/footer-sink.jsonl")" = 1 ] \
+  && [ "$(received capFooterCRC "$OUT/footer-sink.jsonl")" = 0 ] \
+  && [ "$(received capFooterISIZE "$OUT/footer-sink.jsonl")" = 0 ] \
+  && [ "$(received capFooterFirst "$OUT/footer-sink.jsonl")" = 0 ] \
+  && [ "$(statf events_replayed)" = 2 ] && [ "$(statf events_queued)" = 8 ] \
+  && [ "$(statf fallback_broken)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$FB")" = 0 ] \
+  || fail "gzip footer compaction: successor/trigger delivery, stored accounting or drain wrong"
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$FOOTER_SINK"
+ok "CRC/ISIZE-invalid frames trimmed by stored counts: queued=8 compacted=lost=6 replayed=2 backlog=0"
 
 # This cursor test deliberately waits 30s between bounded replays. Scrapes
 # are served at cycle boundaries, not by a separate listener/latch, so allow
@@ -830,6 +966,158 @@ docker exec "$PG_CT" psql -U postgres -Atc "SHOW pg_logtap.export_url" | grep -q
   || fail "aliasing: rejected ALTER SYSTEM still changed the url GUC"
 ok "file:// url == fallback path rejected in both directions, a distinct pair accepted"
 
+echo "== reserved .compact pathname: symmetric SET guards, relative fallback =="
+RES_REL=logtap-reserved.bin
+RES_Q="$FB_DIR/$RES_REL"
+RES_DISTINCT="$FB_DIR/logtap-reserved-distinct.jsonl"
+setguc pg_logtap.level_min 23; reload; sleep 1
+for raw in "$RES_Q" "$RES_REL"; do
+  setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+  setguc pg_logtap.export_fallback_file "$raw"; reload; sleep 1
+  if setguc pg_logtap.export_url "file://$RES_Q.compact" 2>/dev/null; then
+    fail "reserved SET: .compact sink accepted with fallback '$raw'"
+  fi
+  [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_url')" = "http://$VEC:8686" ] \
+    || fail "reserved SET: rejected sink changed active GUC"
+  setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+  setguc pg_logtap.export_url "file://$RES_Q.compact"; reload; sleep 1
+  if setguc pg_logtap.export_fallback_file "$raw" 2>/dev/null; then
+    fail "reserved SET: fallback '$raw' accepted with .compact sink"
+  fi
+  [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_fallback_file')" = '' ] \
+    || fail "reserved SET: rejected fallback changed active GUC"
+  setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 1
+  docker exec "$PG_CT" rm -f "$RES_Q.compact"
+done
+# The distinct sink control must accept both GUCs and really deliver.
+setguc pg_logtap.export_fallback_file "$RES_REL"; reload; sleep 1
+setguc pg_logtap.export_url "file://$RES_DISTINCT"; reload; sleep 1
+setguc pg_logtap.level_min 15; reload; sleep 1
+gen reservedDistinct 1; sleep 2
+docker cp "$PG_CT:$RES_DISTINCT" "$OUT/reserved-distinct.jsonl" >/dev/null \
+  || fail "reserved SET: distinct control sink missing"
+[ "$(received reservedDistinct "$OUT/reserved-distinct.jsonl")" = 1 ] \
+  || fail "reserved SET: distinct pair accepted but did not deliver"
+setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.export_fallback_file ''; reload; sleep 1
+docker exec "$PG_CT" rm -f "$RES_Q" "$RES_DISTINCT"
+ok "absolute/relative .compact aliases rejected in both directions; distinct pair delivered"
+
+echo "== active A/deferred B: reserved absent path, inode canary, boot and cap refusal =="
+RES_A="$FB_DIR/logtap-reserved-active.bin"
+RES_B="$FB_DIR/logtap-reserved-configured.bin"
+RES_TMP="$RES_A.compact"
+docker exec "$PG_CT" rm -f "$RES_A" "$RES_B" "$RES_TMP" "$RES_DISTINCT"
+python3 - "$E2E_TAG" "$E2E_SUF" <<'PY' | docker exec -i -u postgres "$PG_CT" sh -c "umask 077; cat > '$RES_A'"
+import base64, gzip, json, random, struct, sys
+
+tag, suffix = sys.argv[1:]
+out = bytearray(b"PGLTFB02")
+for i in range(4):
+    row = {"seq": 770000 + i, "message": f"logtap {tag} reservedA{suffix} {i}",
+           "pad": base64.b64encode(random.Random(8300 + i).randbytes(600000)).decode()}
+    compressed = gzip.compress((json.dumps(row, separators=(",", ":")) + "\n").encode(), mtime=0)
+    out += struct.pack("<II", len(compressed), 1) + compressed
+sys.stdout.buffer.write(out)
+PY
+docker exec -u postgres "$PG_CT" sh -c "umask 077; printf PGLTFB02 > '$RES_B'" \
+  || fail "active reserved: could not create distinct configured B"
+setguc pg_logtap.level_min 23
+setguc pg_logtap.export_url 'http://127.0.0.1:1'
+setguc pg_logtap.fallback_max_mb 1
+setguc pg_logtap.export_fallback_file "$RES_A"
+docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
+[ "$(statf events_queued)" = 4 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$RES_A")" -gt 2000000 ] \
+  || fail "active reserved: initial A credit or cap fixture wrong"
+setguc pg_logtap.level_min 21; reload; sleep 1
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.level_min')" = 21 ] \
+  || fail "active reserved: ERROR capture threshold not applied"
+a_inode=$(docker exec "$PG_CT" stat -c '%d:%i' "$RES_A")
+b_before=$(docker exec "$PG_CT" sha256sum "$RES_B")
+setguc pg_logtap.export_fallback_file "$RES_B"; reload; sleep 2
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_fallback_file')" = "$RES_B" ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 4 ] \
+  || fail "active reserved: B was not configured/deferred behind unread A"
+# Configured B permits this URL at SET. Active A still reserves the absent
+# pathname: neither sendFile's O_CREAT nor compact's first open may create it.
+setguc pg_logtap.export_url "file://$RES_TMP"; reload; sleep 1
+failed0=$(statf send_cycles_failed)
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'logtap $E2E_TAG reservedTrigger$E2E_SUF 0'; END \$\$" >/dev/null 2>&1
+sleep 2
+[ "$(statf send_cycles_failed)" -gt "$failed0" ] && [ "$(statf events_queued)" = 5 ] \
+  && [ "$(statf events_compacted)" = 0 ] && [ "$(statf events_lost)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%d:%i' "$RES_A")" = "$a_inode" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_B")" = "$b_before" ] \
+  || fail "active reserved: first temp open rewrote A, adopted B, or did not refuse sink"
+docker exec "$PG_CT" test ! -e "$RES_TMP" \
+  || fail "active reserved: absent reserved path was created by sink/compaction"
+# An existing single-link regular canary with alternate /./ spelling must
+# refuse before chmod, unlink, rewrite or sink IO. Keep ctime/mtime as well
+# as bytes, inode, ownership, mode, links and size (atime is read-dependent).
+docker exec -u postgres "$PG_CT" sh -c "printf 'RESERVED-CANARY\n' > '$RES_TMP'; chmod 0644 '$RES_TMP'" \
+  || fail "active reserved: could not create existing single-link canary"
+canary_before=$(docker exec "$PG_CT" sha256sum "$RES_TMP") \
+  || fail "active reserved: canary bytes unavailable"
+canary_meta=$(docker exec "$PG_CT" stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "$RES_TMP") \
+  || fail "active reserved: canary inode/metadata unavailable"
+setguc pg_logtap.export_url "file://$FB_DIR/./logtap-reserved-active.bin.compact"; reload; sleep 1
+a_before=$(docker exec "$PG_CT" sha256sum "$RES_A")
+postmaster0=$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')
+wpid=$(worker_pid); [ -n "$wpid" ] || fail "active reserved: worker missing"
+docker exec "$PG_CT" kill -TERM "$wpid"
+n=0; new_wpid=$wpid
+while [ "$n" -lt 20 ] && { [ -z "$new_wpid" ] || [ "$new_wpid" = "$wpid" ]; }; do
+  n=$((n + 1)); sleep 1; new_wpid=$(worker_pid)
+done
+[ -n "$new_wpid" ] && [ "$new_wpid" != "$wpid" ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT pg_postmaster_start_time()')" = "$postmaster0" ] \
+  || fail "active reserved: replacement was not a soft worker restart"
+sleep 2
+[ "$(docker exec "$PG_CT" sha256sum "$RES_A")" = "$a_before" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_B")" = "$b_before" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_TMP")" = "$canary_before" ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "$RES_TMP")" = "$canary_meta" ] \
+  && [ "$(statf events_queued)" = 5 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 5 ] \
+  || fail "active reserved: boot removed/touched canary or adopted/recredited B"
+# Force another over-cap append with existing temp; cleanup/rewrite must
+# refuse the aliased inode while retaining every original valid frame.
+docker exec "$PG_CT" psql -U postgres -qc "DO \$\$ BEGIN RAISE EXCEPTION 'logtap $E2E_TAG reservedTrigger$E2E_SUF 1'; END \$\$" >/dev/null 2>&1
+sleep 2
+[ "$(statf events_queued)" = 6 ] && [ "$(statf events_compacted)" = 0 ] \
+  && [ "$(statf events_lost)" = 0 ] && [ "$(statf fallback_broken)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%d:%i' "$RES_A")" = "$a_inode" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_B")" = "$b_before" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_TMP")" = "$canary_before" ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "$RES_TMP")" = "$canary_meta" ] \
+  || fail "active reserved: existing-temp collision damaged A/B/canary or drifted accounting"
+# Distinct sink heals the refusal and delivers A, not B. The canary remains
+# present; ordinary stale-temp cleanup is separately exercised above/below.
+setguc pg_logtap.fallback_max_mb 512
+setguc pg_logtap.export_url "file://$RES_DISTINCT"; reload
+n=0; while [ "$n" -lt 20 ]; do
+  [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] && break
+  n=$((n + 1)); sleep 1
+done
+docker cp "$PG_CT:$RES_DISTINCT" "$OUT/reserved-active.jsonl" >/dev/null \
+  || fail "active reserved: distinct recovery sink missing"
+[ "$(received reservedA "$OUT/reserved-active.jsonl")" = 4 ] \
+  && [ "$(received reservedTrigger "$OUT/reserved-active.jsonl")" = 2 ] \
+  && [ "$(seqs_of reservedA "$OUT/reserved-active.jsonl" | sort | uniq -d | wc -l)" = 0 ] \
+  && [ "$(statf events_replayed)" = 6 ] && [ "$(statf events_lost)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$RES_A")" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_B")" = "$b_before" ] \
+  && [ "$(docker exec "$PG_CT" sha256sum "$RES_TMP")" = "$canary_before" ] \
+  && [ "$(docker exec "$PG_CT" stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "$RES_TMP")" = "$canary_meta" ] \
+  || fail "active reserved: distinct recovery lost frames/adopted B/touched canary"
+# Only an explicit repeat HUP after drain may change the active choice.
+setguc pg_logtap.export_fallback_file ''; setguc pg_logtap.export_url "http://$VEC:8686"
+setguc pg_logtap.level_min 15; reload; sleep 1
+docker exec "$PG_CT" rm -f "$RES_A" "$RES_B" "$RES_TMP" "$RES_DISTINCT"
+ok "active A survived deferred B, absent-name/canary collisions and soft boot; distinct sink replayed all six once"
+
 echo "== unparseable network url: rejected at ALTER SYSTEM, not first at send time =="
 # checkUrl runs parseUrl: a control byte or a space in the host/path rides
 # the HTTP request line verbatim, so it must fail ALTER SYSTEM loudly —
@@ -1068,9 +1356,9 @@ docker restart "$PG_CT" >/dev/null; wait_ready
 ok "control-byte message at message_max=1MB: parked, replayed 1/1, nothing skipped or lost"
 
 echo "== file:// final symlink -> queue: sink security and queue alias guards refuse =="
-# The sink now fails O_NOFOLLOW before its inode-alias guard. The regular,
-# single-link queue still needs its mirror alias guard: its peer names this
-# same inode through the symlink. Both files must remain empty/private.
+# The sink's pre-open alias guard refuses before O_NOFOLLOW or chmod. The
+# regular single-link queue still needs its mirror alias guard: its peer names
+# this same inode through the symlink. Both files must remain empty/private.
 FB2_REL=pg_logtap-fallback2.bin
 FB2="$FB_DIR/$FB2_REL"
 docker exec "$PG_CT" sh -c "rm -f '$FB2' '$FB_DIR/logtap-sink-alias.bin'; ln -s '$FB2_REL' '$FB_DIR/logtap-sink-alias.bin'"
@@ -1258,6 +1546,74 @@ setguc pg_logtap.export_url "http://$VEC:8686"; reload; sleep 2
 wait_for stop1 300
 [ "$(received stop1)" = 300 ] || fail "postmaster stop: queue lost across graceful stop (stop1=$(received stop1)/300)"
 ok "graceful stop in ${stop_s}s (bounded), queue carried 300/300 across the shutdown"
+
+echo "== postmaster graceful stop: all 6000 pre-entry ring events survive =="
+# Unlike worker-only TERM, a full stop destroys shmem. The first 4096-event
+# drain alone cannot preserve this accepted burst; final parking must finish it.
+ring_capacity0=$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.ring_capacity')
+level_min0=$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.level_min')
+setguc pg_logtap.ring_capacity 8192
+setguc pg_logtap.level_min 19 # WARNING-only: no reload/shutdown LOG inflow
+setguc pg_logtap.export_url 'tcp://127.0.0.1:1'
+setguc pg_logtap.export_fallback_file "$FB_REL"
+docker restart "$PG_CT" >/dev/null; wait_ready
+[ "$(statf ring_capacity)" = 8192 ] && [ "$(statf ring_events)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  || fail "final ring: requires empty ring and fallback"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "final ring: fallback contains old members"
+wpid=$(worker_pid); [ -n "$wpid" ] || fail "final ring: worker missing"
+docker exec "$PG_CT" kill -STOP "$wpid"
+trap 'docker exec "$PG_CT" kill -CONT "$wpid" >/dev/null 2>&1' EXIT
+trap 'exit 1' INT TERM
+docker exec "$PG_CT" grep -q 'T (stopped)' "/proc/$wpid/status" \
+  || fail "final ring: stopped worker not confirmed"
+cap0=$(statf events_captured); drp0=$(statf events_dropped)
+gen finalring 6000
+[ "$(statf ring_events)" = 6000 ] && [ "$(( $(statf events_captured) - cap0 ))" = 6000 ] \
+  && [ "$(statf events_dropped)" = "$drp0" ] \
+  || fail "final ring: 6000 markers were not accepted without capture drops"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB" 2>/dev/null || echo 0)" = 0 ] \
+  || fail "final ring: markers parked before full stop"
+PG_BINDIR=$(docker exec "$PG_CT" pg_config --bindir)
+start_s=$(date +%s)
+# pg_ctl's timeout only stops waiting; it never escalates to SIGKILL. Docker
+# stop's force-kill timeout would make a failed shutdown look like success.
+docker exec -u postgres "$PG_CT" "$PG_BINDIR/pg_ctl" -D "$FB_DIR" -m fast -w -t 40 stop \
+  >"$OUT/final-ring-stop.log" 2>&1 &
+stop_pid=$!
+sleep 1
+[ "$(docker inspect -f '{{.State.Running}}' "$PG_CT")" = true ] \
+  || fail "final ring: postmaster exited before stopped worker resumed"
+docker exec "$PG_CT" kill -CONT "$wpid"
+trap - EXIT INT TERM
+n=0
+while [ "$n" -lt 40 ] && [ "$(docker inspect -f '{{.State.Running}}' "$PG_CT")" = true ]; do
+  n=$((n + 1)); sleep 1
+done
+[ "$(docker inspect -f '{{.State.Running}}' "$PG_CT")" = false ] \
+  || fail "final ring: graceful shutdown timed out (not force-killed)"
+wait "$stop_pid" || : # Docker may disconnect exec when PID 1 exits cleanly.
+stop_s=$(( $(date +%s) - start_s ))
+[ "$(docker inspect -f '{{.State.ExitCode}}:{{.State.OOMKilled}}' "$PG_CT")" = '0:false' ] \
+  || fail "final ring: shutdown was not a clean postmaster exit"
+docker logs --since "${start_s}" "$PG_CT" >"$OUT/final-ring-shutdown.log" 2>&1
+grep -q 'database system is shut down' "$OUT/final-ring-shutdown.log" \
+  || fail "final ring: graceful shutdown witness missing"
+docker cp "$PG_CT:$FB" "$OUT/final-ring-parked.bin" >/dev/null \
+  || fail "final ring: parked queue missing after full stop"
+docker start "$PG_CT" >/dev/null; wait_ready
+setguc pg_logtap.export_url "http://$VEC:8686"; reload
+wait_for finalring 6000 "" 40
+[ "$(received finalring)" = 6000 ] && [ "$(seqs_of finalring | sort | uniq -d | wc -l)" = 0 ] \
+  && [ "$(statf events_lost)" = 0 ] && [ "$(statf events_dropped)" = 0 ] \
+  && [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SELECT queue_backlog FROM pg_logtap_delivery')" = 0 ] \
+  && [ "$(docker exec "$PG_CT" stat -c %s "$FB")" = 0 ] \
+  || fail "final ring: accepted pre-stop markers missing/duplicated or replay accounting drifted"
+setguc pg_logtap.ring_capacity "$ring_capacity0"
+setguc pg_logtap.level_min "$level_min0"
+docker restart "$PG_CT" >/dev/null; wait_ready
+ok "full graceful stop ${stop_s}s, no forced kill: 6000/6000 replayed once, backlog/lost/dropped=0"
 
 echo "== dns_fail_streak gauge: unresolvable host, then recovery =="
 setguc pg_logtap.export_fallback_file '' # this scenario is about dns, not the queue

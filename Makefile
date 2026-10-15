@@ -25,6 +25,7 @@ build:
 # the library compile — `zig build test` only builds the test module, and
 # broken src/ has passed it before.
 check:
+	python3 scripts/harness-selftest.py
 	zig build fmt lint test --summary all
 	zig build --summary all
 

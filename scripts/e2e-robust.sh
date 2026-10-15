@@ -33,8 +33,198 @@
 # Usage: scripts/e2e-robust.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
+#
+# Isolated auth-DETAIL entry (never part of the normal suite):
+#   PG_LOGTAP_AUTH_PROBE=run scripts/e2e-robust.sh
+# Required: LT_AUTH_PG_CONTAINER, LT_AUTH_EXPECTED_ID, LT_AUTH_LABEL_KEY,
+# LT_AUTH_LABEL_VALUE, LT_AUTH_ADMIN_USER, LT_AUTH_DB, LT_AUTH_CONNECT_HOST,
+# LT_AUTH_CONNECT_PORT, LT_AUTH_USER, LT_AUTH_BAD_PASSWORD, LT_AUTH_REASON,
+# LT_AUTH_HBA_TOKEN, LT_AUTH_CONTROL, and LT_AUTH_EXPORT_FILE. The controller
+# supplies a disposable PG/HBA fixture; this script verifies its ID and label
+# before it issues any command. LT_AUTH_HBA_TOKEN must occur only in the
+# matched server HBA DETAIL, not the authentication message. `PG_LOGTAP_AUTH_PROBE=assert`
+# only validates a captured export file and is useful for the parser smoke, not integration proof.
 set -u
+# e2e-common's fail helper prints E2E_TAG; the guarded modes intentionally
+# bypass e2e_init, so give their preflight failures their own tag.
+[ -z "${PG_LOGTAP_AUTH_PROBE:-}" ] || E2E_TAG=auth-detail
 . "$(dirname "$0")/e2e-common.sh"
+
+auth_require_assert_env() {
+  [ -n "${LT_AUTH_EXPORT_FILE:-}" ] || fail "auth DETAIL probe: LT_AUTH_EXPORT_FILE is required"
+  [ -n "${LT_AUTH_REASON:-}" ] || fail "auth DETAIL probe: LT_AUTH_REASON is required"
+  [ -n "${LT_AUTH_HBA_TOKEN:-}" ] || fail "auth DETAIL probe: LT_AUTH_HBA_TOKEN is required"
+  [ -r "$LT_AUTH_EXPORT_FILE" ] || fail "auth DETAIL probe: export file is unreadable"
+}
+
+auth_assert_export() {
+  python3 - "$LT_AUTH_EXPORT_FILE" "$LT_AUTH_REASON" "$LT_AUTH_HBA_TOKEN" <<'EOF'
+import json, sys
+path, reason, token = sys.argv[1:]
+for line in open(path, encoding="utf-8"):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:  # receiver may be appending its final line
+        continue
+    message = event.get("message") or ""
+    detail = event.get("detail")
+    other_fields = (message, event.get("hint") or "", event.get("context") or "", event.get("query") or "")
+    if reason in message and isinstance(detail, str) and token in detail and all(token not in field for field in other_fields):
+        print("auth DETAIL export found")
+        break
+else:
+    raise SystemExit("no failed-auth export with the HBA token only in effective DETAIL")
+EOF
+}
+
+auth_count_export() {
+  python3 - "$LT_AUTH_EXPORT_FILE" "$LT_AUTH_REASON" "$LT_AUTH_HBA_TOKEN" <<'EOF'
+import json, sys
+path, reason, token = sys.argv[1:]
+count = 0
+for line in open(path, encoding="utf-8"):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    message = event.get("message") or ""
+    detail = event.get("detail")
+    other_fields = (message, event.get("hint") or "", event.get("context") or "", event.get("query") or "")
+    if reason in message and isinstance(detail, str) and token in detail and all(token not in field for field in other_fields):
+        count += 1
+print(count)
+EOF
+}
+
+auth_wait_export() {
+  n=0
+  while [ "$n" -lt 20 ]; do
+    auth_assert_export >/dev/null 2>&1 && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "auth DETAIL probe: failed-auth event never reached export"
+}
+
+auth_count_control() {
+  python3 - "$LT_AUTH_EXPORT_FILE" "$LT_AUTH_CONTROL" <<'EOF'
+import json, sys
+path, control = sys.argv[1:]
+count = 0
+for line in open(path, encoding="utf-8"):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if control in (event.get("message") or ""):
+        count += 1
+print(count)
+EOF
+}
+
+auth_wait_control() {
+  auth_control_before=$1
+  n=0
+  while [ "$n" -lt 20 ]; do
+    auth_control_after=$(auth_count_control)
+    case "$auth_control_after" in ''|*[!0-9]*) fail "auth DETAIL probe: invalid control-event count" ;; esac
+    [ "$auth_control_after" -gt "$auth_control_before" ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  fail "auth DETAIL probe: post-exclusion control event never reached export"
+}
+
+auth_admin() {
+  docker exec "$auth_target" psql -X -U "$LT_AUTH_ADMIN_USER" -d "$LT_AUTH_DB" -v ON_ERROR_STOP=1 "$@"
+}
+
+auth_restore_exclude() {
+  [ "${auth_exclude_armed:-0}" = 1 ] || return 0
+  auth_admin -qc "ALTER SYSTEM RESET pg_logtap.pattern_exclude" >/dev/null &&
+    auth_admin -qc "SELECT pg_reload_conf()" >/dev/null || return 1
+  auth_exclude_armed=0
+}
+
+auth_preflight_fail() {
+  printf '%s\n' "e2e-$E2E_TAG: FAILED: $*" >&2
+  exit 1
+}
+
+auth_check_owner() {
+  auth_id=$(docker inspect -f '{{.Id}}' "$LT_AUTH_PG_CONTAINER") || auth_preflight_fail "auth DETAIL probe: cannot inspect supplied PG container"
+  [ "$auth_id" = "$LT_AUTH_EXPECTED_ID" ] || auth_preflight_fail "auth DETAIL probe: supplied PG container ID does not match"
+  auth_target=$auth_id
+  case "$LT_AUTH_LABEL_KEY" in ''|*[!A-Za-z0-9_.-]*) auth_preflight_fail "auth DETAIL probe: invalid label key" ;; esac
+  auth_label=$(docker inspect -f "{{index .Config.Labels \"$LT_AUTH_LABEL_KEY\"}}" "$auth_target") || auth_preflight_fail "auth DETAIL probe: cannot read supplied PG label"
+  [ "$auth_label" = "$LT_AUTH_LABEL_VALUE" ] || auth_preflight_fail "auth DETAIL probe: supplied PG container label does not match"
+  [ "$(docker inspect -f '{{.State.Running}}' "$auth_target")" = true ] || auth_preflight_fail "auth DETAIL probe: supplied PG container is not running"
+  E2E_CT=$auth_target
+}
+
+auth_bad_login() {
+  if docker exec -e "PGPASSWORD=$LT_AUTH_BAD_PASSWORD" "$auth_target" \
+    psql -X -w -h "$LT_AUTH_CONNECT_HOST" -p "$LT_AUTH_CONNECT_PORT" -U "$LT_AUTH_USER" -d "$LT_AUTH_DB" -qc 'SELECT 1' >/dev/null 2>&1; then
+    fail "auth DETAIL probe: bad-password login unexpectedly succeeded"
+  fi
+}
+
+auth_detail_probe() {
+  auth_require_assert_env
+  [ -n "${LT_AUTH_PG_CONTAINER:-}" ] || fail "auth DETAIL probe: LT_AUTH_PG_CONTAINER is required"
+  [ -n "${LT_AUTH_EXPECTED_ID:-}" ] || fail "auth DETAIL probe: LT_AUTH_EXPECTED_ID is required"
+  [ -n "${LT_AUTH_LABEL_KEY:-}" ] || fail "auth DETAIL probe: LT_AUTH_LABEL_KEY is required"
+  [ -n "${LT_AUTH_LABEL_VALUE:-}" ] || fail "auth DETAIL probe: LT_AUTH_LABEL_VALUE is required"
+  [ -n "${LT_AUTH_ADMIN_USER:-}" ] || fail "auth DETAIL probe: LT_AUTH_ADMIN_USER is required"
+  [ -n "${LT_AUTH_DB:-}" ] || fail "auth DETAIL probe: LT_AUTH_DB is required"
+  [ -n "${LT_AUTH_CONNECT_HOST:-}" ] || fail "auth DETAIL probe: LT_AUTH_CONNECT_HOST is required"
+  [ -n "${LT_AUTH_CONNECT_PORT:-}" ] || fail "auth DETAIL probe: LT_AUTH_CONNECT_PORT is required"
+  [ -n "${LT_AUTH_USER:-}" ] || fail "auth DETAIL probe: LT_AUTH_USER is required"
+  [ -n "${LT_AUTH_BAD_PASSWORD:-}" ] || fail "auth DETAIL probe: LT_AUTH_BAD_PASSWORD is required"
+  [ -n "${LT_AUTH_CONTROL:-}" ] || fail "auth DETAIL probe: LT_AUTH_CONTROL is required"
+  case "$LT_AUTH_HBA_TOKEN" in ''|*[!A-Za-z0-9_]*) fail "auth DETAIL probe: HBA token must be a literal-safe unique token" ;; esac
+  case "$LT_AUTH_CONTROL" in ''|*[!A-Za-z0-9_]*) fail "auth DETAIL probe: control must be a literal-safe unique token" ;; esac
+  case "$LT_AUTH_CONTROL" in *"$LT_AUTH_HBA_TOKEN"*) fail "auth DETAIL probe: control must not contain the excluded HBA token" ;; esac
+  case "$LT_AUTH_CONNECT_PORT" in ''|*[!0-9]*) fail "auth DETAIL probe: port must be numeric" ;; esac
+
+  auth_check_owner
+  [ "$(auth_admin -Atc 'SHOW pg_logtap.pattern_exclude')" = "" ] || fail "auth DETAIL probe: fixture must start with empty pattern_exclude"
+  auth_exclude_armed=0
+  trap 'auth_restore_exclude' 0
+  auth_initial=$(auth_count_export)
+  [ "$auth_initial" = 0 ] || fail "auth DETAIL probe: export already contains this unique HBA token"
+  auth_control_initial=$(auth_count_control)
+  case "$auth_control_initial" in ''|*[!0-9]*) fail "auth DETAIL probe: invalid control-event count" ;; esac
+  [ "$auth_control_initial" = 0 ] || fail "auth DETAIL probe: export already contains this unique control marker"
+
+  auth_bad_login
+  auth_wait_export
+  auth_before=$(auth_count_export)
+  case "$auth_before" in ''|*[!0-9]*) fail "auth DETAIL probe: invalid exported-event count" ;; esac
+  [ "$auth_before" -gt "$auth_initial" ] || fail "auth DETAIL probe: no exported failed-auth event"
+
+  auth_admin -qc "ALTER SYSTEM SET pg_logtap.pattern_exclude TO '$LT_AUTH_HBA_TOKEN'" >/dev/null || fail "auth DETAIL probe: cannot set pattern_exclude"
+  auth_exclude_armed=1
+  auth_admin -qc 'SELECT pg_reload_conf()' >/dev/null || fail "auth DETAIL probe: cannot reload pattern_exclude"
+  sleep 1
+  [ "$(auth_admin -Atc 'SHOW pg_logtap.pattern_exclude')" = "$LT_AUTH_HBA_TOKEN" ] || fail "auth DETAIL probe: pattern_exclude did not take effect"
+
+  auth_bad_login
+  auth_admin -qc "DO \$\$ BEGIN RAISE WARNING '$LT_AUTH_CONTROL'; END \$\$" >/dev/null || fail "auth DETAIL probe: cannot emit control event"
+  auth_wait_control "$auth_control_initial"
+  auth_after=$(auth_count_export)
+  [ "$auth_after" = "$auth_before" ] || fail "auth DETAIL probe: pattern_exclude did not suppress the failed-auth DETAIL event"
+
+  auth_restore_exclude || fail "auth DETAIL probe: cannot reset pattern_exclude"
+  trap - 0
+  ok "failed-auth reason/effective HBA DETAIL exported, then suppressed by pattern_exclude"
+}
+
+case "${PG_LOGTAP_AUTH_PROBE:-}" in
+  '') ;;
+  assert) auth_require_assert_env && auth_assert_export; exit $? ;;
+  run) auth_detail_probe; exit $? ;;
+  *) printf '%s\n' "PG_LOGTAP_AUTH_PROBE must be run or assert" >&2; exit 2 ;;
+esac
+
 e2e_init robust "${1:-}"
 e2e_gate
 
@@ -239,11 +429,11 @@ for line in open(path, encoding="utf-8"):
         assert len(d.encode()) <= 256 and "<REDACTED>" in d, len(d.encode())
         both = True
     if m.startswith("logtap robust redor" + suf):
-        # the value cut clipped in layer one, the regex layer did not: the
-        # clip flag must survive the layer that came after it
+        # The mandatory value cut clipped before the active regex: fail closed
+        # to the complete marker, which fits the DETAIL slot unchanged.
         d = e.get("detail") or ""
-        assert "detail" in e["redacted"], e
-        assert d.startswith("password = <REDACTED>"), repr(d)
+        assert "detail" in e["redacted"] and "detail" not in e["truncated"], e
+        assert d == "<REDACTED>", repr(d)
         orflag = True
 assert clip and both and orflag, "probes missing (clip=%s both=%s or=%s)" % (clip, both, orflag)
 EOF
@@ -251,6 +441,53 @@ ok "redaction clip and slot overflow reported separately (redacted vs truncated)
 docker exec "$PG_CT" psql -U postgres -qc "DROP ROLE IF EXISTS \"tmp_red$SUF\"" >/dev/null 2>&1
 setguc log_min_duration_statement -1; setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload
 ok "statement passwords cut (message and query), benign message word verbatim, redact_pattern masked"
+
+echo "== prepared EXECUTE DETAIL uses the server logging field =="
+# Keep one connection for PREPARE/EXECUTE. PostgreSQL suppresses a duplicate
+# duration query when log_statement already emitted it, so run one EXECUTE
+# through each logging path. No query field or regex may hide a tail-cut failure.
+setguc pg_logtap.field_query off; setguc pg_logtap.redact_pattern ''; reload; sleep 1
+probe="logtap_mask_probe$SUF"
+docker exec -i "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 >/dev/null <<EOF
+SET log_statement = 'all';
+SET log_min_duration_statement = -1;
+PREPARE "$probe" AS SELECT 'logtap-prepare-probe$SUF password=SECRET-canary-$SUF'::text;
+EXECUTE "$probe";
+SET log_statement = 'none';
+SET log_min_duration_statement = 0;
+EXECUTE "$probe";
+DEALLOCATE "$probe";
+EOF
+n=0; while [ "$n" -lt 20 ]; do
+  [ "$(tail -c 50000000 "$OUT/vector-out.jsonl" 2>/dev/null | grep -F -c "$probe")" -ge 2 ] && break
+  n=$((n + 1)); sleep 1
+done
+python3 - "$OUT/vector-out.jsonl" "$SUF" <<'EOF' || fail "prepared EXECUTE DETAIL: contract"
+import json, sys
+path, suf = sys.argv[1], sys.argv[2]
+probe = "logtap_mask_probe" + suf
+secret = "SECRET-canary-" + suf
+whole = open(path, encoding="utf-8").read()
+assert secret not in whole, "canary reached exported data"
+statement = duration = detail = False
+for line in whole.splitlines():
+    event = json.loads(line)
+    message = event.get("message") or ""
+    if "EXECUTE" not in message or probe not in message:
+        continue
+    if message.startswith("statement:"):
+        statement = True
+    if message.startswith("duration:") and "statement:" in message:
+        duration = True
+    if "detail" in event and event["detail"] is not None:
+        assert "<REDACTED>" in event["detail"], event["detail"]
+        detail = True
+assert statement and duration and detail, (
+    "missing EXECUTE evidence (statement=%s duration=%s detail=%s)" %
+    (statement, duration, detail)
+)
+EOF
+ok "same-session PREPARE/EXECUTE keeps effective DETAIL present and masked for statement and duration logs"
 
 echo "== regex GUCs: invalid replacements preserve active expressions =="
 raw_count() { grep -F -c "$1" "$OUT/vector-out.jsonl" 2>/dev/null || true; }
@@ -551,7 +788,7 @@ docker logs "$PG_CT" 2>&1 | grep -q "database system was interrupted" \
 gen panic3 50; wait_for panic3 50
 [ "$(received panic3)" = 50 ] || fail "backend-kill: post-restart delivery loss (panic3=$(received panic3)/50)"
 json_check panic3 >/dev/null || fail "backend-kill: garbage escaped the torn slot (invalid JSON)"
-dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+dups=$(duplicate_seqs)
 [ "$dups" = 0 ] || fail "backend-kill: $dups duplicate seqs across the restart"
 postmin=$(seqs_of panic3 | sort -n | head -1)
 [ "$postmin" -gt "$premax" ] || fail "backend-kill: seq went backwards across the restart ($postmin ≤ $premax)"
@@ -665,12 +902,27 @@ echo "== fragmented HTTP status: the line straddles recvs =="
 FRAG=pglogtap-frag-sink-$PG_CT # per container: parallel majors each rm -f it
 docker rm -f "$FRAG" >/dev/null 2>&1
 docker run -d --rm --name "$FRAG" --network "$NET" python:3-alpine python -u -c '
-import socket, time
+import re, socket, time
 srv = socket.socket()
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("0.0.0.0", 8687)); srv.listen(64)
 seen = set()
 total = 0
+statuses = {
+    b"/status/200": b"HTTP/1.1 200 OK\r\n",
+    b"/status/203": b"HTTP/1.1 203 Non-Authoritative Information\r\n",
+    b"/status/204": b"HTTP/1.1 204 No Content\r\n",
+    b"/status/299": b"HTTP/1.1 299 Custom\r\n",
+    b"/status/199": b"HTTP/1.1 199 Old\r\n",
+    b"/status/300": b"HTTP/1.1 300 Multiple\r\n",
+    b"/status/401": b"HTTP/1.1 401 Unauthorized\r\n",
+    b"/status/500": b"HTTP/1.1 500 Error\r\n",
+    b"/status/2xx": b"HTTP/1.1 2xx Bad\r\n",
+    b"/status/20x": b"HTTP/1.1 20x Bad\r\n",
+    b"/status/version": b"HTTP/2.0 200 Bad\r\n",
+    b"/status/separator": b"HTTP/1.1-200 Bad\r\n",
+    b"/status/2000": b"HTTP/1.1 2000 Bad\r\n",
+}
 while True:
     conn, _ = srv.accept()
     try:
@@ -691,12 +943,28 @@ while True:
                 if not d:
                     break
                 body += d
-            conn.sendall(b"HTTP/1.")  # 7 bytes: below the 12 a status line needs
-            time.sleep(0.3)           # two recvs for sure, still inside send timeout
-            conn.sendall(b"1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            target = hdr.split(b"\r\n", 1)[0].split(b" ")[1]
+            if target == b"/frag":
+                conn.sendall(b"HTTP/1.")  # 7 bytes: below the 12 a status line needs
+                time.sleep(0.3)           # two recvs for sure, still inside send timeout
+                conn.sendall(b"1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            elif target == b"/status/203frag":
+                conn.sendall(b"HTTP/1.1 203 Non-")
+                time.sleep(0.3)
+                conn.sendall(b"Authoritative Information\r\nContent-Length: 0\r\n\r\n")
+            elif target == b"/status/incomplete":
+                conn.sendall(b"HTTP/1.1 200")
+            elif target == b"/status/long":
+                conn.sendall(b"HTTP/1.1 200 " + b"x" * 256 + b"\r\nContent-Length: 0\r\n\r\n")
+            else:
+                conn.sendall(statuses[target] + b"Content-Length: 0\r\n\r\n")
             lines = [l for l in body.splitlines() if b"logtap robust" in l]
             total += len(lines)
             seen.update(lines)
+            for line in lines:
+                marker = re.search(rb"logtap robust ([A-Za-z0-9_.-]+) [0-9]+", line)
+                if marker:
+                    print("FRAGMARK target=%s marker=%s" % (target.decode(), marker.group(1).decode()), flush=True)
             print("FRAGSTAT total=%d uniq=%d" % (total, len(seen)), flush=True)
     except OSError:  # readiness probes close without sending: EPIPE must not kill the sink
         pass
@@ -710,7 +978,44 @@ while [ "$n" -lt 30 ]; do
   n=$((n + 1)); sleep 1
 done
 [ "$n" -lt 30 ] || { docker rm -f "$FRAG" >/dev/null 2>&1; fail "frag-status: sink never answered on $FRAG:8687"; }
-setguc pg_logtap.export_url "http://$SIP:8687"; setguc pg_logtap.export_fallback_file 'pg_logtap-fallback.bin'; reload; sleep 2
+frag_marker_count() {
+  docker logs "$FRAG" 2>/dev/null | grep -F -c "FRAGMARK target=$2 marker=$1"
+}
+frag_restore() {
+  if [ "${frag_route_configured:-0}" = 1 ]; then
+    setguc pg_logtap.export_url "http://$VEC:8686" || return 1
+    reload || return 1
+    n=0
+    while [ "$n" -lt 30 ]; do
+      qb=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
+      [ "$qb" -le 0 ] && break
+      n=$((n + 1)); sleep 1
+    done
+    [ "$n" -lt 30 ] || return 1
+    setguc pg_logtap.export_fallback_file '' || return 1
+    reload || return 1
+  fi
+  docker rm -f "$FRAG" >/dev/null 2>&1 || return 1
+  frag_cleanup_armed=0
+}
+frag_cleanup() {
+  frag_cleanup_status=$1
+  trap - EXIT INT TERM
+  if [ "${frag_cleanup_armed:-0}" = 1 ] && ! frag_restore; then
+    [ "$frag_cleanup_status" -ne 0 ] || frag_cleanup_status=1
+  fi
+  exit "$frag_cleanup_status"
+}
+frag_cleanup_armed=1
+frag_route_configured=0
+trap 'frag_cleanup $?' EXIT
+trap 'frag_cleanup 130' INT
+trap 'frag_cleanup 143' TERM
+setguc pg_logtap.export_url "http://$SIP:8687/frag" || fail "frag-status: cannot set fragmented receiver URL"
+frag_route_configured=1
+setguc pg_logtap.export_fallback_file 'pg_logtap-fallback.bin' || fail "frag-status: cannot set fallback file"
+reload || fail "frag-status: cannot reload fragmented receiver settings"
+sleep 2
 gen frag 300
 fragstat() { docker logs "$FRAG" 2>/dev/null | grep -oE 'FRAGSTAT total=[0-9]+ uniq=[0-9]+' | tail -1; }
 n=0; while [ "$n" -lt 30 ]; do
@@ -719,23 +1024,77 @@ n=0; while [ "$n" -lt 30 ]; do
   n=$((n + 1)); sleep 1
 done
 st=$(fragstat); tot=${st#*total=}; tot=${tot%% *}; uni=${st#*uniq=}
-# Restore the stand's chain BEFORE asserting (a failed assert exits the
-# suite): live sends go back to vector with the fallback file still armed so
-# anything the scenario parked drains there, and only then does the file GUC
-# come off — clearing it first would strand parked events in the file.
-setguc pg_logtap.export_url "http://$VEC:8686"; reload
-n=0; while [ "$n" -lt 30 ]; do
-  qb=$(( $(statf events_queued) - $(statf events_replayed) - $(statf events_compacted) ))
-  [ "$qb" -le 0 ] && break
-  n=$((n + 1)); sleep 1
-done
-setguc pg_logtap.export_fallback_file ''; reload
-docker rm -f "$FRAG" >/dev/null 2>&1
+status_success() {
+  kind=$1
+  target=/status/$kind
+  marker=statusok$kind$E2E_SUF
+  before_sent=$(statf events_sent); before_failed=$(statf send_cycles_failed)
+  setguc pg_logtap.export_url "http://$SIP:8687$target" || fail "status $kind: cannot set receiver URL"
+  reload || fail "status $kind: cannot reload receiver URL"
+  sleep 2
+  gen "statusok$kind" 1
+  n=0
+  while [ "$n" -lt 30 ]; do
+    current_seen=$(frag_marker_count "$marker" "$target")
+    current_sent=$(statf events_sent); current_failed=$(statf send_cycles_failed)
+    [ "$current_seen" -ge 1 ] 2>/dev/null &&
+      [ "$current_sent" -gt "$before_sent" ] 2>/dev/null &&
+      [ "$current_failed" = "$before_failed" ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  [ "${current_seen:-0}" -ge 1 ] 2>/dev/null || fail "status $kind: receiver never saw its marker"
+  [ "${current_sent:-0}" -gt "$before_sent" ] 2>/dev/null || fail "status $kind: receiver response was not acknowledged"
+  fail "status $kind: a 2xx response grew failed cycles"
+}
+status_rejected() {
+  kind=$1
+  target=/status/$kind
+  marker=statusbad$kind$E2E_SUF
+  before_failed=$(statf send_cycles_failed)
+  setguc pg_logtap.export_url "http://$SIP:8687$target" || fail "status $kind: cannot set receiver URL"
+  reload || fail "status $kind: cannot reload receiver URL"
+  sleep 2
+  gen "statusbad$kind" 1
+  n=0
+  while [ "$n" -lt 30 ]; do
+    current_seen=$(frag_marker_count "$marker" "$target")
+    current_failed=$(statf send_cycles_failed)
+    [ "$current_seen" -ge 1 ] 2>/dev/null &&
+      [ "$current_failed" -gt "$before_failed" ] 2>/dev/null && break
+    n=$((n + 1)); sleep 1
+  done
+  [ "${current_seen:-0}" -ge 1 ] 2>/dev/null \
+    || fail "status $kind: receiver never saw the rejected marker"
+  [ "${current_failed:-0}" -gt "$before_failed" ] 2>/dev/null \
+    || fail "status $kind: malformed/non-2xx response did not fail the send"
+  recovery_sent0=$(statf events_sent)
+  setguc pg_logtap.export_url "http://$SIP:8687/status/204" || fail "status $kind: cannot set recovery URL"
+  reload || fail "status $kind: cannot reload recovery URL"
+  sleep 2
+  n=0
+  while [ "$n" -lt 30 ]; do
+    recovery_seen=$(frag_marker_count "$marker" /status/204)
+    current_sent=$(statf events_sent)
+    [ "$recovery_seen" -ge 1 ] 2>/dev/null &&
+      [ "$current_sent" -gt "$recovery_sent0" ] 2>/dev/null && return 0
+    n=$((n + 1)); sleep 1
+  done
+  [ "${recovery_seen:-0}" -ge 1 ] 2>/dev/null \
+    || fail "status $kind: rejected marker was not replayed to /status/204"
+  fail "status $kind: replayed marker was not acknowledged"
+}
+for code in 200 203 203frag 204 299; do status_success "$code"; done
+for kind in 199 300 401 500 2xx 20x version separator incomplete 2000 long; do status_rejected "$kind"; done
+ok "complete 2xx status lines (200/203/204/299, including fragmented 203) acknowledged; non-2xx and malformed/incomplete/over-cap lines retried"
+# Restore before the final assertions: the local EXIT trap runs this same
+# path after every early failure, leaving fallback configured until it drains.
+frag_restore || fail "frag-status: could not restore vector and drain fallback"
+trap - EXIT INT TERM
 [ "${uni:-0}" -ge 300 ] || fail "frag-status: the sink saw ${uni:-0}/300 unique events — delivery itself broke"
 [ "$tot" = "$uni" ] \
   || fail "frag-status: $tot lines delivered for $uni events — a delivered batch was retried (one-recv status read)"
 ok "status line across two recvs accepted: $tot events delivered, each exactly once"
 
-dups=$(grep 'logtap robust' "$OUT/vector-out.jsonl" | grep -o '"seq":[0-9]*' | sort | uniq -d | wc -l)
+dups=$(duplicate_seqs)
 [ "$dups" = 0 ] || fail "$dups duplicate seqs across the suite"
 echo "e2e-robust: all scenarios passed"

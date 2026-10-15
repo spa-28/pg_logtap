@@ -51,6 +51,11 @@ processors:
   transform/pg_logtap_tcp:
     error_mode: propagate
     log_statements:
+      - set(log.severity_number, SEVERITY_NUMBER_DEBUG) where IsString(log.attributes["level"]) and IsMatch(log.attributes["level"], "^DEBUG")
+      - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.attributes["level"] == "LOG" or log.attributes["level"] == "INFO"
+      - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.attributes["level"] == "NOTICE" or log.attributes["level"] == "WARNING"
+      - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.attributes["level"] == "ERROR"
+      - set(log.severity_number, SEVERITY_NUMBER_FATAL) where log.attributes["level"] == "FATAL" or log.attributes["level"] == "PANIC"
       - set(resource.attributes["service.name"], "postgresql")
       - set(resource.attributes["host.name"], log.attributes["host"]) where log.attributes["host"] != nil
       - set(resource.attributes["service.namespace"], log.attributes["cluster"]) where log.attributes["cluster"] != nil

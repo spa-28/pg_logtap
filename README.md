@@ -98,6 +98,7 @@ Enable (requires restart — the extension needs shared memory and a background
 worker):
 
 ```ini
+# Append pg_logtap to any existing preload libraries; do not discard them.
 shared_preload_libraries = 'pg_logtap'
 ```
 
@@ -110,29 +111,37 @@ On PostgreSQL ≤ 16, `ALTER SYSTEM SET pg_logtap.*` before the first restart is
 rejected (GUCs register in `_PG_init`) — enable the preload, restart, then set
 GUCs and restart again.
 
-### Upgrading to 0.6.1
+### Development upgrade to 0.6.2
 
-Install the new library, control file and **all** versioned SQL files, restart
-PostgreSQL, then update each database where the extension is installed:
+The tree prepares **0.6.2**, not a published release. The release-download
+example above remains pinned to a released package. Install the matching new
+library, control file and **all** versioned SQL files, restart PostgreSQL with
+its existing preload list preserved, then explicitly update each database
+where the extension is installed:
 
 ```sql
-ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+ALTER EXTENSION pg_logtap UPDATE TO '0.6.2';
 ```
 
-A fresh 0.6.0 install already has the canonical `pg_logtap_stats_t` /
-`pg_logtap_delivery` column order, so this update preserves their OIDs and
-external dependencies. Older upgrade chains have an append-only historical
-order; 0.6.1 replaces those two objects under `DROP ... RESTRICT`. Before
-updating such a database, remove external objects that depend on the type or
-view and restore baseline ownership/privileges, including the view's implicit
-row type. Remove custom column grants and defaults, comments, security labels
-and relation/column options, including metadata on generated array types;
-restore intentional customizations after the update. Also reset custom
-default privileges for tables/types that apply to the extension schema during
-the migration. A successful normalization changes both OIDs and takes exclusive
-locks, so reconnect or reprepare clients that cache them. Any refusal rolls the
-whole `ALTER EXTENSION` transaction back without changing the old objects or
-`extversion`; the migration never uses `CASCADE`.
+Use this direct target, not an intermediate update to 0.6.1. Older origins
+follow their historical hops to 0.6.0 and then the guarded `0.6.0--0.6.2` edge,
+bypassing the frozen 0.6.1 normalization. A fresh 0.6.0 install is already
+canonical, so it keeps OIDs and external dependencies; `0.6.1--0.6.2` performs
+no object DDL and preserves existing OIDs and metadata. Fresh 0.6.2 uses the
+same SQL API and column order as canonical 0.6.1.
+
+Noncanonical 0.6.0 layouts replace the type and view under `DROP ... RESTRICT`.
+Before updating one, remove external dependencies and restore baseline
+ownership/privileges, including the view's implicit row type. Save and remove
+custom column grants/defaults, comments, security labels and relation/column
+options, including metadata on generated array types and delivery-view rewrite
+rules (such as a `COMMENT ON RULE "_RETURN"`). Reset custom default table/type
+privileges that apply to the extension schema. Restore intentional
+customizations afterward. Normalization changes OIDs and takes exclusive
+locks: reconnect or reprepare clients that cache them. Any refusal rolls back
+the complete update, leaving the old objects, order, OIDs and `extversion`
+unchanged; no `CASCADE` is used. This path cannot recover annotations already
+lost by a previous historical update.
 
 ## Configuration
 
@@ -203,6 +212,7 @@ A typical first setup, end to end:
 
 ```ini
 # postgresql.conf (or ALTER SYSTEM): the tap itself
+# Append pg_logtap to any existing preload libraries; do not discard them.
 shared_preload_libraries = 'pg_logtap'
 ```
 
@@ -540,14 +550,65 @@ one relocated one), and Zig pinned to 0.16.0 (pgzx tracks master).
 
 ### Dev loop (docker)
 
+`scripts/dev-deploy.sh [container]` is an **in-place binary deploy and verifier**,
+not a bootstrap command. The container must already preload pg_logtap and the
+database being checked must already expose `pg_logtap_version()`. It discovers
+the running target major (or `PG_MAJOR` on a stopped official Debian image),
+builds with the matching effective `${PG_CONFIG:-pg_config}` or the existing
+target-major build container, and refuses an unknown major or a failed build
+before copying a library. It copies `.so`, control and all SQL files, restarts,
+and checks the loaded binary version. Other preload libraries are left alone;
+it does **not** create, recreate or update database extensions. Apply the
+explicit SQL update above separately in each installed database.
+
 ```sh
-docker run -d --name pglogtap-pg -e POSTGRES_PASSWORD=dev \
-  -p 55432:5432 -p 9187:9187 postgres:18
-scripts/dev-deploy.sh        # builds in the pgzx-build container, docker cp of .so/.control/.sql
-docker exec pglogtap-pg psql -U postgres -qc \
-  "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'"
-docker restart pglogtap-pg   # .so replacement always requires a restart
+scripts/dev-deploy.sh pglogtap-pg   # already bootstrapped; includes restart
 ```
+
+A **fresh** development container needs a separate install → preload → restart
+→ SQL bootstrap. Run this only for a new container, not an existing database:
+
+```sh
+set -eu
+C=pglogtap-pg
+PG_MAJOR=18
+docker run -d --name "$C" -e POSTGRES_PASSWORD=dev postgres:"$PG_MAJOR"
+ready=0
+for attempt in $(seq 1 60); do
+  if docker exec "$C" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+    ready=1; break
+  fi
+  sleep 1
+done
+[ "$ready" -eq 1 ] || { printf 'fresh PostgreSQL not ready\n' >&2; exit 1; }
+scripts/build.sh "$PG_MAJOR" -Doptimize=ReleaseSafe
+LIBDIR=$(docker exec "$C" pg_config --pkglibdir)
+EXTDIR=$(docker exec "$C" pg_config --sharedir)/extension
+docker cp zig-out/lib/pg_logtap.so "$C:$LIBDIR/"
+docker cp pg_logtap.control "$C:$EXTDIR/"
+for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done
+# Append to the existing preload list rather than replacing other libraries.
+# psql executes the generated ALTER SYSTEM as its own statement.
+docker exec -i "$C" psql -X -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+SELECT format('ALTER SYSTEM SET shared_preload_libraries = %L',
+              concat_ws(',', nullif(current_setting('shared_preload_libraries'), ''), 'pg_logtap'))
+\gexec
+SQL
+docker restart "$C"
+ready=0
+for attempt in $(seq 1 60); do
+  if docker exec "$C" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then
+    ready=1; break
+  fi
+  sleep 1
+done
+[ "$ready" -eq 1 ] || { printf 'preloaded PostgreSQL not ready\n' >&2; exit 1; }
+docker exec "$C" psql -X -U postgres -v ON_ERROR_STOP=1 -qc 'CREATE EXTENSION pg_logtap'
+scripts/e2e-require-ext.sh "$C"
+```
+
+No host ports are needed for `docker exec`; publish only loopback ports if a
+local client needs them. Bootstrap never drops an existing extension.
 
 Locally, `make && make install` does the same against the `pg_config` on PATH
 (pgzx's `zig build -p $PG_HOME` pattern, wrapped in the conventional
@@ -567,6 +628,8 @@ scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 
 scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
 scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
 scripts/e2e-hook-chain.sh pglogtap-e2e       # another extension's emit-log + shmem hooks: chained, not replaced
+scripts/e2e-upgrade.sh pglogtap-e2e          # direct 0.6.2 paths, rule-metadata refusals, canonical OIDs and rollback
+scripts/e2e-upgrade.sh pglogtap-e2e 0.6.1    # frozen historical hops (not the protected update route)
 scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
 scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
 scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
@@ -661,10 +724,11 @@ filename, `build.zig.zon`, and `src/version.zig` (what
 `pg_logtap_version()` returns). To cut a release:
 
 ```sh
-# 1. bump the version in all three files (rename the sql file accordingly)
+# 1. bump the three version pins and add sql/pg_logtap--<new>.sql;
+#    never rename, rewrite or remove released SQL files
 # 2. add sql/pg_logtap--<old>--<new>.sql — the delta script (comment-only if
-#    the SQL didn't change); every version needs one, it is the ALTER EXTENSION
-#    UPDATE hop, and chains compose (0.1.0 → 0.2.0 → 0.3.0 in one command)
+#    the SQL didn't change); assert selected paths and metadata preservation
+#    on PG15–18, including any direct edge needed to bypass an unsafe old hop
 # 3. commit, tag, push
 git tag v0.3.0 && git push origin v0.3.0
 # 4. create a Release for the tag in the GitHub UI (or: gh release create v0.3.0)

@@ -1,8 +1,8 @@
 #!/bin/sh
-# Acceptance: representative released SQL layouts reach one canonical 0.6.1 API.
-# Fresh 0.6.0 keeps object OIDs; historical orders are replaced only when
-# ownership, ACLs and dependencies make that replacement lossless.
-# Usage: scripts/e2e-upgrade.sh [pg_container]
+# Acceptance: released SQL layouts reach the canonical current API.
+# Fresh 0.6.0/0.6.1 keep OIDs and metadata; historical normalization fails closed.
+# Usage: scripts/e2e-upgrade.sh [pg_container] [target: 0.6.2|0.6.1]
+# The explicit 0.6.1 target tests frozen historical hops, not protected upgrades.
 set -u
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init upgrade "${1:-}"
@@ -12,6 +12,9 @@ docker cp "$(dirname "$0")/../tests/e2e/fixtures/pg_logtap--0.1.0.sql" \
   "$PG_CT:$EXTDIR/" >/dev/null \
   || fail "upgrade: could not install the 0.1.0 test fixture"
 
+CURRENT=0.6.2
+TARGET=${2:-$CURRENT}
+case "$TARGET" in 0.6.1|0.6.2) ;; *) fail "upgrade: unsupported target $TARGET" ;; esac
 SCHEMA=logtap_ext
 PROBE_ROLE=lt_upgrade_probe_$$
 OWNER_ROLE=lt_upgrade_owner_$$
@@ -30,16 +33,36 @@ query() { # query <database> <sql>
 psql_db() { # psql_db <database>, SQL on stdin
   docker exec -i "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -d "$1"
 }
-object_ids() {
-  query "$1" "SELECT '$SCHEMA.pg_logtap_stats_t'::regtype::oid || '|' || '$SCHEMA.pg_logtap_delivery'::regclass::oid"
+object_ids() { # Include implicit types/rules/functions; 0.1.0 has only functions.
+  query "$1" "
+SELECT concat_ws('|', t.oid, t.typrelid, t.typarray, v.oid, v.reltype, vt.typarray,
+    (SELECT string_agg(r.oid::text, ',' ORDER BY r.rulename)
+       FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class = v.oid),
+    (SELECT string_agg(p.oid::text, ',' ORDER BY p.proname)
+       FROM pg_catalog.pg_proc AS p WHERE p.pronamespace = e.extnamespace
+        AND p.proname LIKE 'pg_logtap_%'))
+  FROM pg_catalog.pg_extension AS e
+  LEFT JOIN pg_catalog.pg_type AS t
+    ON t.oid = pg_catalog.to_regtype('$SCHEMA.pg_logtap_stats_t')
+  LEFT JOIN pg_catalog.pg_class AS v
+    ON v.oid = pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery')
+  LEFT JOIN pg_catalog.pg_type AS vt ON vt.oid = v.reltype
+ WHERE e.extname = 'pg_logtap'"
+}
+rule_comment() {
+  query "$1" "SELECT pg_catalog.obj_description(r.oid, 'pg_rewrite') FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class = pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery') AND r.rulename = '_RETURN'"
 }
 column_order() {
-  query "$1" "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = '$SCHEMA.pg_logtap_stats_t'::regclass AND attnum > 0 AND NOT attisdropped"
+  query "$1" "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_catalog.pg_attribute WHERE attrelid = pg_catalog.to_regclass('$SCHEMA.pg_logtap_stats_t') AND attnum > 0 AND NOT attisdropped"
 }
 extversion() {
   query "$1" "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_logtap'"
 }
-expect_update_fail() { # <database> <reason> [diagnostic fragment]
+expect_update_fail() { # <database> <reason> [diagnostic] [target] [pre-version]
+  update_target=${4:-$TARGET}
+  update_version_before=$(extversion "$1") || fail "upgrade: could not read pre-version"
+  [ "$update_version_before" = "${5:-0.6.0}" ] || fail "upgrade: unexpected pre-version for $2"
+  update_rule_before=$(rule_comment "$1") || fail "upgrade: could not read rule comment"
   update_oids_before=$(object_ids "$1") \
     || fail "upgrade: could not read OIDs before $2"
   update_order_before=$(column_order "$1") \
@@ -47,15 +70,17 @@ expect_update_fail() { # <database> <reason> [diagnostic fragment]
   update_fingerprint_before=$(fingerprint "$1") \
     || fail "upgrade: could not fingerprint before $2"
   if update_error=$(docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 -d "$1" \
-    -c "ALTER EXTENSION pg_logtap UPDATE TO '0.6.1'" 2>&1); then
+    -c "ALTER EXTENSION pg_logtap UPDATE TO '$update_target'" 2>&1); then
     fail "upgrade: accepted $2"
   fi
   case "$update_error" in
     *"${3:-}"*) ;;
     *) fail "upgrade: rejected $2 for the wrong reason: $update_error" ;;
   esac
-  [ "$(extversion "$1")" = 0.6.0 ] \
+  [ "$(extversion "$1")" = "$update_version_before" ] \
     || fail "upgrade: rejected $2 but changed extversion"
+  [ "$(rule_comment "$1")" = "$update_rule_before" ] \
+    || fail "upgrade: rejected $2 but lost rule comment"
   [ "$(object_ids "$1")" = "$update_oids_before" ] \
     || fail "upgrade: rejected $2 but changed OIDs"
   [ "$(column_order "$1")" = "$update_order_before" ] \
@@ -100,7 +125,7 @@ BEGIN
       FROM pg_catalog.pg_extension AS e
       JOIN pg_catalog.pg_namespace AS n ON n.oid = e.extnamespace
      WHERE e.extname = 'pg_logtap'
-       AND e.extversion = '0.6.1'
+       AND e.extversion = '$TARGET'
        AND n.oid = (SELECT t.typnamespace FROM pg_catalog.pg_type AS t
                      WHERE t.oid = type_oid);
     IF NOT FOUND THEN
@@ -208,7 +233,7 @@ BEGIN
         RAISE EXCEPTION 'wrong function signature or property';
     END IF;
 
-    IF $SCHEMA.pg_logtap_version() <> '0.6.1' THEN
+    IF $SCHEMA.pg_logtap_version() <> '$CURRENT' THEN
         RAISE EXCEPTION 'binary/SQL version mismatch';
     END IF;
 
@@ -326,27 +351,45 @@ SELECT md5(concat_ws(E'\\n',
                        || pg_catalog.format_type(a.atttypid, a.atttypmod),
                        ',' ORDER BY a.attnum)
        FROM pg_catalog.pg_attribute AS a
-      WHERE a.attrelid = '$SCHEMA.pg_logtap_stats_t'::regclass
+      WHERE a.attrelid = pg_catalog.to_regclass('$SCHEMA.pg_logtap_stats_t')
         AND a.attnum > 0 AND NOT a.attisdropped),
     (SELECT string_agg(a.attname::text || ':'
                        || pg_catalog.format_type(a.atttypid, a.atttypmod),
                        ',' ORDER BY a.attnum)
        FROM pg_catalog.pg_attribute AS a
-      WHERE a.attrelid = '$SCHEMA.pg_logtap_delivery'::regclass
+      WHERE a.attrelid = pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery')
         AND a.attnum > 0 AND NOT a.attisdropped),
-    pg_catalog.pg_get_viewdef('$SCHEMA.pg_logtap_delivery'::regclass, false),
+    pg_catalog.pg_get_viewdef(pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery'), false),
     (SELECT value FROM functions),
     (SELECT t.typacl::text FROM pg_catalog.pg_type AS t
-      WHERE t.oid = '$SCHEMA.pg_logtap_stats_t'::regtype),
+      WHERE t.oid = pg_catalog.to_regtype('$SCHEMA.pg_logtap_stats_t')),
     (SELECT c.relacl::text FROM pg_catalog.pg_class AS c
-      WHERE c.oid = '$SCHEMA.pg_logtap_delivery'::regclass),
-    (SELECT value FROM members)
+      WHERE c.oid = pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery')),
+    (SELECT value FROM members),
+    (SELECT string_agg(r.rulename || ':' || coalesce(pg_catalog.obj_description(r.oid, 'pg_rewrite'), '<null>'),
+                       E'\\n' ORDER BY r.rulename)
+       FROM pg_catalog.pg_rewrite AS r
+      WHERE r.ev_class = pg_catalog.to_regclass('$SCHEMA.pg_logtap_delivery'))
 ))
   FROM extension_data AS e"
 }
 
-routes=$(query postgres "SELECT count(*) FROM pg_catalog.pg_extension_update_paths('pg_logtap') WHERE source IN ('0.1.0', '0.4.1', '0.6.0') AND target = '0.6.1' AND path IS NOT NULL")
-[ "$routes" = 3 ] || fail "upgrade: expected three update routes to 0.6.1, got $routes"
+# Assert the selected shortest path, not merely that some route exists.
+released_chain='0.1.0--0.2.0--0.2.1--0.3.0--0.4.0--0.4.1--0.4.2--0.4.3--0.4.4--0.4.5--0.5.0--0.5.1--0.5.2--0.6.0'
+for source_version in 0.1.0 0.2.0 0.2.1 0.3.0 0.4.0 0.4.1 0.4.2 0.4.3 0.4.4 0.4.5 0.5.0 0.5.1 0.5.2 0.6.0; do
+  case "$source_version" in
+    0.1.0) expected_path="$released_chain--$TARGET" ;;
+    *) expected_path="$source_version${released_chain#*"$source_version"}--$TARGET" ;;
+  esac
+  selected_path=$(query postgres "SELECT path FROM pg_catalog.pg_extension_update_paths('pg_logtap') WHERE source = '$source_version' AND target = '$TARGET'") \
+    || fail "upgrade: could not discover path from $source_version"
+  [ "$selected_path" = "$expected_path" ] \
+    || fail "upgrade: unsafe/unexpected path from $source_version to $TARGET: $selected_path"
+done
+if [ "$TARGET" = "$CURRENT" ]; then
+  [ "$(query postgres "SELECT path FROM pg_catalog.pg_extension_update_paths('pg_logtap') WHERE source = '0.6.1' AND target = '$CURRENT'")" = "0.6.1--$CURRENT" ] \
+    || fail "upgrade: expected direct no-DDL 0.6.1 -> $CURRENT hop"
+fi
 
 docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 \
   -qc "DROP ROLE IF EXISTS $PROBE_ROLE" \
@@ -355,9 +398,9 @@ docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 \
   -qc "CREATE ROLE $OWNER_ROLE SUPERUSER" >/dev/null
 for database in $DATABASES; do create_database "$database"; done
 
-# Direct 0.6.1 installation is the reference fingerprint.
-install_version "$DB_DIRECT" 0.6.1
-check_final "$DB_DIRECT" || fail "upgrade: direct 0.6.1 shape check failed"
+# Direct target installation is the reference fingerprint.
+install_version "$DB_DIRECT" "$TARGET"
+check_final "$DB_DIRECT" || fail "upgrade: direct $TARGET shape check failed"
 # The shape assertion itself must reject a wrong composite attribute order/name.
 query "$DB_DIRECT" "ALTER TYPE $SCHEMA.pg_logtap_stats_t RENAME ATTRIBUTE events_captured TO unexpected_captured" >/dev/null \
   || fail "upgrade: could not stage noncanonical composite"
@@ -370,14 +413,17 @@ case "$shape_error" in
   *'noncanonical type order'*) ;;
   *) fail "upgrade: shape assertion rejected noncanonical composite for the wrong reason: $shape_error" ;;
 esac
-check_final "$DB_DIRECT" || fail "upgrade: restored direct 0.6.1 shape check failed"
+check_final "$DB_DIRECT" || fail "upgrade: restored direct $TARGET shape check failed"
 ok "shape assertion rejects noncanonical composite attributes"
 reference=$(fingerprint "$DB_DIRECT") \
-  || fail "upgrade: could not fingerprint direct 0.6.1"
+  || fail "upgrade: could not fingerprint direct $TARGET"
 
-# Fresh 0.6.0 is already canonical: dependencies, OIDs and custom metadata
-# must survive because this path performs no object DDL.
-install_version "$DB_CANONICAL" 0.6.0
+# Both canonical origins must retain dependencies, every object OID and metadata.
+canonical_origins=0.6.0
+[ "$TARGET" != "$CURRENT" ] || canonical_origins='0.6.0 0.6.1'
+for canonical_origin in $canonical_origins; do
+create_database "$DB_CANONICAL" || fail "upgrade: canonical database reset failed"
+install_version "$DB_CANONICAL" "$canonical_origin" || fail "upgrade: canonical install failed"
 # Roll back this probe so explicit baseline ACLs do not affect the clean
 # direct-install fingerprint checked below.
 psql_db "$DB_CANONICAL" >/dev/null <<SQL || fail "upgrade: canonical extended metadata probe failed"
@@ -385,6 +431,7 @@ BEGIN;
 ALTER VIEW $SCHEMA.pg_logtap_delivery ALTER COLUMN events_sent SET DEFAULT 7;
 COMMENT ON TYPE $SCHEMA.pg_logtap_delivery IS 'canonical rowtype comment';
 COMMENT ON TYPE $SCHEMA._pg_logtap_delivery IS 'canonical array comment';
+COMMENT ON RULE "_RETURN" ON $SCHEMA.pg_logtap_delivery IS 'retain this annotation';
 REVOKE USAGE ON TYPE $SCHEMA.pg_logtap_delivery FROM PUBLIC;
 DO \$check\$
 DECLARE
@@ -392,15 +439,18 @@ DECLARE
     view_oid oid := '$SCHEMA.pg_logtap_delivery'::regclass;
     rowtype_oid oid := '$SCHEMA.pg_logtap_delivery'::regtype;
     array_oid oid := (SELECT typarray FROM pg_catalog.pg_type WHERE oid = rowtype_oid);
+    rule_oid oid := (SELECT oid FROM pg_catalog.pg_rewrite WHERE ev_class = view_oid AND rulename = '_RETURN');
 BEGIN
-    ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+    ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
     IF '$SCHEMA.pg_logtap_stats_t'::regtype::oid <> type_oid
        OR '$SCHEMA.pg_logtap_delivery'::regclass::oid <> view_oid
        OR '$SCHEMA.pg_logtap_delivery'::regtype::oid <> rowtype_oid
        OR (SELECT typarray FROM pg_catalog.pg_type WHERE oid = rowtype_oid) <> array_oid
+       OR (SELECT oid FROM pg_catalog.pg_rewrite WHERE ev_class = view_oid AND rulename = '_RETURN') IS DISTINCT FROM rule_oid
+       OR pg_catalog.obj_description(rule_oid, 'pg_rewrite') IS DISTINCT FROM 'retain this annotation'
        OR NOT EXISTS (
            SELECT 1 FROM pg_catalog.pg_extension
-            WHERE extname = 'pg_logtap' AND extversion = '0.6.1'
+            WHERE extname = 'pg_logtap' AND extversion = '$TARGET'
        ) THEN
         RAISE EXCEPTION 'canonical update changed OIDs or failed to update version';
     END IF;
@@ -429,7 +479,7 @@ CREATE VIEW public.keep_delivery AS SELECT * FROM $SCHEMA.pg_logtap_delivery;
 CREATE TABLE public.keep_stats (snapshot $SCHEMA.pg_logtap_stats_t);
 GRANT SELECT ON $SCHEMA.pg_logtap_delivery TO $PROBE_ROLE;
 COMMENT ON VIEW $SCHEMA.pg_logtap_delivery IS 'canonical metadata survives';
-ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
 SQL
 canonical_after=$(object_ids "$DB_CANONICAL")
 [ "$canonical_after" = "$canonical_before" ] \
@@ -447,7 +497,27 @@ check_final "$DB_CANONICAL" || fail "upgrade: canonical 0.6.0 shape check failed
 canonical_fingerprint=$(fingerprint "$DB_CANONICAL") \
   || fail "upgrade: could not fingerprint canonical 0.6.0 chain"
 [ "$canonical_fingerprint" = "$reference" ] \
-  || fail "upgrade: canonical 0.6.0 fingerprint differs"
+  || fail "upgrade: canonical $canonical_origin fingerprint differs"
+ok "canonical $canonical_origin -> $TARGET retained OIDs, dependencies and rule metadata"
+done
+
+# Exercise the frozen normalization explicitly, then the no-DDL current hop.
+# No lost annotations are reconstructed: this is a clean historical fixture.
+if [ "$TARGET" = "$CURRENT" ]; then
+  create_database "$DB_QUOTED" || fail "upgrade: frozen-hop database reset failed"
+  install_version "$DB_QUOTED" 0.3.0 || fail "upgrade: frozen-hop install failed"
+  query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.0'" >/dev/null || fail "upgrade: frozen chain failed"
+  [ "$(column_order "$DB_QUOTED")" != "$CANONICAL_ORDER" ] || fail "upgrade: frozen-hop fixture is canonical"
+  query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.1'" >/dev/null || fail "upgrade: frozen normalization failed"
+  frozen_oids=$(object_ids "$DB_QUOTED") || fail "upgrade: frozen-hop OID read failed"
+  query "$DB_QUOTED" "COMMENT ON RULE \"_RETURN\" ON $SCHEMA.pg_logtap_delivery IS 'retain this annotation'; ALTER EXTENSION pg_logtap UPDATE TO '$CURRENT'" >/dev/null \
+    || fail "upgrade: current no-DDL hop failed"
+  [ "$(object_ids "$DB_QUOTED")" = "$frozen_oids" ] && [ "$(rule_comment "$DB_QUOTED")" = 'retain this annotation' ] \
+    || fail "upgrade: no-DDL hop changed OIDs or rule metadata"
+  query "$DB_QUOTED" "COMMENT ON RULE \"_RETURN\" ON $SCHEMA.pg_logtap_delivery IS NULL" >/dev/null || fail "upgrade: remove annotation failed"
+  check_final "$DB_QUOTED" || fail "upgrade: frozen/current chain shape failed"
+  [ "$(fingerprint "$DB_QUOTED")" = "$reference" ] || fail "upgrade: frozen/current API differs"
+fi
 
 # 0.1.0 follows every historical hop. External dependencies must make the
 # noncanonical replacement fail transactionally, then clean retry must work.
@@ -487,7 +557,7 @@ psql_db "$DB_HISTORICAL" >/dev/null <<SQL || fail "upgrade: historical normaliza
 BEGIN;
 SET LOCAL quote_all_identifiers = off;
 DROP TABLE public.keep_stats;
-ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
 DO \$check\$
 BEGIN
     IF current_setting('quote_all_identifiers') IS DISTINCT FROM 'off' THEN
@@ -513,6 +583,27 @@ query "$DB_041" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.0'" >/dev/null
   || fail "upgrade: direct 0.4.1 did not produce its historical order"
 order_041=$(column_order "$DB_041")
 oids_041=$(object_ids "$DB_041")
+
+# Discriminating regression: the released 0.6.1 hop silently discarded this
+# rule comment on a noncanonical layout. Only the protected route must refuse.
+if [ "$TARGET" = "$CURRENT" ]; then
+  query "$DB_041" "COMMENT ON RULE \"_RETURN\" ON $SCHEMA.pg_logtap_delivery IS 'retain this annotation'" >/dev/null \
+    || fail "upgrade: could not stage rule comment"
+  [ "$(rule_comment "$DB_041")" = 'retain this annotation' ] || fail "upgrade: missing staged rule comment"
+  expect_update_fail "$DB_041" 'delivery rewrite rule comment' 'comments or security labels'
+  [ "$(rule_comment "$DB_041")" = 'retain this annotation' ] || fail "upgrade: refused update lost rule comment"
+  query "$DB_041" "COMMENT ON RULE \"_RETURN\" ON $SCHEMA.pg_logtap_delivery IS NULL" >/dev/null \
+    || fail "upgrade: could not remove rule comment"
+  # Prove clean retry now, but roll back so the remaining guard probes reuse
+  # exactly the same noncanonical fixture and OIDs.
+  psql_db "$DB_041" >/dev/null <<SQL || fail "upgrade: clean rule-comment retry failed"
+BEGIN;
+ALTER EXTENSION pg_logtap UPDATE TO '$CURRENT';
+ROLLBACK;
+SQL
+  [ "$(extversion "$DB_041")" = 0.6.0 ] && [ "$(object_ids "$DB_041")" = "$oids_041" ] \
+    && [ "$(column_order "$DB_041")" = "$order_041" ] || fail "upgrade: clean retry rollback changed fixture"
+fi
 
 query "$DB_041" "ALTER VIEW $SCHEMA.pg_logtap_delivery OWNER TO $PROBE_ROLE" >/dev/null
 expect_update_fail "$DB_041" 'owner drift'
@@ -591,7 +682,7 @@ SET LOCAL quote_all_identifiers = $quote_identifiers;
 DO \$check\$
 BEGIN
     BEGIN
-        ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+        ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
         RAISE EXCEPTION 'custom view definition was accepted';
     EXCEPTION WHEN raise_exception THEN
         IF SQLERRM <> 'pg_logtap_delivery has a custom definition; restore the released view and retry the update' THEN
@@ -641,7 +732,7 @@ query "$DB_041" "ALTER DEFAULT PRIVILEGES REVOKE SELECT ON TABLES FROM $PROBE_RO
 psql_db "$DB_041" >/dev/null <<SQL || fail "upgrade: 0.4.1 normalization with quote_all_identifiers=on failed"
 BEGIN;
 SET LOCAL quote_all_identifiers = on;
-ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
 DO \$check\$
 BEGIN
     IF current_setting('quote_all_identifiers') IS DISTINCT FROM 'on' THEN
@@ -674,29 +765,67 @@ psql_db "$DB_OWNER" >/dev/null <<SQL
 SET ROLE $OWNER_ROLE;
 ALTER DEFAULT PRIVILEGES IN SCHEMA $SCHEMA REVOKE USAGE ON TYPES FROM $PROBE_ROLE;
 RESET ROLE;
-ALTER EXTENSION pg_logtap UPDATE TO '0.6.1';
+ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
 SQL
 check_final "$DB_OWNER" || fail "upgrade: non-invoking owner was not restored"
 [ "$(query "$DB_OWNER" "SELECT pg_get_userbyid(extowner) FROM pg_catalog.pg_extension WHERE extname = 'pg_logtap'")" = "$OWNER_ROLE" ] \
   || fail "upgrade: owner scenario changed extension owner"
+
+# Every released origin/installer must converge, not only the guard fixtures.
+all_origins='0.1.0 0.2.0 0.2.1 0.3.0 0.4.0 0.4.1 0.4.2 0.4.3 0.4.4 0.4.5 0.5.0 0.5.1 0.5.2 0.6.0'
+[ "$TARGET" != "$CURRENT" ] || all_origins="$all_origins 0.6.1"
+for origin in $all_origins; do
+  create_database "$DB_QUOTED" || fail "upgrade: reset database for $origin failed"
+  install_version "$DB_QUOTED" "$origin" || fail "upgrade: install origin $origin failed"
+  query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '$TARGET'" >/dev/null || fail "upgrade: direct $origin -> $TARGET failed"
+  check_final "$DB_QUOTED" || fail "upgrade: final shape from $origin failed"
+  [ "$(fingerprint "$DB_QUOTED")" = "$reference" ] || fail "upgrade: API from $origin differs"
+  ok "origin $origin converged directly to $TARGET"
+done
 
 # Compare within the same namespace: fingerprints intentionally include schema
 # names. Quoted identifiers and alias-like names must not be rewritten.
 for SCHEMA in '"two  spaces"' '"embedded""quote"' pre_jsonb_populate_record '"jsonb_populate_record.schema"'; do
   for origin in 0.1.0 0.4.1; do
     create_database "$DB_QUOTED" || fail "upgrade: could not create quoted-schema reference database"
-    install_version "$DB_QUOTED" 0.6.1 || fail "upgrade: quoted-schema direct installation failed"
+    install_version "$DB_QUOTED" "$TARGET" || fail "upgrade: quoted-schema direct installation failed"
     check_final "$DB_QUOTED" || fail "upgrade: quoted-schema direct shape check failed"
     quoted_reference=$(fingerprint "$DB_QUOTED") \
       || fail "upgrade: could not fingerprint quoted-schema direct installation"
     create_database "$DB_QUOTED" || fail "upgrade: could not recreate quoted-schema database"
     install_version "$DB_QUOTED" "$origin" || fail "upgrade: quoted-schema historical installation failed"
-    query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.0'" >/dev/null \
-      || fail "upgrade: quoted-schema historical hop failed"
-    [ "$(column_order "$DB_QUOTED")" != "$CANONICAL_ORDER" ] \
-      || fail "upgrade: quoted-schema origin $origin did not produce historical order"
-    query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '0.6.1'" >/dev/null \
-      || fail "upgrade: normalization failed in schema $SCHEMA from $origin"
+    # A composite dependency on 0.4.1 must roll back every earlier hop too.
+    # 0.1.0 has only functions: it exercises direct transaction rollback below,
+    # but cannot stage a dependency on the not-yet-created statistics type.
+    if [ "$origin" != 0.1.0 ]; then
+      query "$DB_QUOTED" "CREATE TABLE public.keep_stats (snapshot $SCHEMA.pg_logtap_stats_t)" >/dev/null \
+        || fail "upgrade: direct-origin dependency staging failed"
+      expect_update_fail "$DB_QUOTED" 'direct old-origin dependency' '' "$TARGET" "$origin"
+      query "$DB_QUOTED" "SELECT count(*) FROM public.keep_stats" >/dev/null \
+        || fail "upgrade: direct-origin rollback lost dependent table"
+      query "$DB_QUOTED" "DROP TABLE public.keep_stats" >/dev/null || fail "upgrade: remove dependency failed"
+    fi
+    for quote_identifiers in off on; do
+      origin_oids=$(object_ids "$DB_QUOTED") || fail "upgrade: direct-origin OID read failed"
+      origin_fingerprint=$(fingerprint "$DB_QUOTED") || fail "upgrade: direct-origin fingerprint failed"
+      psql_db "$DB_QUOTED" >/dev/null <<SQL || fail "upgrade: direct-origin rollback with quote_all_identifiers=$quote_identifiers failed"
+BEGIN;
+SET LOCAL quote_all_identifiers = $quote_identifiers;
+ALTER EXTENSION pg_logtap UPDATE TO '$TARGET';
+DO \$check\$
+BEGIN
+    IF current_setting('quote_all_identifiers') IS DISTINCT FROM '$quote_identifiers' THEN
+        RAISE EXCEPTION 'direct-origin update changed quote_all_identifiers';
+    END IF;
+END
+\$check\$;
+ROLLBACK;
+SQL
+      [ "$(extversion "$DB_QUOTED")" = "$origin" ] && [ "$(object_ids "$DB_QUOTED")" = "$origin_oids" ] \
+        && [ "$(fingerprint "$DB_QUOTED")" = "$origin_fingerprint" ] || fail "upgrade: direct-origin transaction rollback changed catalog"
+    done
+    query "$DB_QUOTED" "ALTER EXTENSION pg_logtap UPDATE TO '$TARGET'" >/dev/null \
+      || fail "upgrade: direct update failed in schema $SCHEMA from $origin"
     check_final "$DB_QUOTED" || fail "upgrade: quoted-schema normalized shape check failed"
     quoted_fingerprint=$(fingerprint "$DB_QUOTED") \
       || fail "upgrade: could not fingerprint quoted-schema historical upgrade"

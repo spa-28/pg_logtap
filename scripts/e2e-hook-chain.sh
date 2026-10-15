@@ -3,23 +3,25 @@
 # emit_log, shmem-request and shmem-startup hooks, not silently replace them
 # (PROBLEMS.md B1). hookchain.c is preloaded BEFORE pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
-set -u
+set -eu
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init hookchain "${1:-}"
 e2e_gate
 OUT=${E2E_OUT:-/tmp/logtap-e2e}/hookchain # per container in a parallel matrix
 
-psql_ct() { docker exec "$PG_CT" psql -U postgres "$@"; }
+psql_ct() { docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 "$@"; }
 
 # Build hookchain.so against the target major's server headers (the fmgr
 # magic block is version-checked at load, so a pg18 .so won't load into 15).
 MAJ=$(psql_ct -Atc "SHOW server_version" | cut -d. -f1)
 LIBDIR=$(docker exec "$PG_CT" pg_config --pkglibdir)
 mkdir -p "$OUT"
-if command -v pg_config >/dev/null 2>&1; then # CI: server-dev for this major
+e2e_stand_lock || fail "could not acquire build lock"
+if HOST_CONFIG=$(e2e_pg_config "$MAJ"); then
   # -Wno-ignored-attributes: PG headers mark printf functions gnu_printf,
   # which zig cc's clang does not accept — header noise, not our code.
-  zig cc -shared -fPIC -Wno-ignored-attributes -I"$(pg_config --includedir-server)" \
+  INC=$("$HOST_CONFIG" --includedir-server) || fail "could not read PostgreSQL $MAJ headers"
+  zig cc -shared -fPIC -Wno-ignored-attributes -I"$INC" \
     tests/e2e/hookchain.c -o "$OUT/hookchain.so" \
     || fail "could not build hookchain.so for PostgreSQL $MAJ"
 else # local: the pgzx-build container has server-dev 15-18
@@ -31,6 +33,7 @@ else # local: the pgzx-build container has server-dev 15-18
   docker cp "pgzx-build:/tmp/hookchain-$PG_CT.so" "$OUT/hookchain.so" \
     || fail "docker cp of built hookchain.so for PostgreSQL $MAJ failed"
 fi
+exec 7>&- # builder is shared; the container lock stays held through restore
 docker cp "$OUT/hookchain.so" "$PG_CT:$LIBDIR/"
 
 # Preload hookchain first; the original setting goes back afterwards. List
@@ -38,13 +41,17 @@ docker cp "$OUT/hookchain.so" "$PG_CT:$LIBDIR/"
 # 'a,b' literal is stored as ONE element and the postmaster then fails to
 # load a file literally named "a,b" (FATAL at boot, crash loop).
 SAVED=$(psql_ct -Atc "SHOW shared_preload_libraries")
+URL_SAVED=$(psql_ct -Atc "SHOW pg_logtap.export_url")
 SAVED_LIST=$(echo "$SAVED" | sed "s/[,[:space:]]\+/', '/g") # '' | 'a' | 'a', 'b'
 restore() {
+  status=$?
+  trap - EXIT INT TERM
   psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = '$SAVED_LIST'" \
-    -qc "ALTER SYSTEM SET pg_logtap.export_url = '$URL_SAVED'" >/dev/null
-  docker restart "$PG_CT" >/dev/null
-  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1
-  wait_ready
+    -qc "ALTER SYSTEM SET pg_logtap.export_url = '$URL_SAVED'" >/dev/null || status=1
+  docker restart "$PG_CT" >/dev/null || status=1
+  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1 || status=1
+  wait_ready || status=1
+  exit "$status"
 }
 trap restore EXIT INT TERM
 
@@ -64,7 +71,6 @@ ok "previous shmem request/startup hooks initialized their shared state"
 
 # Mute the exporter for the check below: a live export_url drains the ring
 # between the DO and the dump, and the marker events would never be IN it.
-URL_SAVED=$(psql_ct -Atc "SHOW pg_logtap.export_url")
 psql_ct -qc "ALTER SYSTEM SET pg_logtap.export_url = ''" -qc "SELECT pg_reload_conf()" >/dev/null
 
 # One connection: baseline count, 5 marker warnings, after-count, and the
@@ -98,6 +104,15 @@ ok "chained hook fired for all events ($((C2 - C1)) calls), capture intact ($INR
 psql_ct -qc "CREATE OR REPLACE FUNCTION public.hookchain_arm(boolean) RETURNS integer
   AS '\$libdir/hookchain', 'hookchain_arm' LANGUAGE C STRICT" >/dev/null
 # Rows: count, arm(true)'s count, [DO logs but prints no row], count, arm(false)
+nested_log_count() {
+  if n=$(grep -Fc 'hookchain nested call'); then :; else
+    status=$?
+    [ "$status" = 1 ] || return "$status" # 1 means a valid zero-match count
+  fi
+  printf '%s\n' "$n"
+}
+SERVER_LOG0=$(docker logs "$PG_CT" 2>&1) || fail "could not read server log before hostile hook"
+NESTED_LOG0=$(printf '%s\n' "$SERVER_LOG0" | nested_log_count) || fail "could not count server log before hostile hook"
 R=$(psql_ct -qAt \
   -c "SELECT hookchain_count()" \
   -c "SELECT hookchain_arm(true)" \
@@ -109,10 +124,15 @@ A1=$(echo "$R" | sed -n 1p)
 A2=$(echo "$R" | sed -n 3p)
 DELTA=$((A2 - A1))
 [ "$DELTA" -ge 1 ] && [ "$DELTA" -lt 5 ] || fail "logging chained hook out of bounds: $DELTA hook calls for one event"
+SERVER_LOG1=$(docker logs "$PG_CT" 2>&1) || fail "could not read server log after hostile hook"
+NESTED_LOG1=$(printf '%s\n' "$SERVER_LOG1" | nested_log_count) || fail "could not count server log after hostile hook"
+NESTED_LOG_DELTA=$((NESTED_LOG1 - NESTED_LOG0))
+[ "$NESTED_LOG_DELTA" -ge 1 ] && [ "$NESTED_LOG_DELTA" -lt 5 ] \
+  || fail "nested WARNING missing or unbounded in server log: $NESTED_LOG_DELTA lines"
 ARMED_INRING=$(psql_ct -Atc "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line)
   WHERE line LIKE '%\"message\":\"logtap hookchain-armed%'")
 NESTED_INRING=$(psql_ct -Atc "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line)
   WHERE line LIKE '%hookchain nested%'")
 [ "$ARMED_INRING" = 1 ] || fail "marker not captured under the logging hook ($ARMED_INRING in ring)"
 [ "$NESTED_INRING" = 0 ] || fail "nested hook line captured — guard does not cover the chain call"
-ok "logging chained hook bounded ($((A2 - A1)) call, marker captured, nested line not)"
+ok "logging chained hook bounded ($((A2 - A1)) calls, $NESTED_LOG_DELTA nested WARNING in server log, marker captured, nested line not)"

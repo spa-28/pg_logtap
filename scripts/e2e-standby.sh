@@ -4,6 +4,7 @@
 # primary, standby and standby volume; the matrix stand supplies Vector only.
 # Usage: scripts/e2e-standby.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -u
+. "$(dirname "$0")/e2e-common.sh"
 
 V=${1:-}
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
@@ -25,9 +26,13 @@ STANDBY_MARKER="logtap standby replica $SUF"
   exit 2
 }
 mkdir -p "$OUT"
-exec 9>"${E2E_LOCK_DIR:-$OUT}/lock.standby-$V"
-flock -n 9 || {
-  echo "e2e-standby: another pg$V standby scenario is running" >&2
+E2E_CT=$PRIMARY E2E_TAG=standby
+e2e_lock || exit 1
+# Deploys may target either container. Acquire both before installing cleanup,
+# which removes both; nonblocking acquisition cannot deadlock with another suite.
+exec 8>"${E2E_LOCK_DIR:-/tmp/logtap-e2e-locks}/lock.$STANDBY"
+flock -n 8 || {
+  echo "e2e-standby: another e2e holds $STANDBY" >&2
   exit 1
 }
 

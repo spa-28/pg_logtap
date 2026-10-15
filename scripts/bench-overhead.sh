@@ -20,34 +20,21 @@
 # Needs the stand from test-matrix.sh phase_stand (so deployed). The CPU
 # governor must be `performance` — a scaling governor halves TPS on developer
 # boxes and the numbers become garbage (checked below).
-set -euo pipefail
-cd "$(dirname "$0")/.."
-SECS=${1:-300}
-C=${2:-pglogtap-mx18}
-WARMUP=30
-SEED=20260825
-RX=pglogtap-bench-rx          # one-shot latency receiver, removed on exit
-NET=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$C")
-OUT=/tmp/logtap-bench
-mkdir -p "$OUT"
-
-if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
-  gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
-  [ "$gov" = performance ] || echo "WARNING: cpu governor='$gov' — set performance or the TPS deltas are garbage" >&2
-fi
+# shellcheck source=e2e-common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 cleanup() { docker rm -f "$RX" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
 
 wait_ready() {
   for _ in $(seq 1 60); do
-    [ "$(docker inspect -f '{{.State.Health.Status}}' "$C" 2>/dev/null)" = healthy ] && return 0
+    docker exec "$C" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
     sleep 1
   done
   echo "pg in $C not ready after 60s" >&2; return 1
 }
 
 set_preload() { # <''|pg_logtap>
+  unset E2E_EXPORT_EPOCH # the existing restart starts a new counter epoch
   # '' as an explicit SET is a postmaster FATAL (dlopen "" — the default and
   # an empty SET are not the same), so the off-job RESETs the entry instead.
   if [ -n "$1" ]; then
@@ -86,32 +73,86 @@ set_mute() { # <on|off>: '' is a valid log_destination and mutes the server's
 
 # One measured job: warmup run, then T seconds with the container CPU sampled
 # alongside it. Appends "tag tps lat_ms cpu_pct" lines to $OUT/jobs.
-run_job() { # <tag>
-  docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1
-  : > "$OUT/cpu"
-  # --no-stream per sample: streaming docker stats decorates output with
-  # terminal control codes even off-tty, which poisons the average.
-  ( for _ in $(seq "$SECS"); do
-      docker stats --no-stream --format '{{.CPUPerc}}' "$C" || true
-      sleep 1
-    done ) > "$OUT/cpu" &
-  local samp=$!
-  local res
-  res=$(docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$SECS" --random-seed=$SEED postgres 2>&1)
-  wait "$samp" || true
-  local tps lat cpu
-  tps=$(awk '/^tps = / {print $3}' <<<"$res" | tail -1)
-  lat=$(awk '/^latency average = / {print $4}' <<<"$res" | tail -1)
+run_job() ( # <tag> [warmed]: run_loud owns its warmup/counter boundary
+  samp='' work=''
+  trap '[ -z "$samp" ] || { kill "$samp" 2>/dev/null || true; wait "$samp" 2>/dev/null || true; }; [ -z "$work" ] || { kill "$work" 2>/dev/null || true; wait "$work" 2>/dev/null || true; }' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ "${2:-}" != warmed ]; then
+    if [ "$1" = on-mute ]; then e2e_drain_export || exit 1; fi
+    docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1 || exit $?
+    # on-loud drains in run_loud; on-mute is the other exporting profile.
+    if [ "$1" = on-mute ]; then e2e_drain_export || exit 1; fi
+  fi
+  docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$SECS" --random-seed=$SEED postgres > "$OUT/pgbench" 2>&1 &
+  work=$!
+  e2e_sample_cpu "$work" "$OUT/cpu" &
+  samp=$!
+  wait "$work" || exit $?
+  work=
+  kill "$samp" 2>/dev/null || true
+  wait "$samp" 2>/dev/null || true
+  samp=
+  tps=$(awk '/^tps = / {print $3}' "$OUT/pgbench" | tail -1)
+  lat=$(awk '/^latency average = / {print $4}' "$OUT/pgbench" | tail -1)
   cpu=$(awk '{s += $1} END {if (n = NR) printf "%.0f", s / n}' "$OUT/cpu")
   echo "$1 $tps $lat $cpu" >> "$OUT/jobs"
   echo "  $1: tps=$tps lat=${lat}ms cpu=${cpu}%"
-}
+)
 
 stats_field() { # <name> — value from pg_logtap_stats()
   docker exec "$C" psql -U postgres -Atc "SELECT pg_logtap_stats()" | sed "s/.*$1=\([0-9]*\).*/\1/"
 }
 
-echo "== pg_logtap overhead benchmark: $(date -u +%FT%TZ) secs=$SECS commit=$(git rev-parse --short HEAD) arch=$(uname -m) =="
+run_loud() (
+e2e_drain_export || exit 1
+docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1 || exit $?
+e2e_drain_export || exit 1
+base_cap=$(stats_field events_captured)
+base_snt=$(stats_field events_sent)
+base_drp=$(stats_field events_dropped)
+latency_since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+run_job on-loud warmed || exit $?
+e2e_drain_export || exit 1
+
+cap=$(( $(stats_field events_captured) - base_cap ))
+drp=$(( $(stats_field events_dropped) - base_drp ))
+snt=$(( $(stats_field events_sent) - base_snt ))
+rss=$(docker exec "$C" ps -eo rss=,args= | awk '/pg_logtap exporter/ {print $1; exit}')
+echo "  events/s=$((cap / SECS)) captured=$cap dropped=$drp sent=$snt worker_rss=$((rss / 1024))MB"
+
+echo "-- latency capture→receiver (on-loud)"
+docker logs --since "$latency_since" "$RX" 2>/dev/null | grep -E '^[0-9.]+$' | python3 -c '
+import sys
+v = sorted(float(x) for x in sys.stdin)
+if not v:
+    raise SystemExit("no latency samples")
+p = lambda q: v[min(len(v) - 1, int(q * len(v)))]
+print("  n=%d p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms" % (len(v), p(0.5), p(0.95), p(0.99), v[-1]))
+'
+)
+
+main() {
+  set -euo pipefail
+  cd "$(dirname "$0")/.."
+  SECS=${1:-300}
+  C=${2:-pglogtap-mx18}
+  E2E_CT=$C E2E_TAG=bench
+  unset E2E_EXPORT_EPOCH # never trust inherited provenance
+  e2e_lock || return 1
+  WARMUP=30
+  SEED=20260825
+  RX=pglogtap-bench-rx          # one-shot latency receiver, removed on exit
+  NET=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$C")
+  OUT=/tmp/logtap-bench
+  mkdir -p "$OUT"
+  if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+    gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+    [ "$gov" = performance ] || echo "WARNING: cpu governor='$gov' — set performance or the TPS deltas are garbage" >&2
+  fi
+  trap cleanup EXIT
+
+  echo "== pg_logtap overhead benchmark: $(date -u +%FT%TZ) secs=$SECS commit=$(git rev-parse --short HEAD) arch=$(uname -m) =="
 : > "$OUT/jobs"
 docker exec "$C" pgbench -i -q -s 8 -U postgres postgres >/dev/null 2>&1
 
@@ -154,33 +195,14 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8687), H).serve_forever()
 ' >/dev/null
 set_logging quiet
+e2e_export_begin || return 1
 docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = ''" \
   -qc "SELECT pg_reload_conf()" >/dev/null
 run_job on-quiet
 set_logging loud
 docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$RX:8687'" \
   -qc "SELECT pg_reload_conf()" >/dev/null
-base_cap=$(stats_field events_captured)
-base_snt=$(stats_field events_sent)
-base_drp=$(stats_field events_dropped)
-run_job on-loud
-sleep 3 # drain
-
-cap=$(( $(stats_field events_captured) - base_cap ))
-drp=$(( $(stats_field events_dropped) - base_drp ))
-snt=$(( $(stats_field events_sent) - base_snt ))
-rss=$(docker exec "$C" ps -eo rss=,args= | awk '/pg_logtap exporter/ {print $1; exit}')
-echo "  events/s=$((cap / SECS)) captured=$cap dropped=$drp sent=$snt worker_rss=$((rss / 1024))MB"
-
-echo "-- latency capture→receiver (on-loud)"
-docker logs "$RX" 2>/dev/null | grep -E '^[0-9.]+$' | python3 -c '
-import sys
-v = sorted(float(x) for x in sys.stdin)
-if not v:
-    raise SystemExit("no latency samples")
-p = lambda q: v[min(len(v) - 1, int(q * len(v)))]
-print("  n=%d p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms" % (len(v), p(0.5), p(0.95), p(0.99), v[-1]))
-'
+run_loud
 # Last job: same loud config with the server's own stderr muted — on-mute −
 # off-mute isolates pg_logtap with zero stderr-logging cost in either job.
 # export_url stays pointed at the receiver from on-loud (docker logs is read
@@ -195,3 +217,8 @@ column -t "$OUT/jobs" 2>/dev/null || cat "$OUT/jobs"
 set_logging quiet
 docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
   -qc "SELECT pg_reload_conf()" >/dev/null
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

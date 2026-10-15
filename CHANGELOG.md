@@ -54,11 +54,20 @@
 
 ### Changed
 
-- The next extension version is `0.6.1`. Updating a historical installation
-  normalizes `pg_logtap_stats_t` and `pg_logtap_delivery` to the fresh-install
-  column order. Noncanonical installations must remove external dependencies
-  and custom object metadata before the update; the transactional migration
-  never uses `CASCADE`, and successful normalization changes the type/view OIDs.
+- The next development version is `0.6.2`. Direct updates from historical
+  origins use the guarded `0.6.0--0.6.2` normalization, bypassing the old 0.6.1
+  hop. Noncanonical layouts refuse comments/security labels on delivery-view
+  rewrite rules before destructive DDL, as well as other custom metadata and
+  external dependencies. Successful normalization changes type/view OIDs;
+  refusals roll back the whole update, and neither drop uses `CASCADE`.
+- Fresh 0.6.2 has the same SQL API and canonical column order as 0.6.1.
+  Canonical 0.6.0 updates and the no-DDL 0.6.1 hop retain object OIDs,
+  dependencies, privileges and annotations.
+- Development deployment builds for the discovered PostgreSQL target major
+  and stops before replacing the library if the target is unknown or the build
+  fails. It preserves other preloads and leaves SQL extension updates explicit.
+- The manual OpenTelemetry stand uses unique run names, private endpoints,
+  bounded readiness and early ownership-checked cleanup.
 
 ## 0.6.0 (2026-09-30)
 
@@ -108,7 +117,7 @@
 
 ## 0.5.0 (2026-09-07)
 
-TLS export and HTTP auth-header round. Upgrade is the
+TLS export and HTTP auth headers. Upgrade is the
 0.4.5 → 0.5.0 script (the four warn-counter attributes and the re-created
 view) + binary replace + restart; the four new GUCs are all SIGHUP.
 Audit `pg_logtap.export_url` before upgrading: a network URL with a space,
@@ -470,7 +479,7 @@ fails the reload (at boot it is fatal).
   the rename — makes the queue durable again while the counter stays;
   alert on its growth, not its level.
 - e2e-tls phase 11, rapid trust rotation through SIGHUP: ca / server_name /
-  url alternated across reloads, two rounds of verified → cleared-CA fail →
+  url alternated across reloads, two cycles of verified → cleared-CA fail →
   root-pinned chain → name-mismatch fail — the per-handshake bundle rebuild
   must land the right trust decision every time (no stale bundle, no stale
   name), with failed-cycle and zero-leak asserts at every step.
@@ -572,7 +581,7 @@ fails the reload (at boot it is fatal).
 
 ## 0.4.5 (2026-09-04)
 
-Boot-safety and delivery-contract documentation round. No schema, GUC or
+Boot-safety fixes and delivery-contract documentation. No schema, GUC or
 counter changes; upgrade is binary replace + restart.
 
 ### Fixed
@@ -600,7 +609,7 @@ counter changes; upgrade is binary replace + restart.
 
 ## 0.4.4 (2026-09-04)
 
-TCP-stream parsing and accounting round.
+TCP-stream parsing and accounting fixes.
 Upgrade is the 0.4.3 → 0.4.4 script (schema unchanged — the script only
 provides the update path) + binary replace + restart; no new GUCs or
 counters.
@@ -644,7 +653,7 @@ counters.
 
 ## 0.4.3 (2026-09-03)
 
-Filesystem-hardening round. Upgrade is the
+Filesystem hardening. Upgrade is the
 0.4.2 → 0.4.3 script (schema unchanged — the script only provides the
 update path) + binary replace + restart; no new GUCs or counters.
 
@@ -686,7 +695,7 @@ update path) + binary replace + restart; no new GUCs or counters.
 
 ## 0.4.2 (2026-09-02)
 
-Delivery-hardening round. Upgrade is the
+Delivery hardening. Upgrade is the
 0.4.1 → 0.4.2 script (one new counter attribute) + binary replace +
 restart.
 
@@ -723,7 +732,7 @@ restart.
 
 ## 0.4.1 (2026-09-01)
 
-Hardening round. No schema or shmem
+Hardening fixes. No schema or shmem
 changes; upgrade is a binary replace + restart as usual.
 
 ### Fixed

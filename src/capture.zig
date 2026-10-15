@@ -230,11 +230,14 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     const d = edata.*;
     if (d.message == null) return;
     const msg: [*:0]const u8 = @ptrCast(d.message);
+    // detail_log is the server's effective DETAIL for logging. A non-null
+    // empty value intentionally overrides detail.
+    const detail = if (d.detail_log != null) d.detail_log else d.detail;
     // pattern_exclude sees every text field the event would carry — the
     // query only when it is actually captured (field_query), matching what
     // ships: no excluding on text that never leaves the process.
     const filter_extra = [_]?[*:0]const u8{
-        @as(?[*:0]const u8, @ptrCast(d.detail)),
+        @as(?[*:0]const u8, @ptrCast(detail)),
         @as(?[*:0]const u8, @ptrCast(d.hint)),
         @as(?[*:0]const u8, @ptrCast(d.context)),
         if (guc_field_query) @as(?[*:0]const u8, @ptrCast(pg.debug_query_string)) else null,
@@ -264,11 +267,18 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
         filter.statementMessageId(std.mem.span(@as([*:0]const u8, @ptrCast(d.message_id))))
     else
         false;
+    // Prepared-statement DETAIL gets the tail cut only for these two
+    // untranslated primary IDs; translated DETAIL text (such as "prepare:")
+    // is never used as provenance. Extended-protocol wrappers keep value cuts.
+    const detail_stmt_line = if (d.message_id != null)
+        filter.statementDetailMessageId(std.mem.span(@as([*:0]const u8, @ptrCast(d.message_id))))
+    else
+        false;
     const msg_bytes = copyMsg(&entry, d.message, if (stmt_line) .tail else .none);
     // Auxiliary fields keep their localized wrappers. Password assignments and
     // PostgreSQL's structural `$N = 'value'` payloads are masked wherever they
     // occur, including log_parameter_max_length_on_error CONTEXT lines.
-    copyText(&entry.detail, &entry, .detail, d.detail, .value);
+    copyText(&entry.detail, &entry, .detail, detail, if (detail_stmt_line) .tail else .value);
     copyText(&entry.hint, &entry, .hint, d.hint, .value);
     copyText(&entry.context, &entry, .context, d.context, .value);
     copyStr(&entry.filename, &entry, .filename, d.filename);
@@ -292,39 +302,13 @@ fn copyStr(dst: anytype, entry: *ring.ShmLogEntry, field: ring.TruncField, src: 
     ring.setStr(dst, &entry.truncated_mask, field, std.mem.span(@as([*:0]const u8, @ptrCast(src))));
 }
 
-/// Which password cut a field gets: none; the tail cut (query and
-/// statement-embedded message lines — everything after a standalone
-/// `password` token goes, pgaudit semantics); or the value cut
-/// (detail/hint/context — only a quoted value assigned to the token is
-/// masked, so PG's own `password authentication failed for user "x"`
-/// diagnostics survive verbatim).
-const PwCut = enum { none, tail, value };
+const PwCut = filter.PwCut;
 
-/// Each changed layer writes to the scratch buffer opposite its input. Two
-/// buffers are enough for any number of passes, and avoid overlapping copies
-/// when one auxiliary field contains both password and bind assignments.
-fn scratchFor(text: []const u8) []u8 {
-    const len = messageMax() + 1;
-    return if (text.ptr == redact_a[0..].ptr) redact_b[0..len] else redact_a[0..len];
-}
-
-/// Each layer must preserve clipping reported by an earlier layer.
-fn applyLayer(out: filter.Masked, layer: filter.Masked) filter.Masked {
-    return .{ .text = layer.text, .clipped = out.clipped or layer.clipped };
-}
-
+/// Capture owns the BSS scratch buffers; filter owns the pure layer ordering.
 fn maskThroughLayers(text: []const u8, pw: PwCut) filter.Masked {
-    var out = filter.Masked{ .text = text, .clipped = false };
-    switch (pw) {
-        .none => {},
-        .tail => out = applyLayer(out, filter.redactPassword(scratchFor(out.text), out.text)),
-        .value => {
-            out = applyLayer(out, filter.redactPasswordValue(scratchFor(out.text), out.text));
-            out = applyLayer(out, filter.redactParamValues(scratchFor(out.text), out.text));
-        },
-    }
-    if (redactor) |*red| out = applyLayer(out, red.apply(scratchFor(out.text), out.text));
-    return out;
+    const red: ?*const filter.Redactor = if (redactor) |*active| active else null;
+    const scratch_len = messageMax() + 1;
+    return filter.maskThroughLayers(text, pw, red, redact_a[0..scratch_len], redact_b[0..scratch_len]);
 }
 
 /// Copy a C string field through the redaction layers into its fixed slot.

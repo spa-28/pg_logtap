@@ -132,24 +132,35 @@ the currently installed URL/content type/extra headers; PostgreSQL does not
 atomically validate a future multi-GUC tuple, so the runtime renderer remains
 the final backstop.
 
-## SQL upgrade to 0.6.1
+## Development SQL upgrade to 0.6.2
 
-Historical update chains appended statistics fields, so their composite type
-and view can have a different physical order from a fresh 0.6.0 installation.
-The `0.6.0--0.6.1` migration validates the exact released shape. It leaves an
-already-canonical pair untouched, preserving OIDs and dependencies; otherwise
-it drops and recreates only the view and type in canonical delivery order.
+The current tree prepares 0.6.2; this is not a release-availability claim.
+Install the matching library/control and all SQL files, preserve existing
+preloads and restart, then explicitly `ALTER EXTENSION pg_logtap UPDATE TO
+'0.6.2'` in each installed database. In-place development deployment verifies
+the binary but never performs that SQL update or recreates an extension.
 
-The replacement takes exclusive locks and changes both OIDs. Before updating a
+Historical chains appended statistics fields, producing a physical order
+unlike a fresh 0.6.0 installation. Their selected current route goes through
+0.6.0 **directly to 0.6.2**, bypassing the frozen 0.6.1 normalization. The
+`0.6.0--0.6.2` script validates the released shape and leaves an already-canonical
+pair untouched, preserving OIDs, dependencies and metadata. Otherwise it drops
+and recreates the view and type in canonical delivery order. The
+`0.6.1--0.6.2` hop performs no object DDL: the SQL API/order is already canonical
+and is identical to fresh 0.6.2.
+
+Replacement takes exclusive locks and changes OIDs. Before updating a
 noncanonical installation, remove external dependencies and restore baseline
-ownership/privileges. Remove custom column defaults, grants, comments, labels
-and options; these guards also cover the view's implicit row type and generated
-array types. Reset default table/type privileges that apply to the extension
-schema. Reconnect or reprepare OID-caching clients afterward, then restore
-intentional dependencies and metadata. Both drops use `RESTRICT`, never
-`CASCADE`: a dependency or
-unsupported customization aborts the complete `ALTER EXTENSION` transaction,
-leaving `extversion`, objects, OIDs and old order unchanged.
+ownership/privileges. Save and remove custom column defaults, grants, comments,
+labels and options; guards cover the view's implicit row type, generated array
+types **and delivery-view rewrite rules**, including `_RETURN` rule comments.
+Reset default table/type privileges affecting the extension schema. Reconnect
+or reprepare OID-caching clients afterward, then restore intentional
+dependencies and metadata. Both drops use `RESTRICT`, never `CASCADE`:
+unsupported customization or a dependency aborts the complete update,
+leaving `extversion`, objects, OIDs, annotations and old order unchanged.
+Already-lost annotations from an earlier historical update cannot be recovered
+by the new path.
 
 ## Ordering and identity
 

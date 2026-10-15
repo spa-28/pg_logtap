@@ -31,34 +31,12 @@
 # Usage: scripts/storm.sh [secs] [pg_major] [modes]   (default 300 18 loud)
 # The CPU governor must be `performance` (checked; a scaling governor halves
 # TPS on developer boxes).
-set -euo pipefail
-cd "$(dirname "$0")/.."
-SECS=${1:-300}
-V=${2:-18}
-MODES=${3:-loud}
-C=pglogtap-mx$V
-WARMUP=30
-SEED=20260825
-RX=pglogtap-storm-rx
-COMPOSE="docker compose -f tests/e2e/compose.yaml"
-OUT=/tmp/logtap-storm
-DUMP=/tmp/logtap-e2e/vector-out.jsonl # the compose vector's file sink (host side)
-mkdir -p "$OUT"
-
-case "$(uname -m)" in
-  x86_64)  ZIG_TARGET="x86_64-linux-gnu.2.28" ;;
-  aarch64) ZIG_TARGET="aarch64-linux-gnu.2.28" ;;
-  *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-esac
-
-if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
-  gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
-  [ "$gov" = performance ] || echo "WARNING: cpu governor='$gov' — set performance or the numbers are garbage" >&2
-fi
+# shellcheck source=e2e-common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 wait_ready() {
   for _ in $(seq 1 60); do
-    [ "$(docker inspect -f '{{.State.Health.Status}}' "$C" 2>/dev/null)" = healthy ] && return 0
+    docker exec "$C" pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1 && return 0
     sleep 2
   done
   echo "pg in $C not ready after 120s" >&2
@@ -123,15 +101,147 @@ HTTPServer(("0.0.0.0", 8687), H).serve_forever()
   sleep 2
 }
 
+build_extension() {
+  local host_config
+  if host_config=$(e2e_pg_config "$V"); then
+    PG_CONFIG="$host_config" zig build -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe -p "dist/pg$V"
+  else
+    scripts/build.sh "$V" -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe >/dev/null || return 1
+    mkdir -p "dist/pg$V/lib" && cp zig-out/lib/pg_logtap.so "dist/pg$V/lib/"
+  fi
+}
+
+run_mode() (
+  mode=$1 samp='' work=''
+  trap '[ -z "$samp" ] || { kill "$samp" 2>/dev/null || true; wait "$samp" 2>/dev/null || true; }; [ -z "$work" ] || { kill "$work" 2>/dev/null || true; wait "$work" 2>/dev/null || true; }' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  e2e_drain_export || exit 1
+  echo "== mode=$mode: warmup ${WARMUP}s (discarded) + storm ${SECS}s =="
+  set_mode "$mode"
+  if [ "$mode" = chain ]; then
+    # export stays on the compose chain: vector sinks to console+file+vlogs
+    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
+      -qc "SELECT pg_reload_conf()" >/dev/null
+    # delivery into the file sink is counted as a line delta: the dump is
+    # root-owned (vector's container creates it), so no truncating from the
+    # host — and it grows unbounded, clean /tmp/logtap-e2e between runs
+    warm_lines=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
+    warm_sent=$(stats_field events_sent)
+    warm_replayed=$(stats_field events_replayed)
+    sleep 2
+  else
+    start_rx
+    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$RX:8687'" \
+      -qc "SELECT pg_reload_conf()" >/dev/null
+    sleep 2
+  fi
+
+  docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1 || exit $?
+  e2e_drain_export || exit 1
+  if [ "$mode" = chain ]; then
+    # Vector ACK precedes its file-sink flush: account for warmup there too.
+    target=$((warm_lines + $(stats_field events_sent) - warm_sent + $(stats_field events_replayed) - warm_replayed))
+    for _ in $(seq 1 60); do
+      lines0=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
+      [ "$lines0" -ge "$target" ] && break
+      sleep 1
+    done
+    [ "$lines0" -ge "$target" ] || { echo "warmup file sink did not drain" >&2; exit 1; }
+    base_replayed=$(stats_field events_replayed)
+  fi
+  base_cap=$(stats_field events_captured); base_snt=$(stats_field events_sent)
+  base_drp=$(stats_field events_dropped);  base_lst=$(stats_field events_lost)
+  latency_since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+
+  docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$SECS" -s 8 --random-seed=$SEED postgres > "$OUT/pgbench.$mode" 2>&1 &
+  work=$!
+  e2e_sample_cpu "$work" "$OUT/cpu.$mode" &
+  samp=$!
+  wait "$work" || exit $?
+  work=
+  kill "$samp" 2>/dev/null || true
+  wait "$samp" 2>/dev/null || true
+  samp=
+  e2e_drain_export || exit 1
+
+  grep -E "^tps = |^latency average = " "$OUT/pgbench.$mode" | head -2
+  cpu=$(awk '{s += $1} END {if (n = NR) printf "%.0f", s / n}' "$OUT/cpu.$mode")
+  cap=$(( $(stats_field events_captured) - base_cap ))
+  drp=$(( $(stats_field events_dropped) - base_drp ))
+  lst=$(( $(stats_field events_lost) - base_lst ))
+  snt=$(( $(stats_field events_sent) - base_snt ))
+  rss=$(docker exec "$C" ps -eo rss=,args= | awk '/pg_logtap exporter/ {print $1; exit}')
+  echo "RESULT[$mode] events/s=$((cap / SECS)) captured=$cap sent=$snt dropped=$drp lost=$lst worker_rss=$((rss / 1024))MB cpu=${cpu}%"
+
+  if [ "$mode" = chain ]; then
+    # Both live and replay ACKs precede Vector's asynchronous file-sink flush.
+    target=$((snt + $(stats_field events_replayed) - base_replayed))
+    for _ in $(seq 1 60); do
+      lines=$(( $(wc -l < "$DUMP" 2>/dev/null || echo 0) - lines0 ))
+      [ "$lines" -ge "$target" ] && break
+      sleep 1
+    done
+    [ "$lines" -ge "$target" ] || { echo "measured file sink did not drain" >&2; exit 1; }
+    echo "RESULT[chain] vector_file_lines=$lines (end-to-end delivery into the file sink)"
+    # ask victoria-logs itself how much it ingested over this window
+    docker run --rm --network "$NET" curlimages/curl:8.8.0 -G -s \
+      'http://pglogtap-vlogs-e2e:9428/select/logsql/query' \
+      --data-urlencode 'query=* | count()' --data-urlencode "time_range=${SECS}s" \
+      | sed 's/^/RESULT[chain] vlogs_count=/' || echo "RESULT[chain] vlogs_count=query failed"
+    return 0
+  fi
+
+  docker logs --since "$latency_since" "$RX" > "$OUT/receiver.$mode" 2>/dev/null || exit 1
+  grep -E '^[0-9.]+$' "$OUT/receiver.$mode" > "$OUT/lat.$mode" || [ "$?" = 1 ] || exit 1
+  # quiet legitimately captures nothing the receiver would see — no samples
+  # is the expected outcome there, not an error
+  python3 - "$OUT/lat.$mode" <<'PYEOF'
+import sys
+v = sorted(float(x) for x in open(sys.argv[1]))
+if not v:
+    print("RESULT[%s] lat n=0 (no events reached the receiver)" % sys.argv[1].rsplit(".", 1)[-1])
+else:
+    p = lambda q: v[min(len(v) - 1, int(q * len(v)))]
+    print("RESULT[%s] lat n=%d p50=%.1fms p95=%.1fms p99=%.1fms p99.9=%.1fms"
+          % (sys.argv[1].rsplit(".", 1)[-1], len(v), p(0.5), p(0.95), p(0.99), p(0.999)))
+PYEOF
+)
+
+main() {
+set -euo pipefail
+cd "$(dirname "$0")/.."
+SECS=${1:-300}
+V=${2:-18}
+MODES=${3:-loud}
+C=pglogtap-mx$V
+E2E_CT=$C E2E_TAG=storm
+unset E2E_EXPORT_EPOCH # never trust inherited provenance across setup restarts
+e2e_lock
+e2e_stand_lock
+WARMUP=30
+SEED=20260825
+RX=pglogtap-storm-rx
+COMPOSE="docker compose -f tests/e2e/compose.yaml"
+OUT=/tmp/logtap-storm
+DUMP=/tmp/logtap-e2e/vector-out.jsonl # the compose vector's file sink (host side)
+mkdir -p "$OUT"
+
+case "$(uname -m)" in
+  x86_64)  ZIG_TARGET="x86_64-linux-gnu.2.28" ;;
+  aarch64) ZIG_TARGET="aarch64-linux-gnu.2.28" ;;
+  *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+esac
+
+if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+  gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+  [ "$gov" = performance ] || echo "WARNING: cpu governor='$gov' — set performance or the numbers are garbage" >&2
+fi
+
 echo "== storm: $(date -u +%FT%TZ) secs=$SECS modes=$MODES commit=$(git rev-parse --short HEAD) pg$V =="
 
 echo "-- build (ReleaseSafe, release target)"
-if command -v pg_config >/dev/null 2>&1; then
-  zig build -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe -p "dist/pg$V"
-else
-  scripts/build.sh "$V" -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseSafe >/dev/null
-  mkdir -p "dist/pg$V/lib" && cp zig-out/lib/pg_logtap.so "dist/pg$V/lib/"
-fi
+build_extension
 
 echo "-- stand: pg first and alone, then the receivers"
 # The service container may live under another major's name from a previous
@@ -165,77 +275,9 @@ docker exec "$C" psql -U postgres -qc "CREATE EXTENSION pg_logtap" >/dev/null
 echo "  version: $(docker exec "$C" psql -U postgres -Atc 'SELECT pg_logtap_version()')"
 
 docker exec "$C" pgbench -i -q -s 8 -U postgres postgres >/dev/null 2>&1
+e2e_export_begin || return 1
 
-for mode in ${MODES//,/ }; do
-  echo "== mode=$mode: warmup ${WARMUP}s (discarded) + storm ${SECS}s =="
-  set_mode "$mode"
-  if [ "$mode" = chain ]; then
-    # export stays on the compose chain: vector sinks to console+file+vlogs
-    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://pglogtap-vector:8686'" \
-      -qc "SELECT pg_reload_conf()" >/dev/null
-    # delivery into the file sink is counted as a line delta: the dump is
-    # root-owned (vector's container creates it), so no truncating from the
-    # host — and it grows unbounded, clean /tmp/logtap-e2e between runs
-    lines0=$(wc -l < "$DUMP" 2>/dev/null || echo 0)
-    sleep 2
-  else
-    start_rx
-    docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET pg_logtap.export_url = 'http://$RX:8687'" \
-      -qc "SELECT pg_reload_conf()" >/dev/null
-    sleep 2
-  fi
-
-  docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$WARMUP" --random-seed=$SEED postgres >/dev/null 2>&1
-  base_cap=$(stats_field events_captured); base_snt=$(stats_field events_sent)
-  base_drp=$(stats_field events_dropped);  base_lst=$(stats_field events_lost)
-
-  : > "$OUT/cpu.$mode"
-  # --no-stream per sample: streaming docker stats decorates output with
-  # terminal control codes even off-tty, which poisons the average.
-  ( for _ in $(seq "$SECS"); do
-      docker stats --no-stream --format '{{.CPUPerc}}' "$C" || true
-      sleep 1
-    done ) > "$OUT/cpu.$mode" &
-  samp=$!
-  res=$(docker exec "$C" pgbench -U postgres -c 8 -j 2 -T "$SECS" -s 8 --random-seed=$SEED postgres 2>&1)
-  kill "$samp" 2>/dev/null || true # docker stats takes ~1-2s a call: the loop overruns the storm
-  wait "$samp" 2>/dev/null || true
-  sleep 5 # drain
-
-  echo "$res" | grep -E "^tps = |^latency average = " | head -2
-  cpu=$(awk '{s += $1} END {if (n = NR) printf "%.0f", s / n}' "$OUT/cpu.$mode")
-  cap=$(( $(stats_field events_captured) - base_cap ))
-  drp=$(( $(stats_field events_dropped) - base_drp ))
-  lst=$(( $(stats_field events_lost) - base_lst ))
-  snt=$(( $(stats_field events_sent) - base_snt ))
-  rss=$(docker exec "$C" ps -eo rss=,args= | awk '/pg_logtap exporter/ {print $1; exit}')
-  echo "RESULT[$mode] events/s=$((cap / SECS)) captured=$cap sent=$snt dropped=$drp lost=$lst worker_rss=$((rss / 1024))MB cpu=${cpu}%"
-
-  if [ "$mode" = chain ]; then
-    lines=$(( $(wc -l < "$DUMP" 2>/dev/null || echo 0) - lines0 ))
-    echo "RESULT[chain] vector_file_lines=$lines (end-to-end delivery into the file sink)"
-    # ask victoria-logs itself how much it ingested over this window
-    docker run --rm --network "$NET" curlimages/curl:8.8.0 -G -s \
-      'http://pglogtap-vlogs-e2e:9428/select/logsql/query' \
-      --data-urlencode 'query=* | count()' --data-urlencode "time_range=${SECS}s" \
-      | sed 's/^/RESULT[chain] vlogs_count=/' || echo "RESULT[chain] vlogs_count=query failed"
-    continue
-  fi
-
-  docker logs "$RX" 2>/dev/null | grep -E '^[0-9.]+$' > "$OUT/lat.$mode"
-  # quiet legitimately captures nothing the receiver would see — no samples
-  # is the expected outcome there, not an error
-  python3 - "$OUT/lat.$mode" <<'PYEOF'
-import sys
-v = sorted(float(x) for x in open(sys.argv[1]))
-if not v:
-    print("RESULT[%s] lat n=0 (no events reached the receiver)" % sys.argv[1].rsplit(".", 1)[-1])
-else:
-    p = lambda q: v[min(len(v) - 1, int(q * len(v)))]
-    print("RESULT[%s] lat n=%d p50=%.1fms p95=%.1fms p99=%.1fms p99.9=%.1fms"
-          % (sys.argv[1].rsplit(".", 1)[-1], len(v), p(0.5), p(0.95), p(0.99), p(0.999)))
-PYEOF
-done
+for mode in ${MODES//,/ }; do run_mode "$mode"; done
 
 echo "-- restore quiet config"
 docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET log_min_messages = 'warning'" \
@@ -248,3 +290,8 @@ docker exec "$C" psql -U postgres -qc "ALTER SYSTEM SET log_min_messages = 'warn
 docker rm -f "$RX" >/dev/null 2>&1 || true
 echo "stand left up for post-mortem: $C (+compose receivers)"
 echo "teardown: docker rm -f $C && $COMPOSE down"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

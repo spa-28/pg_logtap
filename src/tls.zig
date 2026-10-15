@@ -37,6 +37,12 @@ fn monotonicNowUs(io_ctx: std.Io) i64 {
 /// the minimum the client asserts for its socket-facing buffers.
 const buf_len = tls.max_ciphertext_record_len;
 
+/// The TLS client accepts a hostname slice directly; bound it before a GUC
+/// value can become an unbounded SNI or certificate-verification input.
+pub fn serverNameValid(name: []const u8) bool {
+    return name.len <= 255;
+}
+
 pub const Options = struct {
     /// PEM file with the receiver's CA (the receiver's own certificate for a
     /// self-signed one). Empty = system CA roots. A custom file REPLACES the
@@ -359,9 +365,8 @@ fn failIfEmpty(comptime fmt: []const u8, args: anytype) void {
 /// (rotation), and a stale bundle turns every handshake into a mystery
 /// failure. A PEM parse per send (~ms on a KB-scale file, one send per
 /// flush cycle) is cheaper than any stat-based invalidation. An empty path
-/// clears the bundle too — empty means SYSTEM roots, not "whatever the
-/// previous value loaded" — and the TLS client's own incremental rescan of
-/// the system roots then fills it.
+/// replaces the previous bundle with a fresh system-root scan; this explicit
+/// scan is necessary because the caller supplies the bundle to the TLS client.
 /// Two operator mistakes fail HERE, with the path in the reason, instead of
 /// later as an opaque chain error: a wrong/unreadable path, and a file that
 /// parses but holds no certificates (created empty, or the wrong file).
@@ -375,7 +380,17 @@ fn bundleReady(ca_path: []const u8) bool {
     defer ca_lock.unlock(io());
     ca_bundle.deinit(alloc);
     ca_bundle = .empty;
-    if (ca_path.len == 0) return true;
+    if (ca_path.len == 0) {
+        ca_bundle.rescan(alloc, io(), realNow()) catch |err| {
+            fail("tls system roots: {s}", .{@errorName(err)});
+            return false;
+        };
+        if (ca_bundle.map.count() == 0) {
+            fail("tls system roots: no certificates", .{});
+            return false;
+        }
+        return true;
+    }
     if (ca_path.len > 4096) {
         fail("tls ca path too long ({d} bytes)", .{ca_path.len});
         return false;
@@ -394,6 +409,23 @@ fn bundleReady(ca_path: []const u8) bool {
     return true;
 }
 
+test "TLS server name has an exact bounded override" {
+    const at_limit: [255]u8 = @splat('a');
+    const over_limit: [256]u8 = @splat('a');
+    const huge: [65_536]u8 = @splat('a');
+    try std.testing.expect(serverNameValid(""));
+    try std.testing.expect(serverNameValid(&at_limit));
+    try std.testing.expect(!serverNameValid(&over_limit));
+    try std.testing.expect(!serverNameValid(&huge));
+}
+
+test "invalid effective server name fails before TLS initialization" {
+    const over_limit: [256]u8 = @splat('a');
+    const deadline_us = monotonicNowUs(io()) + 1_000_000;
+    try std.testing.expect(connect(-1, "url-host", .{ .server_name = &over_limit, .verify = false }, deadline_us) == null);
+    try std.testing.expectEqualStrings("tls server name too long (256 bytes)", last_error);
+}
+
 /// Handshake over a connected fd. `deadline_us` is the send attempt's
 /// absolute budget on worker.zig's netNowUs() monotonic clock (same clock
 /// as monotonicNowUs() here); every socket read AND write — inside the
@@ -407,6 +439,11 @@ fn bundleReady(ca_path: []const u8) bool {
 /// it punches a plain one).
 pub fn connect(fd: c_int, url_host: []const u8, opts: Options, deadline_us: i64) ?*Conn {
     clearFailure();
+    const host = if (opts.server_name.len > 0) opts.server_name else url_host;
+    if (!serverNameValid(host)) {
+        fail("tls server name too long ({d} bytes)", .{host.len});
+        return null;
+    }
     const c = &conn_storage;
     const io_ref = io();
     c.deadline_reader = .{
@@ -435,7 +472,6 @@ pub fn connect(fd: c_int, url_host: []const u8, opts: Options, deadline_us: i64)
     };
     if (opts.verify) {
         if (!bundleReady(opts.ca_pem)) return null;
-        const host = if (opts.server_name.len > 0) opts.server_name else url_host;
         client_opts.host = .{ .explicit = host };
         client_opts.ca = .{ .bundle = .{ .gpa = alloc, .io = io_ref, .lock = &ca_lock, .bundle = &ca_bundle } };
     }

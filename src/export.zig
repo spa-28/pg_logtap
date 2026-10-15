@@ -9,9 +9,34 @@ const std = @import("std");
 
 pub const host_max: usize = 255;
 pub const http_head_cap: usize = 2048;
+/// Bounded response start line; accommodates normal reason phrases without
+/// parsing or retaining response headers/body.
+pub const http_status_line_cap: usize = 128;
 
 pub const Endpoint = struct { host: []const u8, port: u16, tls: bool = false };
 pub const Http = struct { host: []const u8, port: u16, path: []const u8, tls: bool = false };
+
+/// Returns the status code only for a complete HTTP/1.x status-code prefix.
+/// The caller owns finding the CRLF; the required space after the code keeps
+/// a fourth digit from being misread as a valid response.
+pub fn httpStatusCode(prefix: []const u8) ?u16 {
+    if (prefix.len < 13 or !std.mem.eql(u8, prefix[0..7], "HTTP/1.") or
+        (prefix[7] != '0' and prefix[7] != '1') or prefix[8] != ' ' or prefix[12] != ' ')
+    {
+        return null;
+    }
+    const hundreds = prefix[9];
+    const tens = prefix[10];
+    const ones = prefix[11];
+    if (hundreds < '0' or hundreds > '9' or tens < '0' or tens > '9' or ones < '0' or ones > '9') return null;
+    return @as(u16, hundreds - '0') * 100 + @as(u16, tens - '0') * 10 + @as(u16, ones - '0');
+}
+
+/// A resolver-cache entry must not travel backwards across the monotonic
+/// clock, and may serve failed DNS only for its fixed one-minute lease.
+pub fn dnsCacheFresh(cached_us: i64, now_us: i64) bool {
+    return now_us >= cached_us and now_us - cached_us <= 60_000_000;
+}
 
 pub const Dest = union(enum) {
     http: Http,
@@ -162,6 +187,27 @@ fn parseEndpoint(hostport: []const u8) ?Endpoint {
     if (host.len == 0 or host.len > host_max or std.mem.findScalar(u8, host, ':') != null) return null; // IPv6 / garbage
     const port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return null;
     return .{ .host = host, .port = port };
+}
+
+test "HTTP status code accepts only complete numeric HTTP/1.x status prefixes" {
+    try std.testing.expectEqual(@as(?u16, 200), httpStatusCode("HTTP/1.1 200 OK"));
+    try std.testing.expectEqual(@as(?u16, 204), httpStatusCode("HTTP/1.0 204 No Content"));
+    try std.testing.expectEqual(@as(?u16, 299), httpStatusCode("HTTP/1.1 299 Custom"));
+
+    try std.testing.expectEqual(@as(?u16, 199), httpStatusCode("HTTP/1.1 199 Old"));
+    try std.testing.expectEqual(@as(?u16, 300), httpStatusCode("HTTP/1.1 300 Multiple"));
+    try std.testing.expectEqual(@as(?u16, 401), httpStatusCode("HTTP/1.1 401 Unauthorized"));
+    try std.testing.expectEqual(@as(?u16, 500), httpStatusCode("HTTP/1.1 500 Error"));
+
+    for ([_][]const u8{ "HTTP/1.1 2xx Bad", "HTTP/1.1 20x Bad", "HTTP/2.0 200 Bad", "HTTP/1.1-200 Bad", "HTTP/1.1 200", "HTTP/1.1 2000 Bad" }) |line| {
+        try std.testing.expect(httpStatusCode(line) == null);
+    }
+}
+
+test "DNS cache freshness keeps the full monotonic one-minute lease" {
+    try std.testing.expect(dnsCacheFresh(5, 60_000_005));
+    try std.testing.expect(!dnsCacheFresh(5, 60_000_006));
+    try std.testing.expect(!dnsCacheFresh(6, 5));
 }
 
 test "parse http" {
