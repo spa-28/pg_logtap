@@ -519,8 +519,7 @@ def dribble_write_tls(port, ctx):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     srv.bind(("0.0.0.0", port))
     srv.listen(8)
-    while True:
-        conn, _ = srv.accept()
+    def handle(conn):
         tls = None
         stage = None
         try:
@@ -550,6 +549,9 @@ def dribble_write_tls(port, ctx):
                 conn.close()
             except OSError:
                 pass
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 threading.Thread(target=dribble_write_tls, args=(int(os.environ["PORT_TDRIB"]), ctx), daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)

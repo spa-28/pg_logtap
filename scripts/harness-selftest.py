@@ -1548,29 +1548,45 @@ def test_tls_fixture_semantics():
         if "connected" not in (tmp / "wdrib-evidence").read_text() or "bytes" not in (tmp / "wdrib-evidence").read_text():
             fail("plain write dribbler lacks connection/byte stage evidence")
 
+        class QueuedThread:
+            pending = []
+            def __init__(self, *, target, args=(), daemon=None):
+                self.target, self.args, self.daemon = target, args, daemon
+            def start(self):
+                self.pending.append(self)
+            def run(self):
+                self.target(*self.args)
+
         raw_conns = [_Conn([]), _Conn([])]
-        tls_conns = [_Conn([b"P", b""]), _Conn([b""])]
+        tls_conns = [_Conn([b"P", b""]), _Conn([b"{", b""])]
         server = _Server(raw_conns)
         class Context:
             def __init__(self): self.items = iter(tls_conns)
             def wrap_socket(self, _raw, server_side): return next(self.items)
         func = types.FunctionType(env["dribble_write_tls"].__code__,
                                   {**env, "socket": _Sockets(server), "d": str(tmp),
+                                   "threading": types.SimpleNamespace(Thread=QueuedThread),
                                    "time": types.SimpleNamespace(sleep=lambda _: None)})
         try:
             func(1, Context())
         except StopIteration:
             pass
-        if server.accepted != 3 or any(not conn.closed for conn in raw_conns + tls_conns):
+        if server.accepted != 3 or len(QueuedThread.pending) != 2 or not all(item.daemon for item in QueuedThread.pending):
+            fail("TLS write dribbler did not dispatch two accepted peers before either handler ran")
+        for handler in QueuedThread.pending:
+            handler.run()
+        if any(not conn.closed for conn in raw_conns + tls_conns):
             fail("TLS write dribbler did not stop at EOF and close wrapper plus accepted socket")
         evidence = (tmp / "tdrib-evidence").read_text()
         https_stage = {"https-connected", "https-handshake", "https-bytes"}
         tcps_stage = {"tcps-connected", "tcps-handshake", "tcps-bytes"}
-        if not https_stage <= set(evidence.splitlines()) or tcps_stage <= set(evidence.splitlines()):
-            fail("TLS write dribbler did not keep HTTPS evidence distinct from tcps")
+        if not https_stage <= set(evidence.splitlines()) or not tcps_stage <= set(evidence.splitlines()):
+            fail("TLS write dribbler did not retain HTTPS and tcps stage evidence")
 
         # A late HTTPS session cannot satisfy the tcps assertion: only a fresh
         # raw-NDJSON byte through the actual fixture creates tcps stage lines.
+        QueuedThread.pending.clear()
+        (tmp / "tdrib-evidence").unlink()
         raw_conns = [_Conn([])]
         tls_conns = [_Conn([b"{", b""])]
         server = _Server(raw_conns)
@@ -1578,11 +1594,15 @@ def test_tls_fixture_semantics():
             def wrap_socket(self, _raw, server_side): return tls_conns.pop(0)
         func = types.FunctionType(env["dribble_write_tls"].__code__,
                                   {**env, "socket": _Sockets(server), "d": str(tmp),
+                                   "threading": types.SimpleNamespace(Thread=QueuedThread),
                                    "time": types.SimpleNamespace(sleep=lambda _: None)})
         try:
             func(1, TcpsContext())
         except (IndexError, StopIteration):
             pass
+        if len(QueuedThread.pending) != 1 or not QueuedThread.pending[0].daemon:
+            fail("TLS write dribbler did not dispatch the fresh tcps peer")
+        QueuedThread.pending[0].run()
         if not tcps_stage <= set((tmp / "tdrib-evidence").read_text().splitlines()):
             fail("TLS write dribbler lacks fresh tcps connection/handshake/byte evidence")
 
