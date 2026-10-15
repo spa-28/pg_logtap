@@ -485,11 +485,17 @@ fixture_size=$(docker exec "$PG_CT" stat -c %s "$FB")
 setguc pg_logtap.level_min 23
 setguc pg_logtap.export_url "http://127.0.0.1:1"
 setguc pg_logtap.export_fallback_file "$FB_REL"
-setguc pg_logtap.fallback_max_mb 1
+# Do not let boot-time flushing trim the queue before the EEXIST fixture exists.
+setguc pg_logtap.fallback_max_mb 512
 docker restart "$PG_CT" >/dev/null; wait_ready; sleep 2
 setguc pg_logtap.level_min 15; reload; sleep 1
+[ "$(statf events_compacted)" = 0 ] || fail "count metadata compaction: fixture trimmed before stale temp staging"
 # Ordinary unrelated EEXIST litter must still be removed during compaction.
-docker exec -u postgres "$PG_CT" sh -c "printf garbage > '$FB.compact'"
+docker exec -u postgres "$PG_CT" sh -c "printf garbage > '$FB.compact'" \
+  || fail "count metadata compaction: could not stage ordinary stale temp"
+[ "$(docker exec "$PG_CT" stat -c %s "$FB.compact")" = 7 ] \
+  || fail "count metadata compaction: stale temp fixture absent"
+setguc pg_logtap.fallback_max_mb 1; reload; sleep 1
 gen compacttrigger 1
 n=0; while [ "$n" -lt 20 ] && [ "$(statf events_compacted)" -eq 0 ]; do
   n=$((n + 1)); sleep 1
