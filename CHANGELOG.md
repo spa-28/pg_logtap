@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 (2026-10-16)
 
 ### Fixed
 
@@ -60,7 +60,7 @@
 
 ### Changed
 
-- The next development version is `0.6.2`. Direct updates from historical
+- Version `0.6.2` adds guarded SQL upgrades. Direct updates from historical
   origins use the guarded `0.6.0--0.6.2` normalization, bypassing the old 0.6.1
   hop. Noncanonical layouts refuse comments/security labels on delivery-view
   rewrite rules before destructive DDL, as well as other custom metadata and

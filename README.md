@@ -63,8 +63,8 @@ Grab the package matching your PostgreSQL major from the
 installation:
 
 ```sh
-curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.6.0/pg_logtap-0.6.0-pg18-amd64.tar.gz
-tar -xzf pg_logtap-0.6.0-pg18-amd64.tar.gz          # → lib/ + extension/
+curl -LO https://github.com/spa-28/pg_logtap/releases/download/v0.6.2/pg_logtap-0.6.2-pg18-amd64.tar.gz
+tar -xzf pg_logtap-0.6.2-pg18-amd64.tar.gz          # → lib/ + extension/
 sudo install -m 755 lib/pg_logtap.so "$(pg_config --pkglibdir)/pg_logtap.so"
 sudo install -m 644 extension/* "$(pg_config --sharedir)/extension/"
 ```
@@ -113,12 +113,11 @@ On PostgreSQL ≤ 16, `ALTER SYSTEM SET pg_logtap.*` before the first restart is
 rejected (GUCs register in `_PG_init`) — enable the preload, restart, then set
 GUCs and restart again.
 
-### Development upgrade to 0.6.2
+### Upgrade to 0.6.2
 
-Version **0.6.2** is under development, not a published release. To upgrade to
-it, install the matching library, control file and **all** versioned SQL files,
-preserve the existing preload list, restart PostgreSQL, then update each
-database where the extension is installed:
+To upgrade to **0.6.2**, install the matching library, control file and **all**
+versioned SQL files, preserve the existing preload list, restart PostgreSQL,
+then update each database where the extension is installed:
 
 ```sql
 ALTER EXTENSION pg_logtap UPDATE TO '0.6.2';
@@ -128,7 +127,7 @@ Use this direct target, not an intermediate update to 0.6.1. Older origins
 first reach 0.6.0 and then update directly to 0.6.2. Noncanonical 0.6.0 layouts
 require view/type replacement and change OIDs. Save customizations and prepare
 external dependencies before updating; follow the
-[full upgrade checklist](docs/delivery.md#development-sql-upgrade-to-062).
+[full upgrade checklist](docs/delivery.md#sql-upgrade-to-062).
 
 ## Configuration
 
