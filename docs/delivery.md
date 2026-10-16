@@ -134,9 +134,8 @@ the currently installed URL/content type/extra headers; PostgreSQL does not
 atomically validate a future multi-GUC tuple, so the runtime renderer remains
 the final backstop.
 
-## Development SQL upgrade to 0.6.2
+## SQL upgrade to 0.6.2
 
-Version 0.6.2 is under development, not a published release.
 Install the matching library/control and all SQL files, preserve existing
 preloads and restart, then explicitly `ALTER EXTENSION pg_logtap UPDATE TO
 '0.6.2'` in each installed database. In-place development deployment verifies
