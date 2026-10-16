@@ -274,7 +274,7 @@ test "timestamps serialize as JSON values across civil bounds" {
         try writeEntry(&line_w.writer, &entry, "", .{});
         const line = line_w.written();
         try std.testing.expect(try std.json.validate(std.testing.allocator, line));
-        try std.testing.expect(std.mem.indexOf(u8, line, case.want) != null);
+        try std.testing.expect(std.mem.find(u8, line, case.want) != null);
     }
 }
 
