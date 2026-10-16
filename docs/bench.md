@@ -1,7 +1,7 @@
 # Overhead benchmark
 
 `scripts/bench-overhead.sh` measures what pg_logtap costs an OLTP workload:
-pgbench before/after the extension on one stand, four measured jobs —
+pgbench before/after the extension on one stand, six measured jobs —
 identical hardware, fixed seed, warmup before each.
 
 | job | preload | logging | meaning |

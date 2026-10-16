@@ -1,5 +1,5 @@
 #!/bin/sh
-# M3 acceptance: generate N events in Postgres, assert Vector received >= N.
+# End-to-end acceptance: generate N events in Postgres, assert Vector received >= N.
 # The receiver is the compose stand's vector (tests/e2e/compose.yaml); its
 # output file accumulates across runs, so counting is by distinct markers.
 # Usage: scripts/e2e-vector.sh [pg_container] [events]

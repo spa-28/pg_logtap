@@ -56,8 +56,10 @@ burst is fully queryable within 3 s. The receiver chain absorbs
 capture-rate bursts; it is not the bottleneck (a dead-endpoint storm
 captures at ~12 k ev/s, above).
 
-Everywhere, **dedup by `(host, seq)`** (recipe below) makes at-least-once
-effectively exactly-once.
+At-least-once paths can replay a whole batch. Configure receiver-side
+deduplication with the key and retention guidance in
+[Ordering and identity](#ordering-and-identity); it reduces duplicate effects,
+but does not change the transport contract.
 
 ## TLS (`https://`, `tcps://`)
 
@@ -134,33 +136,39 @@ the final backstop.
 
 ## Development SQL upgrade to 0.6.2
 
-The current tree prepares 0.6.2; this is not a release-availability claim.
+Version 0.6.2 is under development, not a published release.
 Install the matching library/control and all SQL files, preserve existing
 preloads and restart, then explicitly `ALTER EXTENSION pg_logtap UPDATE TO
 '0.6.2'` in each installed database. In-place development deployment verifies
 the binary but never performs that SQL update or recreates an extension.
 
-Historical chains appended statistics fields, producing a physical order
-unlike a fresh 0.6.0 installation. Their selected current route goes through
-0.6.0 **directly to 0.6.2**, bypassing the frozen 0.6.1 normalization. The
-`0.6.0--0.6.2` script validates the released shape and leaves an already-canonical
-pair untouched, preserving OIDs, dependencies and metadata. Otherwise it drops
-and recreates the view and type in canonical delivery order. The
-`0.6.1--0.6.2` hop performs no object DDL: the SQL API/order is already canonical
-and is identical to fresh 0.6.2.
+Older origins first reach 0.6.0 and then update directly to 0.6.2, not
+through 0.6.1. The `0.6.0--0.6.2` script validates the released shape. A
+canonical view/type pair — the column order used by a fresh 0.6.0 installation
+— is left untouched, preserving its OIDs, dependencies and metadata. Older
+upgrade chains can have a different column order; those pairs are replaced
+in canonical delivery order. The `0.6.1--0.6.2` update performs no object DDL:
+its SQL API and order already match fresh 0.6.2.
 
-Replacement takes exclusive locks and changes OIDs. Before updating a
-noncanonical installation, remove external dependencies and restore baseline
-ownership/privileges. Save and remove custom column defaults, grants, comments,
-labels and options; guards cover the view's implicit row type, generated array
-types **and delivery-view rewrite rules**, including `_RETURN` rule comments.
-Reset default table/type privileges affecting the extension schema. Reconnect
-or reprepare OID-caching clients afterward, then restore intentional
-dependencies and metadata. Both drops use `RESTRICT`, never `CASCADE`:
-unsupported customization or a dependency aborts the complete update,
-leaving `extversion`, objects, OIDs, annotations and old order unchanged.
-Already-lost annotations from an earlier historical update cannot be recovered
-by the new path.
+A noncanonical installation must have the released `pg_logtap_delivery` view
+definition (no custom `WHERE` clause or body), no additional rewrite rules,
+and no user-defined triggers. The ordinary `_RETURN` rule is required and
+must remain. Before manually
+removing custom DDL, save it so intentional changes can be restored after the
+upgrade. Remove external dependencies and restore baseline ownership and
+privileges, including those of the view's implicit row type. Save and remove
+custom column grants/defaults, comments, security labels and relation/column
+options, including metadata on generated array types and comments on the
+view's `_RETURN` rule. Reset custom default table/type
+privileges that apply to the extension schema.
+
+Replacement takes exclusive locks and changes OIDs: reconnect or reprepare
+OID-caching clients afterward, then restore intentional dependencies and
+metadata. Both drops use `RESTRICT`, never `CASCADE`. An unsupported
+customization or dependency aborts and rolls back the complete transaction,
+leaving the old `extversion`, object order, OIDs, objects and annotations
+unchanged. The update cannot automatically recover annotations already lost by
+a previous update.
 
 ## Ordering and identity
 
@@ -171,26 +179,28 @@ reordering.
 
 `seq` is seeded from the wall clock (µs since 2000-01-01, ~8·10¹⁴ < 2⁵³ —
 JSON/JS-safe) at shared-memory init. Each second of uptime advances the seed by
-10⁶ µs but consumes fewer than 10⁶ values unless capture exceeds 1M events/s,
-so `seq` never repeats on a host across restarts and `(host, seq)` is a safe
-dedup key long-term. Caveats: a wall clock stepped backwards can regress the
-seed — for absolute safety dedup on `(host, seq, timestamp)`; and `seq` is
-per-cluster state — two Postgres clusters on one host seed overlapping ranges,
-so there set `cluster_name` (it is empty by default) and dedup on
-`(host, cluster, seq)`. The seed is clamped at 0: a pre-2000 wall clock (dead
-CMOS battery, pre-NTP boot) would otherwise be negative and unrepresentable.
+10⁶ µs but consumes fewer than 10⁶ values unless capture exceeds 1M events/s.
+The normal receiver key is `(host, cluster, seq)`: `seq` is per-cluster state,
+so two PostgreSQL clusters on one host need distinct `cluster_name` values
+(`cluster` is null when unset). A wall clock rollback across a restart can
+regress the seed; use the conservative `(host, cluster, seq, timestamp)` key
+there. The seed is clamped at 0: a pre-2000 wall clock (dead CMOS battery,
+pre-NTP boot) would otherwise be negative and unrepresentable.
 
-Receiver-side dedup recipe (Vector):
+Receiver-side dedup still depends on the receiver retaining its cache through
+the maximum replay/duplicate window. It makes duplicate handling practical; it
+is not exactly-once delivery regardless of key choice or cache retention.
+
+Conservative Vector recipe (including the wall-clock rollback case):
 
 ```yaml
 transforms:
   dedup:
     type: dedup
     inputs: ["pg_logtap"]
-    # cluster is null while cluster_name is unset — matches everything,
-    # i.e. the one-cluster-per-host case; set it to make the key cluster-safe
-    fields.match: ["host", "cluster", "seq"]
-    cache.num_events: 100000   # ~one retry window of duplicates
+    # cluster is null while cluster_name is unset; set it for multi-cluster hosts
+    fields.match: ["host", "cluster", "seq", "timestamp"]
+    cache.num_events: 100000   # retain at least the expected duplicate window
 ```
 
 ## What is never captured
@@ -352,9 +362,9 @@ publishes each cycle's counters and cursor under one lock: a death before that
 point leaves both old and safely replays the cycle; a death after it leaves
 both advanced and does not count or deliver those members again. A postmaster
 restart creates new shared memory and therefore replays the file from byte 0,
-so the receiver can still see already-delivered members — dedup by `(host,
-seq)` as above makes that harmless. Events may also appear twice because the
-failed send that queued them may have partially landed — same dedup.
+so the receiver can still see already-delivered members — apply the
+[documented deduplication key](#ordering-and-identity). Events may also appear
+twice because the failed send that queued them may have partially landed.
 
 When the queue reaches its end, that cycle stops before accepting another
 append and publishes counters with the end cursor. Before truncating, it
@@ -405,16 +415,15 @@ journal or automatic discovery of old queues.
 
 ### Size cap: `fallback_max_mb`
 
-The queue grows without bound through an outage — by default until the disk
-is full (then the RAM-backlog loss semantics take over). `pg_logtap.
-fallback_max_mb` (default 512, `0` = unlimited — parking into an unbounded
-queue logs one WARNING per divert) bounds it instead: once an
-append pushes the file past the cap, it is compacted to the **newest half of
-the cap** (atomic tmp+rename rewrite). The rewrite runs under the cycle's
-abort budget — a shutdown flush never waits it out; an interrupted
-compaction leaves the original untouched and the next append past the cap
-retries it. Peak disk use is momentarily ≈1.5× the cap (the file plus the
-rewrite tmp on the same filesystem), so size the device's headroom for that.
+`pg_logtap.fallback_max_mb` defaults to **512 MB**. Once an append pushes the
+queue past that cap, it is compacted to the **newest half of the cap** (atomic
+tmp+rename rewrite). Only `fallback_max_mb = 0` permits unlimited growth;
+parking into that unbounded queue logs one WARNING per divert. The rewrite runs
+under the cycle's abort budget — a shutdown flush never waits it out; an
+interrupted compaction leaves the original untouched and the next append past
+the cap retries it. Peak disk use is momentarily ≈1.5× the cap (the file plus
+the rewrite tmp on the same filesystem), so size the device's headroom for
+that.
 Delivered members at the head are dropped free; undelivered dropped
 members count into **both** `events_compacted` (they left the queue — keeps
 `queue_backlog` truthful, and `delivered = sent + replayed` counts only events
@@ -427,8 +436,8 @@ compaction's rename is made durable by a directory fsync, and if that sync
 fails (warned once, like the queue's other sync failures) an OS crash can
 resurrect the pre-compaction members — events already counted as compacted
 replay again as duplicates. Delivery is the extension's job, so the
-receiver dedups on `(host, seq)` as the README recipe describes; nothing is
-lost in either outcome.
+receiver uses the [documented deduplication key](#ordering-and-identity);
+nothing is lost in either outcome.
 A cap smaller than one member (~a hundred KB compressed) bounds the file
 only at member granularity. Fill rate measured (v0.3.0, one 16-core
 host, 8-client pgbench with every statement duration-logged into a dead
@@ -543,22 +552,21 @@ natively as long as the Prometheus scrape interval is shorter than the restart.
 
 ## Counter glossary
 
-Each event is counted once per lifecycle stage it actually passes through.
-The delivery invariant is `events_captured ≈ delivered + queue_backlog +
-events_dropped + events_lost + in-flight/ring`: `queue_backlog` removes
-replayed events, cap-trimmed events, and exact-count unreadable v2 frames, so
-none are double-counted with delivery or loss. Names are identical in
-`pg_logtap_stats()` text, the `pg_logtap_delivery` view and the Prometheus
-exposition; the view adds derived `queue_backlog` and `delivered`, and
-Prometheus exposes that same backlog as `pg_logtap_queue_backlog`.
+Counters describe lifecycle stages, not a universal conservation balance.
+Ring overflow increments `events_dropped` without incrementing
+`events_captured`; the event never entered the shared ring. `delivered` is the
+view's derived `events_sent + events_replayed`, while `queue_backlog` is the
+fallback-file event backlog after replay, cap trimming and counted unreadable
+frames — it excludes ring and RAM backlog. A postmaster restart begins a new
+counter epoch; recovered queue members are credited separately from captures
+in that epoch and replay from byte zero under the documented at-least-once
+contract. Soft worker replacement restores the shared-memory replay cursor and
+keeps its counter/cursor publication atomic.
 
-`events_replayed ≤ events_queued` remains stable across a soft export-worker
-restart: the replacement validates and restores the shared-memory replay
-cursor, while counters and cursor advance atomically. A postmaster restart
-zeros both the counters and cursor, credits the full physical queue, and
-replays it from byte 0 under the documented at-least-once contract. Persisting
-the cursor on disk would avoid that full-file scan and postmaster-restart
-replay; it is not required for truthful soft-restart accounting.
+Names are identical in `pg_logtap_stats()` text, the `pg_logtap_delivery` view
+and the Prometheus exposition; the view adds derived `queue_backlog` and
+`delivered`, and Prometheus exposes that same fallback backlog as
+`pg_logtap_queue_backlog`.
 
 | counter | unit | grows when |
 |---|---|---|
@@ -572,7 +580,7 @@ replay; it is not required for truthful soft-restart accounting.
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue: the members are in the file and replay normally, but an OS crash (not a postmaster death) could lose them. The server-log WARNING is once per failure streak; this shared counter is monotonic across reloads, fallback reconfiguration and soft worker replacement, resetting only with the postmaster — a growing value is a disk that cannot make the queue durable. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth (`PgLogtapFbSyncFailing` uses `increase()`), not its level |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life): https/tcps is shipping unauthenticated. The server-log line is edge-triggered; this is its cumulative copy |
-| `warn_fallback_open` | **lines** | the fallback queue could not be opened — `fallback_broken` also goes 1; the line fires once because broken stops the re-opens |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` goes 1 and stops re-opens), or its reserved `.compact` rewrite path aliases the `file://` sink (rewrite refused, valid queue retained); warnings are edge-triggered |
 | `warn_fallback_skipped` | **lines** | an unreadable counted (v2) queue member was observed during a boot/reload credit scan or replay. Explicit same-path reload scans unread members again; a soft worker restart resumes after the published cursor. Only actual replay accounts the stored event count in `events_lost` and removes it from `queue_backlog`, not the credit scans |
 | `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) fallback queue — once per divert |
 | `ring_events`/`ring_capacity` | events | ring fill right now / ring size |

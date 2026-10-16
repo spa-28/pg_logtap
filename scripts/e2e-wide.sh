@@ -4,7 +4,7 @@
 # receiver; past the configured width it is cut at a UTF-8 character
 # boundary and named in "truncated"; aux fields (detail) stay 256 bytes
 # whatever the width. Runs the whole cycle itself: ALTER SYSTEM, restart,
-# probes, then restores the default width.
+# probes, then restores its prior settings.
 # Usage: scripts/e2e-wide.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
@@ -13,6 +13,28 @@ set -u
 e2e_init wide "${1:-}"
 e2e_gate
 WIDE=8192
+
+psql_ct() { docker exec "$PG_CT" psql -X -U postgres -v ON_ERROR_STOP=1 "$@"; }
+SAVED_EXPORT_URL=$(psql_ct -Atc "SHOW pg_logtap.export_url") || fail "could not save pg_logtap.export_url"
+SAVED_EXPORT_FALLBACK_FILE=$(psql_ct -Atc "SHOW pg_logtap.export_fallback_file") \
+  || fail "could not save pg_logtap.export_fallback_file"
+SAVED_MESSAGE_MAX=$(psql_ct -Atc "SHOW pg_logtap.message_max") || fail "could not save pg_logtap.message_max"
+cleanup() {
+  status=$?
+  cleanup_failed=0
+  trap - EXIT HUP INT TERM
+  setguc pg_logtap.export_url "$SAVED_EXPORT_URL" || cleanup_failed=1
+  setguc pg_logtap.export_fallback_file "$SAVED_EXPORT_FALLBACK_FILE" || cleanup_failed=1
+  setguc pg_logtap.message_max "$SAVED_MESSAGE_MAX" || cleanup_failed=1
+  docker restart "$PG_CT" >/dev/null || cleanup_failed=1
+  (wait_ready) || cleanup_failed=1
+  [ "$status" -ne 0 ] || [ "$cleanup_failed" -eq 0 ] || status=1
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # wide's markers carry free text (not a trailing number) after the marker
 # word, so counting is line-based — override the common DISTINCT-counter.
@@ -44,9 +66,10 @@ EOF
 echo "== wide: pg_logtap.message_max = $WIDE =="
 # message_max is POSTMASTER: apply + restart, then wait out the worker's
 # first flush cycle so probes cannot race it.
-setguc pg_logtap.export_url "http://$VEC:8686"; setguc pg_logtap.export_fallback_file ''
-setguc pg_logtap.message_max "$WIDE"
-docker restart "$PG_CT" >/dev/null
+setguc pg_logtap.export_url "http://$VEC:8686" || fail "could not set pg_logtap.export_url"
+setguc pg_logtap.export_fallback_file '' || fail "could not clear pg_logtap.export_fallback_file"
+setguc pg_logtap.message_max "$WIDE" || fail "could not set pg_logtap.message_max"
+docker restart "$PG_CT" >/dev/null || fail "could not restart after setting pg_logtap.message_max"
 wait_ready; wait_vector
 sleep 2
 
@@ -142,9 +165,4 @@ echo "  wide burst: $N events (~$((N * 8 / 1000))MB) generated in $((t1 - t0))s,
 [ "$dups" = 0 ] || fail "wide burst: $dups duplicate seqs"
 ok "$capd wide events, dropped=0, delivery exact, no duplicate seqs"
 
-# Restore the default width so a standalone run against a standing container
-# leaves it as it was (the matrix removes the container anyway).
-setguc pg_logtap.message_max 1024
-docker restart "$PG_CT" >/dev/null
-wait_ready
 echo "e2e-wide: all scenarios passed"

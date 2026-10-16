@@ -30,6 +30,10 @@ pg_logtap.export_gzip = on
 pg_logtap.export_fallback_file = 'pg_logtap-fallback.bin'
 ```
 
+Use this unauthenticated inbound HTTP receiver only on a trusted private
+network. Otherwise terminate TLS and enforce authentication at the receiver or
+an ingress proxy.
+
 Collector configuration:
 
 ```yaml
@@ -205,7 +209,10 @@ location and truncation/redaction metadata. They additionally map:
 | `cluster` | resource `service.namespace` |
 
 Deduplicate downstream on `(host, cluster, seq)`; `cluster` may be null unless
-`pg_logtap.cluster_name` or PostgreSQL's `cluster_name` is set.
+`pg_logtap.cluster_name` or PostgreSQL's `cluster_name` is set. If the wall
+clock rolls back across a restart, include `timestamp`:
+`(host, cluster, seq, timestamp)`; see
+[Ordering and identity](delivery.md#ordering-and-identity).
 
 ## Tested downstream example: VictoriaLogs
 
@@ -277,8 +284,6 @@ Docker are required). No host ports are published; the stand uses a private
 internal network. Each run gets unique names and a run label. Cleanup is armed
 before downloading or creating Docker resources, and checks ownership before
 removal, so a name collision fails without deleting an unrelated resource.
-The historical runtime/image pins and validation claims above are unchanged;
-this example does not claim validation of a development version.
 
 Download the runtime package matching the host architecture:
 

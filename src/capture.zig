@@ -20,7 +20,7 @@ var entries_base: [*]u8 = undefined;
 var ready = false;
 var tranche_id: c_int = 0;
 
-/// Previous hooks, called first (PROBLEMS.md B1: never swallow other hooks).
+/// Previous hooks, called first: never swallow other hooks.
 var prev_hook: pg.emit_log_hook_type = null;
 var prev_shmem_request_hook: @TypeOf(pg.shmem_request_hook) = null;
 var prev_shmem_startup_hook: @TypeOf(pg.shmem_startup_hook) = null;
@@ -36,7 +36,7 @@ var guc_redact_pattern: [*c]u8 = null;
 var guc_ring_capacity: c_int = 1024;
 var guc_message_max: c_int = 1024;
 
-/// Compiled from the GUCs on every assign; read-only in the hook (E1).
+/// Compiled from the GUCs on every assign; read-only in the hook.
 var filter_cache = filter.Filter{};
 /// Compiled pg_logtap.redact_pattern; null unless the GUC is set.
 var redactor: ?filter.Redactor = null;
@@ -223,7 +223,7 @@ fn emitLogHook(edata: [*c]pg.ErrorData) callconv(.c) void {
     // The postmaster runs this hook for its own lines too — and during an
     // emergency restart it logs from inside PGSharedMemoryCreate, after the
     // old segment is already unmapped: `state` dangles there and even a read
-    // SEGVs (gdb: emitLogHook ← PGSharedMemoryCreate). PGPROC-less callers
+    // can fault. PGPROC-less callers
     // are exactly that process — skip them; their lines still reach stderr.
     if (pg.MyProc == null) return;
     if (edata == null) return;

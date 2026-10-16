@@ -1,6 +1,6 @@
 //! Capture filters: level threshold + POSIX regex include/exclude.
 //! Pure module: libc only, no PostgreSQL imports — regexes are compiled once
-//! per GUC assignment (PROBLEMS.md E1), never inside the log hook. The
+//! per GUC assignment, never inside the log hook. The
 //! compiled state lives behind an opaque box owned by src/c/regex_shim.c:
 //! regex_t layout is libc- and arch-specific (glibc's even has bitfields,
 //! opaque to translate-c), so the buffer is allocated in C against the
@@ -52,14 +52,16 @@ fn hasBackref(pattern: []const u8) bool {
     return false;
 }
 
-/// Shared compile-with-diag: on failure the shim filled buf with regerror's
-/// NUL-terminated text, which is copied into the caller's diag if it wants it.
+/// Shared compile-with-diag: use an OOM fallback unless the shim fills buf
+/// with regerror's NUL-terminated text; copy the result if the caller wants it.
 fn compileInto(comptime f: anytype, pattern: [:0]const u8, diag: ?*CompileDiag) ?*LtRegex {
     if (hasBackref(pattern)) {
         setDiag(diag, "backreferences (\\1..\\9) are not supported");
         return null;
     }
     var buf: [128]u8 = undefined;
+    @memset(&buf, 0);
+    @memcpy(buf[0.."out of memory".len], "out of memory");
     const re = f(pattern.ptr, &buf, buf.len) orelse {
         if (diag) |d| {
             d.len = std.mem.findScalar(u8, &buf, 0) orelse buf.len;
@@ -186,6 +188,19 @@ test "compile failure reports regerror's text" {
     var diag2 = CompileDiag{};
     try std.testing.expect(Redactor.compileDiag("a(", &diag2) == null);
     try std.testing.expect(diag2.len > 0);
+}
+
+test "compile failure without errbuf reports OOM fallback" {
+    const noDiag = struct {
+        fn compile(_: [*:0]const u8, _: [*c]u8, _: usize) ?*LtRegex {
+            return null;
+        }
+    }.compile;
+
+    var diag = CompileDiag{};
+    try std.testing.expect(compileInto(noDiag, "valid", &diag) == null);
+    try std.testing.expect(std.mem.eql(u8, diag.text(), "out of memory"));
+    try std.testing.expect(compileInto(noDiag, "valid", null) == null);
 }
 
 // --- redaction ----------------------------------------------------------------

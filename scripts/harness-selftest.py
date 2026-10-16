@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -43,13 +44,21 @@ def fixture_bin(tmp):
     bindir = tmp / "bin"
     bindir.mkdir()
     write_exe(bindir / "docker", r'''#!/usr/bin/env python3
-import json, os, re, subprocess, sys
+import fcntl, json, os, re, signal, subprocess, sys
 from pathlib import Path
 args = sys.argv[1:]
 log = Path(os.environ["HARNESS_LOG"])
 with log.open("a") as f: f.write(json.dumps(args) + "\n")
 mode = os.environ.get("HARNESS_MODE", "")
 state, hits = Path(os.environ["HARNESS_STATE"]), Path(os.environ["HARNESS_HITS"])
+config_mode = mode.startswith(("hook_config", "wide_"))
+gucs = Path(os.environ["HARNESS_GUCS"])
+def config_state():
+    if not gucs.exists():
+        initial = json.loads(os.environ["HARNESS_INITIAL_GUCS"])
+        gucs.write_text(json.dumps({"configured": initial, "effective": initial, "restarts": 0, "signaled": False}))
+    return json.loads(gucs.read_text())
+def save_config(value): gucs.write_text(json.dumps(value))
 def die(code=97): sys.exit(code)
 def hit(name, code):
     if not hits.exists():
@@ -116,7 +125,22 @@ elif args[0] == "cp":
     else: die()
 elif args[0] == "restart":
     if args[1:] not in (["model"], ["pglogtap-mx15"]): die()
-    if mode == "hook_restart" and not state.exists():
+    if config_mode:
+        config = config_state()
+        config["restarts"] += 1
+        save_config(config)
+        if os.environ.get("HARNESS_FAIL_FIRST_RESTART") == "1" and config["restarts"] == 1:
+            hit("first_restart", 86)
+        if config["restarts"] > 1 and os.environ.get("HARNESS_ASSERT_LOCK") == "1":
+            lock = Path(os.environ["E2E_LOCK_DIR"]) / "lock.model"
+            with lock.open("a") as fd:
+                try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    with hits.open("a") as out: out.write("restoring_lock_held\n")
+                else: die()
+        config["effective"] = dict(config["configured"])
+        save_config(config)
+    elif mode == "hook_restart" and not state.exists():
         state.write_text("failed"); hit("hook_restart", 86)
     if args[1] == "pglogtap-mx15":
         if not state.exists():
@@ -133,7 +157,7 @@ elif args[0] == "logs":
     if args[1:] not in (["model"], ["pglogtap-mx15"], ["--tail", "40", "pglogtap-mx15"]): die()
     count = int(state.read_text() or "0") if state.exists() else 0
     state.write_text(str(count + 1))
-    if mode == "hook_zero" and count:
+    if (mode == "hook_zero" or mode.startswith("hook_config")) and count:
         print("hookchain nested call")
 elif args[0] == "exec":
     ct, cmd = exec_parts()
@@ -177,6 +201,26 @@ elif args[0] == "exec":
             sys.exit(subprocess.run(["bash", "-c", body], env=child_env).returncode)
     elif cmd[0] == "psql":
         rest = cmd[1:]
+        if (rest[:5] == ["-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1"] and len(rest) == 9
+                and rest[5] == "-v" and rest[6].startswith("guc=")
+                and rest[7] == "-v" and rest[8].startswith("value=")):
+            name, value = rest[6][4:], rest[8][6:]
+            if name not in ("pg_logtap.export_url", "pg_logtap.export_fallback_file", "pg_logtap.message_max"):
+                die()
+            if sys.stdin.read() != "SELECT format('ALTER SYSTEM SET %s = %L', :'guc', :'value')\n\\gexec\n":
+                die()
+            if not config_mode:
+                if name != "pg_logtap.export_url": die()
+                sys.exit(0)
+            config = config_state()
+            if name == os.environ.get("HARNESS_FAIL_SETGUC"):
+                sys.exit(86)
+            config["configured"][name] = value; save_config(config)
+            requested = os.environ.get("HARNESS_SIGNAL")
+            if requested and not config.get("signaled"):
+                config["signaled"] = True; save_config(config)
+                os.kill(os.getppid(), getattr(signal, "SIG" + requested))
+            sys.exit(0)
         if rest[:3] == ["-U", "postgres", "-Atc"] and len(rest) == 4:
             statements = [rest[3]]
         elif rest[:5] == ["-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1"]:
@@ -194,6 +238,7 @@ elif args[0] == "exec":
             "SELECT 1", "SELECT pg_logtap_version()", "SELECT pg_logtap_stats()",
             "SELECT pid || ' ' || backend_type FROM pg_stat_activity WHERE backend_type LIKE '%logtap%'",
             "SHOW server_version", "SHOW shared_preload_libraries", "SHOW pg_logtap.export_url",
+            "SHOW pg_logtap.export_fallback_file", "SHOW pg_logtap.message_max",
             "SELECT hookchain_shmem_ready()", "SELECT hookchain_count()", "SELECT hookchain_arm(true)", "SELECT hookchain_arm(false)",
             "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]",
             "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'", "ALTER SYSTEM SET cluster_name = 'matrix-pg15'",
@@ -203,8 +248,8 @@ elif args[0] == "exec":
             "ALTER SYSTEM SET pg_logtap.level_min = 10", "ALTER SYSTEM SET log_min_duration_statement = -1",
             "ALTER SYSTEM SET log_min_messages = 'warning'", "ALTER SYSTEM SET pg_logtap.level_min = 15",
             "SELECT pg_reload_conf()", "ALTER SYSTEM SET shared_preload_libraries = 'hookchain', 'pg_logtap'",
-            "ALTER SYSTEM SET shared_preload_libraries = 'oldpreload'", "ALTER SYSTEM SET pg_logtap.export_url = 'oldurl'",
-            "ALTER SYSTEM SET pg_logtap.export_url = ''",
+            "ALTER SYSTEM SET shared_preload_libraries = 'oldpreload'", "ALTER SYSTEM RESET shared_preload_libraries",
+            "ALTER SYSTEM SET pg_logtap.export_url = 'oldurl'", "ALTER SYSTEM SET pg_logtap.export_url = ''",
             "CREATE OR REPLACE FUNCTION public.hookchain_count() RETURNS integer AS '$libdir/hookchain', 'hookchain_count' LANGUAGE C STRICT",
             "CREATE OR REPLACE FUNCTION public.hookchain_shmem_ready() RETURNS boolean AS '$libdir/hookchain', 'hookchain_shmem_ready' LANGUAGE C STRICT",
             "CREATE OR REPLACE FUNCTION public.hookchain_arm(boolean) RETURNS integer AS '$libdir/hookchain', 'hookchain_arm' LANGUAGE C STRICT",
@@ -215,15 +260,76 @@ elif args[0] == "exec":
             "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%hookchain nested%'",
         }
         if any(statement not in allowed for statement in normalized): die()
+        if config_mode:
+            config = config_state()
+            if normalized == [
+                "SELECT hookchain_count()",
+                "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]",
+                "DO $$ DECLARE i int := 0; BEGIN WHILE i < 5 LOOP RAISE WARNING 'logtap hook %', i; i := i + 1; END LOOP; END $$",
+                "SELECT hookchain_count()",
+                "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]",
+            ]:
+                print("0\n0\n5\n5")
+            elif normalized == [
+                "SELECT hookchain_count()", "SELECT hookchain_arm(true)",
+                "DO $$ BEGIN RAISE WARNING 'logtap hookchain-armed'; END $$",
+                "SELECT hookchain_count()", "SELECT hookchain_arm(false)",
+            ]:
+                print("0\n1\n2\n3")
+            else:
+                for statement in normalized:
+                    if statement == "SHOW server_version":
+                        print("15.0")
+                    elif statement in ("SHOW shared_preload_libraries", "SHOW pg_logtap.export_url",
+                                       "SHOW pg_logtap.export_fallback_file", "SHOW pg_logtap.message_max"):
+                        print(config["effective"][statement[5:]])
+                    elif statement == "ALTER SYSTEM SET shared_preload_libraries = 'hookchain', 'pg_logtap'":
+                        config["configured"]["shared_preload_libraries"] = "hookchain, pg_logtap"
+                    elif statement == "ALTER SYSTEM SET shared_preload_libraries = 'oldpreload'":
+                        if os.environ.get("HARNESS_FAIL_PRELOAD_RESTORE") == "1": sys.exit(86)
+                        config["configured"]["shared_preload_libraries"] = "oldpreload"
+                    elif statement == "ALTER SYSTEM RESET shared_preload_libraries":
+                        if os.environ.get("HARNESS_FAIL_PRELOAD_RESTORE") == "1": sys.exit(86)
+                        config["configured"]["shared_preload_libraries"] = ""
+                    elif statement == "ALTER SYSTEM SET pg_logtap.export_url = ''":
+                        config["configured"]["pg_logtap.export_url"] = ""
+                    elif statement == "SELECT 1": print("1")
+                    elif statement == "SELECT pg_logtap_version()": print(os.environ["HARNESS_VERSION"])
+                    elif statement == "SELECT pg_logtap_stats()": print("events_captured=0 events_dropped=0 events_sent=0 send_cycles_failed=0")
+                    elif statement == "SELECT hookchain_shmem_ready()": print("t")
+                    elif statement == "SELECT hookchain_count()": print("0")
+                    elif statement == "SELECT hookchain_arm(true)": print("1")
+                    elif statement == "SELECT hookchain_arm(false)": print("3")
+                    elif statement == "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]": print("0")
+                    elif statement == "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%\"message\":\"logtap hook %'": print("5")
+                    elif statement == "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%\"message\":\"logtap hookchain-armed%'": print("1")
+                    elif statement == "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%hookchain nested%'": print("0")
+                    elif statement in allowed:
+                        pass
+                    else: die()
+            save_config(config)
+            sys.exit(0)
         if normalized == ["SELECT 1"]: print("1")
         elif normalized == ["SELECT pg_logtap_version()"]: print(os.environ["HARNESS_VERSION"])
         elif normalized == ["SHOW server_version"]: print("15.0")
         elif normalized == ["SHOW shared_preload_libraries"]: print("oldpreload")
         elif normalized == ["SHOW pg_logtap.export_url"]: print("oldurl" if not state.exists() else "mutated-url")
         elif normalized == ["SELECT hookchain_shmem_ready()"]: print("t")
-        elif "SELECT hookchain_count()" in normalized: print("0\n1\n2\n3" if "SELECT hookchain_arm(true)" in normalized else "0\n0\n5\n5")
+        elif normalized == [
+            "SELECT hookchain_count()",
+            "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]",
+            "DO $$ DECLARE i int := 0; BEGIN WHILE i < 5 LOOP RAISE WARNING 'logtap hook %', i; i := i + 1; END LOOP; END $$",
+            "SELECT hookchain_count()",
+            "SELECT (regexp_match(pg_logtap_stats(), 'events_captured=([0-9]+)'))[1]",
+        ]: print("0\n0\n5\n5")
+        elif normalized == [
+            "SELECT hookchain_count()", "SELECT hookchain_arm(true)",
+            "DO $$ BEGIN RAISE WARNING 'logtap hookchain-armed'; END $$",
+            "SELECT hookchain_count()", "SELECT hookchain_arm(false)",
+        ]: print("0\n1\n2\n3")
+        elif normalized == ["SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%\"message\":\"logtap hook %'"]: print("5")
+        elif normalized == ["SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%\"message\":\"logtap hookchain-armed%'"]: print("1")
         elif normalized == ["SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE line LIKE '%hookchain nested%'"]: print("0")
-        elif any(statement.startswith("SELECT count(*)") for statement in normalized): print("1" if "hookchain-armed" in normalized[0] else "5")
         elif normalized == ["SELECT pg_logtap_stats()"]: print("events_captured=0 events_dropped=0 events_sent=0 send_cycles_failed=0")
         elif "ALTER SYSTEM SET shared_preload_libraries = 'pg_logtap'" in normalized:
             if mode == "sql_preload": hit("sql_preload", 92)
@@ -293,6 +399,13 @@ def env_for(tmp, mode=""):
         "HARNESS_LOG": str(tmp / "calls.jsonl"),
         "HARNESS_STATE": str(tmp / "state"),
         "HARNESS_HITS": str(tmp / "hits"),
+        "HARNESS_GUCS": str(tmp / "gucs.json"),
+        "HARNESS_INITIAL_GUCS": json.dumps({
+            "shared_preload_libraries": "oldpreload",
+            "pg_logtap.export_url": "oldurl",
+            "pg_logtap.export_fallback_file": "",
+            "pg_logtap.message_max": "1024",
+        }),
         "HARNESS_VERSION": version,
         "HARNESS_MODE": mode,
         "E2E_LOCK_DIR": str(tmp / "locks"),
@@ -1322,6 +1435,8 @@ def test_mock_rejection():
             [bindir + "/docker", "exec", "model", "sh", "-c", "UNEXPECTED_TASK7_REVIEW_COMMAND"],
             [bindir + "/docker", "exec", "model", "psql", "UNEXPECTED_TASK7_REVIEW_COMMAND"],
             [bindir + "/docker", "exec", "-e", "UNEXPECTED_TASK7_REVIEW_ENV=1", "model", "psql", "-Atc", "SELECT 1"],
+            [bindir + "/docker", "exec", "-i", "model", "psql", "-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-v", "guc=unexpected", "-v", "value=x"],
+            [bindir + "/docker", "exec", "-i", "model", "psql", "-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-v", "guc=pg_logtap.export_url", "-v", "value=x"],
             [bindir + "/docker", "exec", "model", "psql", "-Atc", "SELECT 1; UNEXPECTED_TASK7_REVIEW_COMMAND"],
             [bindir + "/docker", "inspect", "-f", "{{.State.Status}}", "model", "UNEXPECTED_TASK7_REVIEW_ARGUMENT"],
             [bindir + "/docker", "rm", "-f", "UNEXPECTED_TASK7_REVIEW_CONTAINER"],
@@ -1331,6 +1446,21 @@ def test_mock_rejection():
         ]
         if any(subprocess.run(command, env=env).returncode == 0 for command in commands):
             fail("fixture command stub accepted an unexpected command")
+
+    for mode in ("", "hook_config_normal", "wide_early"):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw); env = env_for(tmp, mode)
+            docker = env["PATH"].split(":", 1)[0] + "/docker"
+            psql = [docker, "exec", "model", "psql", "-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1"]
+            commands = [
+                [*psql, "-qAt", "-c", "SELECT hookchain_count()", "-c", "SELECT hookchain_arm(true)",
+                 "-c", "UNEXPECTED_REVIEW_COMMAND"],
+                [*psql, "-qc", "SELECT count(*) FROM unnest(pg_logtap_dump(100)) AS t(line) WHERE UNEXPECTED_REVIEW_COMMAND"],
+                [*psql, "-qc", "CREATE OR REPLACE FUNCTION public.hookchain_evil() RETURNS integer LANGUAGE C"],
+                [*psql, "-qc", "DO $$ UNEXPECTED_REVIEW_COMMAND $$"],
+            ]
+            if any(subprocess.run(command, env=env).returncode == 0 for command in commands):
+                fail(f"fixture {mode or 'default'} mode accepted a mixed or prefix-compatible SQL command")
 
 
 def test_matrix_fail_closed():
@@ -1454,6 +1584,99 @@ printf AFTER
             fail("matrix main EXIT cleanup tore down a failed stand")
 
 
+def test_configuration_restoration():
+    def initial(preload="oldpreload"):
+        return {
+            "shared_preload_libraries": preload,
+            "pg_logtap.export_url": r"https://saved.example/a'b\\segment",
+            "pg_logtap.export_fallback_file": r"/tmp/queue'a\\segment",
+            "pg_logtap.message_max": "4096",
+        }
+
+    def saved(env):
+        return json.loads(Path(env["HARNESS_GUCS"]).read_text())
+
+    def restored(env, want, label):
+        value = saved(env)
+        if value["configured"] != want or value["effective"] != want:
+            fail(f"{label}: configured/effective GUC restoration lost quoted or nondefault values: {value}")
+
+    for preload, mode in (("oldpreload", "hook_config_normal"), ("", "hook_config_empty")):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw); env = env_for(tmp, mode); want = initial(preload)
+            env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["E2E_OUT"] = str(tmp / "out")
+            result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+            if result.returncode:
+                fail(f"hook {preload or 'empty'} restore did not complete: {result.stderr}; trace={joined(env)}")
+            restored(env, want, f"hook {preload or 'empty'}")
+            trace = "\n".join(joined(env))
+            if preload and "ALTER SYSTEM SET shared_preload_libraries = 'oldpreload'" not in trace:
+                fail("hook nonempty preload did not preserve its existing list restoration path")
+            if not preload and "ALTER SYSTEM RESET shared_preload_libraries" not in trace:
+                fail("hook empty preload did not use ALTER SYSTEM RESET")
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw); env = env_for(tmp, "hook_config_normal"); want = initial()
+        env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["E2E_OUT"] = str(tmp / "out")
+        env["HARNESS_FAIL_PRELOAD_RESTORE"] = "1"
+        result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+        value, trace = saved(env), "\n".join(joined(env))
+        if result.returncode == 0:
+            fail("hook preload restore failure returned success")
+        if value["configured"]["pg_logtap.export_url"] != want["pg_logtap.export_url"] or value["effective"]["pg_logtap.export_url"] != want["pg_logtap.export_url"]:
+            fail("hook preload restore failure skipped independent URL restore")
+        if value["effective"]["shared_preload_libraries"] != "hookchain, pg_logtap":
+            fail("hook preload restore failure did not retain the still-configured hookchain library")
+        if "sh -c rm -f '/lib/hookchain.so'" in trace or trace.count("restart model") < 2 or trace.count("pg_isready") < 2:
+            fail("hook preload restore failure deleted its needed library or skipped restart/readiness")
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw); env = env_for(tmp, "wide_early"); want = initial()
+        env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["HARNESS_FAIL_FIRST_RESTART"] = "1"
+        env["HARNESS_ASSERT_LOCK"] = "1"
+        result = run(["/bin/sh", str(ROOT / "scripts/e2e-wide.sh"), "model"], env=env)
+        if result.returncode == 0 or any("DO $$" in item for item in joined(env)):
+            fail("wide early restart failure reached probes or returned success")
+        restored(env, want, "wide early failure")
+        if "restoring_lock_held" not in hits(env):
+            fail("wide released its container lock before the restoring restart")
+
+    for name, code in (("HUP", 129), ("INT", 130), ("TERM", 143)):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw); env = env_for(tmp, "wide_signal"); want = initial()
+            env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["HARNESS_SIGNAL"] = name
+            result = run(["/bin/sh", str(ROOT / "scripts/e2e-wide.sh"), "model"], env=env)
+            if result.returncode != code or any("DO $$" in item for item in joined(env)):
+                fail(f"wide {name}: rc={result.returncode}, later probes={joined(env)}")
+            restored(env, want, f"wide {name}")
+
+    source = (ROOT / "scripts/e2e-wide.sh").read_text()
+    cleanup = re.search(r"cleanup\(\) \{\n.*?^\}", source, re.S | re.M)
+    if cleanup is None:
+        fail("wide actual cleanup function not found")
+    for original, cleanup_failure, expected in ((0, "", 0), (42, "", 42), (0, "pg_logtap.export_url", 1), (42, "pg_logtap.export_url", 42)):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw); env = env_for(tmp, "wide_cleanup"); want = initial()
+            env["HARNESS_INITIAL_GUCS"] = json.dumps(want)
+            if cleanup_failure: env["HARNESS_FAIL_SETGUC"] = cleanup_failure
+            driver = tmp / "cleanup.sh"
+            driver.write_text(f'''#!/bin/sh
+set -u
+. "{ROOT / 'scripts/e2e-common.sh'}"
+E2E_CT=model E2E_TAG=wide PG_CT=model
+SAVED_EXPORT_URL=$(printf %s {want["pg_logtap.export_url"]!r})
+SAVED_EXPORT_FALLBACK_FILE=$(printf %s {want["pg_logtap.export_fallback_file"]!r})
+SAVED_MESSAGE_MAX={want["pg_logtap.message_max"]!r}
+{cleanup.group(0)}
+{'(exit 42); ' if original else ''}cleanup
+''')
+            result = run(["/bin/sh", str(driver)], env=env)
+            if result.returncode != expected:
+                fail(f"wide cleanup original={original} cleanup_failure={cleanup_failure}: rc={result.returncode}, stderr={result.stderr}")
+            if not cleanup_failure:
+                restored(env, want, f"wide cleanup original={original}")
+
+
 def test_hook_restore():
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -1467,8 +1690,8 @@ def test_hook_restore():
             fail("hook early restart failure reached SQL probes")
         if "ALTER SYSTEM SET shared_preload_libraries = 'oldpreload'" not in trace:
             fail("hook early failure did not restore saved preload")
-        if "ALTER SYSTEM SET pg_logtap.export_url = 'oldurl'" not in trace:
-            fail("hook early failure did not restore pre-mutation URL")
+        if "guc=pg_logtap.export_url -v value=oldurl" not in trace:
+            fail("hook early failure did not restore pre-mutation URL through setguc")
 
     for mode, want_success in (("hook_zero", True), ("hook_missing", False)):
         with tempfile.TemporaryDirectory() as raw:
@@ -2071,7 +2294,7 @@ def test_actual_finalizers():
 
 def main():
     tests = [test_common_gates, test_source_guards, test_mock_rejection, test_matrix_fail_closed,
-             test_failed_stand_is_retained, test_hook_restore, test_tls_fixture_semantics,
+             test_failed_stand_is_retained, test_configuration_restoration, test_hook_restore, test_tls_fixture_semantics,
              test_tls_received_caller_propagation, test_tls_adapter_lifecycle, test_actual_finalizers,
              test_benchmark_readiness, test_container_locks, test_lock_cooperation,
              test_matrix_native_lock_lifecycle,

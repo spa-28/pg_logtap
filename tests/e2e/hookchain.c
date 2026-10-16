@@ -3,7 +3,7 @@
  * Preloaded BEFORE pg_logtap (shared_preload_libraries =
  * 'hookchain,pg_logtap'), it installs emit_log_hook plus both shared-memory
  * hooks. pg_logtap must forward to all three instead of silently replacing
- * them (PROBLEMS.md B1). hookchain_count() reads the process-local log-hook
+ * them. hookchain_count() reads the process-local log-hook
  * counter, so it must be called in the session that logged.
  *
  * hookchain_arm(true) turns on the hostile mode: every hook invocation also

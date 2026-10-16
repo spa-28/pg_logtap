@@ -81,7 +81,9 @@ Fluent Bit 4.0.14 accepts multiple NDJSON objects in one `application/json`
 request and transparently inflates request gzip. It returns HTTP 201; pg_logtap
 accepts any 2xx response as acknowledgement of the complete batch. A lost
 response can still produce a whole-batch retry, so deduplicate downstream on
-`(host, cluster, seq)` when duplicates matter.
+`(host, cluster, seq)` when duplicates matter. If the wall clock rolls back
+across a restart, include `timestamp`: `(host, cluster, seq, timestamp)`; see
+[Ordering and identity](delivery.md#ordering-and-identity).
 
 The request path is part of the routing contract: `/pg_logtap_http` becomes the
 `pg_logtap_http` tag. Do not set the HTTP input's `tag_key` unless records are

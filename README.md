@@ -9,8 +9,9 @@ HTTP/TCP/file receiver. No log files, no parsers, no sidecar agents. Written in
 
 Instead of tailing `postgresql.log`, `pg_logtap` hooks into PostgreSQL's logging
 pipeline (`emit_log_hook`), normalizes each event in shared memory, and a
-background worker pushes them out. The hook fires before formatting, so nothing
-about your logging configuration affects the captured data.
+background worker pushes them out. The hook fires before formatting and
+destination handling, so those settings do not change captured fields;
+`log_min_messages` still gates which server messages reach the hook.
 
 ```
 emit_log_hook ──► shmem ring ──► bgworker ──► JSON ──► receiver (http/tcp/file):
@@ -26,7 +27,7 @@ pass through, so some systems ingest directly without a collector in between.
 ## Features
 
 - **Real-time capture** — hooks `emit_log_hook`; events are captured as `ErrorData`, before formatting.
-- **Zero log-config coupling** — any `log_destination`, any `log_line_prefix`, `logging_collector` on or off.
+- **Formatting/destination independent** — any `log_destination`, any `log_line_prefix`, `logging_collector` on or off; `log_min_messages` still gates capture.
 - **Session context built in** — `app` (application_name, %a), `client_host` (client address, %h) — richer than `log_line_prefix` ever gives you.
 - **Source identity** — every event carries `host` / `cluster` / `pgdata`, so one central Vector can serve many clusters without confusion.
 - **Filtering** — by level and POSIX regex (include/exclude).
@@ -40,8 +41,9 @@ pass through, so some systems ingest directly without a collector in between.
 
 ## PostgreSQL Logging Settings
 
-The extension is indifferent to your logging configuration — it taps the
-pipeline before any of it applies:
+Formatting and destination configuration do not change captured fields: the
+hook runs before either applies. `log_min_messages` remains a server-side gate;
+lines it excludes never reach the hook:
 
 | Setting | Requirement |
 |---|---|
@@ -113,35 +115,20 @@ GUCs and restart again.
 
 ### Development upgrade to 0.6.2
 
-The tree prepares **0.6.2**, not a published release. The release-download
-example above remains pinned to a released package. Install the matching new
-library, control file and **all** versioned SQL files, restart PostgreSQL with
-its existing preload list preserved, then explicitly update each database
-where the extension is installed:
+Version **0.6.2** is under development, not a published release. To upgrade to
+it, install the matching library, control file and **all** versioned SQL files,
+preserve the existing preload list, restart PostgreSQL, then update each
+database where the extension is installed:
 
 ```sql
 ALTER EXTENSION pg_logtap UPDATE TO '0.6.2';
 ```
 
 Use this direct target, not an intermediate update to 0.6.1. Older origins
-follow their historical hops to 0.6.0 and then the guarded `0.6.0--0.6.2` edge,
-bypassing the frozen 0.6.1 normalization. A fresh 0.6.0 install is already
-canonical, so it keeps OIDs and external dependencies; `0.6.1--0.6.2` performs
-no object DDL and preserves existing OIDs and metadata. Fresh 0.6.2 uses the
-same SQL API and column order as canonical 0.6.1.
-
-Noncanonical 0.6.0 layouts replace the type and view under `DROP ... RESTRICT`.
-Before updating one, remove external dependencies and restore baseline
-ownership/privileges, including the view's implicit row type. Save and remove
-custom column grants/defaults, comments, security labels and relation/column
-options, including metadata on generated array types and delivery-view rewrite
-rules (such as a `COMMENT ON RULE "_RETURN"`). Reset custom default table/type
-privileges that apply to the extension schema. Restore intentional
-customizations afterward. Normalization changes OIDs and takes exclusive
-locks: reconnect or reprepare clients that cache them. Any refusal rolls back
-the complete update, leaving the old objects, order, OIDs and `extversion`
-unchanged; no `CASCADE` is used. This path cannot recover annotations already
-lost by a previous historical update.
+first reach 0.6.0 and then update directly to 0.6.2. Noncanonical 0.6.0 layouts
+require view/type replacement and change OIDs. Save customizations and prepare
+external dependencies before updating; follow the
+[full upgrade checklist](docs/delivery.md#development-sql-upgrade-to-062).
 
 ## Configuration
 
@@ -156,7 +143,7 @@ lost by a previous historical update.
 | `pg_logtap.message_max` | `1024` (1024–1048576) | postmaster | Slot width for each event's `message` in bytes; longer messages are cut at a UTF-8 character boundary and named in `truncated`. Other fields stay 256 bytes. Shared memory cost is `ring_capacity × (message_max + ~2.4 KB)` — the default keeps the slot byte-identical to 0.3.x (≈3.4 KB); the max width with the max ring is ≈8.6 GB. Capture cost grows with the message's actual length, not the setting (~1.8 µs/KB — a 1 MB message adds ~1.9 ms in the logging backend; short messages pay microseconds as before). Check the receiver's line limit before raising it (see Receivers). |
 | `pg_logtap.export_url` | `''` (no export) | SIGHUP | Destination, see below. |
 | `pg_logtap.cluster_name` | `''` | SIGHUP | Cluster label in every event's `cluster` field. Empty = fall back to the server's `cluster_name` GUC (empty by default → field is `null`). |
-| `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
+| `pg_logtap.export_gzip` | `false` | SIGHUP | Compress `http(s)://` batches with `Content-Encoding: gzip` (10–20× less wire). Receiver must accept gzipped request bodies — see Receivers. |
 | `pg_logtap.export_tls_ca` | `''` | SIGHUP | PEM file with the CA to verify `https://`/`tcps://` receivers against (for a self-signed receiver, the receiver's own certificate). Empty = the system CA roots; a set file **replaces** them. Re-read before every handshake, so rotation needs no restart. Keep it on local disk — the read sits inside the send attempt, and a hung network filesystem would stall the worker outside every timeout. The receiver may present leaf+intermediate — pin the root (or the intermediate itself); the file may hold several certs. |
 | `pg_logtap.export_tls_verify` | `on` | SIGHUP | `off` disables chain and name verification. Development only — with it off, a man in the middle can read the logs; the first TLS send then logs one WARNING per worker life (and counts `warn_tls_no_verify`). |
 | `pg_logtap.export_tls_server_name` | `''` | SIGHUP | Certificate name to verify and SNI to send when it differs from the URL host. Two cases need it: IP-literal URLs (name verification matches `dNSName` SANs only — an `iPAddress` SAN never matches) and TLS-terminating load balancers. |
@@ -169,7 +156,7 @@ lost by a previous historical update.
 | `pg_logtap.export_backlog_max` | `65536` events | SIGHUP | RAM backlog depth before the oldest events are trimmed (`events_lost`). Absorbs throughput spikes while batches park on disk; sustained parking matches capture, so trimming at this depth signals real capacity shortfall, not noise. Ceiling cost ≈ depth × slot (`message_max + ~2.4 KB`), touched only when parking falls behind. Clamped up to `ring_capacity`. |
 | `pg_logtap.fallback_max_mb` | `512` MB | SIGHUP | Size cap for `export_fallback_file`: once an append pushes the file past it, the file is compacted to the newest half of the cap (atomic rewrite; dropped undelivered events count as `events_lost`). `0` = unlimited (the 0.2.1 behavior — grows until the disk is full). A cap smaller than one queue member (~a hundred KB compressed) bounds the file only at member granularity. |
 | `pg_logtap.metrics_port` | `0` (off) | SIGHUP | Prometheus `/metrics` and `/healthz`/`/livez`/`/readyz` port. |
-| `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default — the counters name the host, cluster and data directory; set `0.0.0.0` when a scraper on the network needs them. |
+| `pg_logtap.metrics_addr` | `127.0.0.1` | SIGHUP | Bind address for the metrics listener (IP literal, v4/v6). Loopback by default; the listener has no TLS or authentication. Expose it only to trusted scrapers/networks. |
 
 ### Setting the minimum level
 
@@ -181,20 +168,19 @@ ring — it never occupies memory, never counts in the stats):
 |---|---|---|
 | `10`–`14` | DEBUG5 … DEBUG1 | everything, including per-statement debug noise — storm volumes, use for troubleshooting only |
 | `15` | LOG | server operational messages: connections, checkpoints, autovacuum, duration lines from `log_min_duration_statement` — **the default** |
-| `16`–`18` | LOG_SERVER_ONLY / INFO / NOTICE | user-facing informational messages (RAISE INFO/NOTICE) plus LOG |
+| `16`–`18` | LOG_SERVER_ONLY / INFO / NOTICE | user-facing informational messages (RAISE INFO/NOTICE); not LOG (15) |
 | `19` | WARNING | warnings and everything above — the usual "no noise" export |
 | `21` | ERROR | errors only |
 | `22`/`23` | FATAL / PANIC | crash-level events only |
 
 Two filters stack, and both must let an event through: the server's own
 `log_min_messages` decides whether a line reaches the hook at all, then
-`level_min` decides whether pg_logtap exports it. So an export of
-`level_min = 21` (ERROR) with the default `log_min_messages = warning`
-works as expected, but `level_min = 15` (LOG) exports LOG lines only if the
-server also logs them (`log_min_messages = log` or lower). One PostgreSQL
-quirk to keep in mind: in `log_min_messages` the server ranks `LOG` between
-`ERROR` and `FATAL` for its own output, while `level_min` uses the raw
-elevel numbers, where LOG is 15.
+`level_min` decides whether pg_logtap exports it. An export of
+`level_min = 21` (ERROR) with the default `log_min_messages = warning` works
+as expected. At the server layer, `LOG` has a special rank: the default
+`log_min_messages = warning` already permits it. That rule is distinct from
+`level_min`, which uses raw elevel numbers, so `LOG` is 15 and a threshold of
+16–18 does not export it.
 
 Apply without a restart — both settings reload on SIGHUP:
 
@@ -203,10 +189,10 @@ ALTER SYSTEM SET pg_logtap.level_min = 19;   -- WARNING and up
 SELECT pg_reload_conf();
 ```
 
-Only `ring_capacity` (postmaster context) and `shared_preload_libraries`
-itself need a restart. On PostgreSQL ≤ 16, the first `ALTER SYSTEM SET
-pg_logtap.*` is rejected until the extension has loaded once — preload,
-restart, then set GUCs.
+`ring_capacity` and `message_max` use postmaster context and require a restart,
+as does `shared_preload_libraries`. On PostgreSQL ≤ 16, the first
+`ALTER SYSTEM SET pg_logtap.*` is rejected until the extension has loaded once
+— preload, restart, then set GUCs.
 
 A typical first setup, end to end:
 
@@ -262,11 +248,11 @@ connection bursts on `log_connections`). Memory cost is `capacity ×
 or dead receiver is *not* a ring problem — that is what `export_backlog_max`
 and the fallback file absorb (next section). One stall source is easy to
 miss: `fallback_max_mb` compactions during an outage storm run inside flush
-cycles, and on a slow disk the walk + cap/2 copy can hold drain for seconds
-(seen on a CI runner: a 150k-event storm against a 1 MB cap stalled drain
-past an 8192 ring — 11k newest events refused, counted in `events_dropped`).
-If the cap is hit regularly, size the ring for capture rate × (send timeout
-+ worst compaction walk), not for the send timeout alone.
+cycles, and on a slow disk the walk + cap/2 copy can hold drain for seconds.
+If the cap is hit regularly, size the ring for
+`capture rate × (send timeout + worst compaction walk)`, not for the send
+timeout alone; see [worker pinned in one send](docs/delivery.md#worker-pinned-in-one-send)
+for the related loss bound.
 
 ### Tuning delivery
 
@@ -342,7 +328,7 @@ the fallback file and the receiver all hold the masked form only:
   `message`/`detail`/`hint`/`context`/`query`; every match becomes
   `<REDACTED>`:
 
-  ```sh
+  ```sql
   ALTER SYSTEM SET pg_logtap.redact_pattern = 'sk-[A-Za-z0-9]{20,}|Bearer [A-Za-z0-9._-]+';
   SELECT pg_reload_conf();
   ```
@@ -465,6 +451,11 @@ One JSON object per line:
 }
 ```
 
+`timestamp` is RFC3339 UTC with microseconds. If the server clock produces a
+year outside `0000..9999`, it is JSON `null` instead of a fabricated date.
+Receivers requiring a non-null timestamp may reject such events; correct the
+clock or configure an explicit receiver policy for missing event time.
+
 Notes: `sqlerrcode` is the canonical 5-char SQLSTATE string. `app` /
 `client_host` come from the session (`[local]` for unix sockets). `host` /
 `cluster` / `pgdata` identify the sending server. Fields are copied into
@@ -509,7 +500,7 @@ replayed, cap-trimmed and unreadable skipped events from `events_queued`):
 | `send_cycles_failed` | **cycles** | one per flush cycle whose send attempt failed — the receiver-down signal; events are safe, not lost |
 | `fb_sync_failures` | **calls** | one per failed `fdatasync` on the fallback queue — members are in the file and replay, but an OS crash could lose them; a growing value is a disk that cannot make the queue durable. Monotonic across reloads/reconfiguration and soft worker replacement, reset only on postmaster restart. Non-zero is history, not current state: the next successful sync (or a compaction, whose rewrite is fdatasynced before the rename) makes the queue durable again while the counter stays — alert on its growth, not its level |
 | `warn_tls_no_verify` | **lines** | the verify=off WARNING fired (once per worker life) — https/tcps is shipping unauthenticated |
-| `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` also goes 1) |
+| `warn_fallback_open` | **lines** | the fallback queue could not be opened (`fallback_broken` goes 1), or its reserved `.compact` rewrite path aliases the `file://` sink (rewrite refused, valid queue retained) |
 | `warn_fallback_skipped` | **lines** | an unreadable counted queue member was observed during a boot/reload credit scan or replay; only actual replay accounts its stored event count in `events_lost` and removes it from `queue_backlog` |
 | `warn_fallback_unbounded` | **lines** | events were diverted into an unbounded (`fallback_max_mb=0`) queue |
 | `ring_events` / `ring_capacity` | events | ring fill right now / ring size |
@@ -542,11 +533,6 @@ dropped, export failing, fallback file broken, DNS failing, queue sync
 failing, redact pattern failed).
 
 ## Development & Testing
-
-The setup follows [pgzx](https://github.com/xataio/pgzx) conventions where they
-fit, with two deliberate deviations: no Nix (a docker container is the dev
-environment, because the version matrix needs many PostgreSQL installs, not
-one relocated one), and Zig pinned to 0.16.0 (pgzx tracks master).
 
 ### Dev loop (docker)
 
@@ -713,8 +699,7 @@ the 15–18 comptime branches and the Zig 0.16 port live upstream in the fork
 instead of being vendored here.
 
 ABI note: a `.so` built against X.Y runs on any X.* of the same major and arch
-(headers are build-time only); release builds should target the oldest glibc
-you support (e.g. debian:bookworm).
+(headers are build-time only); published release builds target glibc 2.28.
 
 ## Releases
 
@@ -729,9 +714,10 @@ filename, `build.zig.zon`, and `src/version.zig` (what
 # 2. add sql/pg_logtap--<old>--<new>.sql — the delta script (comment-only if
 #    the SQL didn't change); assert selected paths and metadata preservation
 #    on PG15–18, including any direct edge needed to bypass an unsafe old hop
-# 3. commit, tag, push
-git tag v0.3.0 && git push origin v0.3.0
-# 4. create a Release for the tag in the GitHub UI (or: gh release create v0.3.0)
+# 3. set VERSION to the actual release version, then commit, tag, push
+VERSION=X.Y.Z
+git tag "v$VERSION" && git push origin "v$VERSION"
+# 4. create a Release for v$VERSION in the GitHub UI (or: gh release create "v$VERSION")
 ```
 
 Publishing the Release triggers CI, which rebuilds the matrix (PG majors ×

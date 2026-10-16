@@ -93,7 +93,10 @@ With `wait_end_of_query=1`, pg_logtap uses ClickHouse's HTTP 2xx response as
 the batch acknowledgement. HTTP/network/insert failures use the normal
 in-memory retry backlog and optional fallback file; see
 [Delivery contract](delivery.md). Deduplicate on `(host, cluster, seq)` when a
-fallback replay overlaps a batch already committed by ClickHouse.
+fallback replay overlaps a batch already committed by ClickHouse. If the wall
+clock rolls back across a restart,
+include `timestamp`: `(host, cluster, seq, timestamp)`; see
+[Ordering and identity](delivery.md#ordering-and-identity).
 
 ## Tested result
 

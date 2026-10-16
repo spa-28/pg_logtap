@@ -1,7 +1,7 @@
 #!/bin/sh
 # PostgreSQL hook interop: pg_logtap must chain to previously-installed
-# emit_log, shmem-request and shmem-startup hooks, not silently replace them
-# (PROBLEMS.md B1). hookchain.c is preloaded BEFORE pg_logtap.
+# emit_log, shmem-request and shmem-startup hooks, not silently replace them.
+# hookchain.c is preloaded BEFORE pg_logtap.
 # Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
 set -eu
 . "$(dirname "$0")/e2e-common.sh"
@@ -45,15 +45,31 @@ URL_SAVED=$(psql_ct -Atc "SHOW pg_logtap.export_url")
 SAVED_LIST=$(echo "$SAVED" | sed "s/[,[:space:]]\+/', '/g") # '' | 'a' | 'a', 'b'
 restore() {
   status=$?
-  trap - EXIT INT TERM
-  psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = '$SAVED_LIST'" \
-    -qc "ALTER SYSTEM SET pg_logtap.export_url = '$URL_SAVED'" >/dev/null || status=1
-  docker restart "$PG_CT" >/dev/null || status=1
-  docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1 || status=1
-  wait_ready || status=1
+  cleanup_failed=0
+  preload_restored=1
+  trap - EXIT HUP INT TERM
+  if [ -n "$SAVED" ]; then
+    psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = '$SAVED_LIST'" >/dev/null || {
+      cleanup_failed=1; preload_restored=0
+    }
+  else
+    psql_ct -qc "ALTER SYSTEM RESET shared_preload_libraries" >/dev/null || {
+      cleanup_failed=1; preload_restored=0
+    }
+  fi
+  setguc pg_logtap.export_url "$URL_SAVED" || cleanup_failed=1
+  docker restart "$PG_CT" >/dev/null || cleanup_failed=1
+  if [ "$preload_restored" -eq 1 ]; then
+    docker exec "$PG_CT" sh -c "rm -f '$LIBDIR/hookchain.so'" >/dev/null 2>&1 || cleanup_failed=1
+  fi
+  (wait_ready) || cleanup_failed=1
+  [ "$status" -ne 0 ] || [ "$cleanup_failed" -eq 0 ] || status=1
   exit "$status"
 }
-trap restore EXIT INT TERM
+trap restore EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 psql_ct -qc "ALTER SYSTEM SET shared_preload_libraries = 'hookchain', 'pg_logtap'" >/dev/null
 docker restart "$PG_CT" >/dev/null; wait_ready

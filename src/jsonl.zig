@@ -1,12 +1,12 @@
-//! Captured event → one JSON line (the single wire format, plan §4.3).
+//! Captured event → one JSON line.
 //! Pure module: no PostgreSQL imports; names that require catalog lookups
 //! are resolved by the caller and passed in.
 const std = @import("std");
 
 const ring = @import("ring.zig");
 
-/// PG epoch: 2000-01-01T00:00:00Z in Unix µs.
-const pg_epoch_unix_us: i64 = 946_684_800 * 1_000_000;
+/// PG epoch: 2000-01-01T00:00:00Z in Unix seconds.
+const pg_epoch_unix_seconds: i64 = 946_684_800;
 
 /// Catalog-resolved names; null → JSON null.
 pub const Names = struct {
@@ -37,9 +37,8 @@ pub const worst_serialized_entry = 6 * (ring.max_message + 9 * ring.aux_len + 2 
 /// message_max), so every owner of it — the ring slot, the RAM backlog
 /// record, the capture hold buffer — hands it in as a plain slice.
 pub fn writeEntry(w: *std.Io.Writer, e: *const ring.ShmLogEntry, msg: []const u8, names: Names) !void {
-    try w.print("{{\"seq\":{d},\"timestamp\":\"", .{e.seq});
+    try w.print("{{\"seq\":{d},\"timestamp\":", .{e.seq});
     try writeTimestamp(w, e.timestamp_us);
-    try w.writeAll("\"");
     try w.print(",\"level\":\"{s}\",\"message\":", .{levelName(e.elevel)});
     try jsonStr(w, msg);
     try w.print(",\"detail\":", .{});
@@ -144,16 +143,18 @@ fn optJsonStr(w: *std.Io.Writer, s: ?[]const u8) !void {
     }
 }
 
-/// TimestampTz (µs since PG epoch) → RFC3339 UTC with microseconds.
+/// TimestampTz (µs since PG epoch) → a JSON RFC3339 UTC string, or null
+/// when its civil year cannot be represented with four digits.
 pub fn writeTimestamp(w: *std.Io.Writer, ts_us: i64) !void {
-    const unix_us = ts_us + pg_epoch_unix_us;
-    const secs = @divFloor(unix_us, 1_000_000);
-    const micros: u32 = @intCast(@mod(unix_us, 1_000_000));
+    const ts_secs = @divFloor(ts_us, 1_000_000);
+    const micros: u32 = @intCast(@mod(ts_us, 1_000_000));
+    const secs = ts_secs + pg_epoch_unix_seconds;
     const days = @divFloor(secs, 86_400);
     const day_secs: u32 = @intCast(@mod(secs, 86_400));
     const civil = civilFromDays(days);
-    const year: u32 = @intCast(@max(civil.year, 0)); // {d:0>4} prints '+' for signed
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
+    if (civil.year < 0 or civil.year > 9999) return w.writeAll("null");
+    const year: u32 = @intCast(civil.year);
+    try w.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z\"", .{
         year,            civil.month,            civil.day,
         day_secs / 3600, (day_secs % 3600) / 60, day_secs % 60,
         micros,
@@ -248,20 +249,33 @@ test "control characters in message escape correctly" {
     try std.testing.expect(try std.json.validate(std.testing.allocator, line));
 }
 
-test "timestamp formatting" {
-    var tbuf: [40]u8 = undefined;
-    var fixed_w = std.Io.Writer.fixed(&tbuf);
-    // 845s after PG epoch → 2000-01-01T00:14:05.000001Z
-    try writeTimestamp(&fixed_w, 845_000_001);
-    try std.testing.expectEqualStrings("2000-01-01T00:14:05.000001Z", fixed_w.buffered());
-}
+test "timestamps serialize as JSON values across civil bounds" {
+    const cases = [_]struct { ts_us: i64, want: []const u8 }{
+        // 845s after PG epoch
+        .{ .ts_us = 845_000_001, .want = "\"timestamp\":\"2000-01-01T00:14:05.000001Z\"" },
+        // unix 2024-02-29T12:00:00Z
+        .{ .ts_us = (1709208000 - 946684800) * 1_000_000, .want = "\"timestamp\":\"2024-02-29T12:00:00.000000Z\"" },
+        .{ .ts_us = -946_684_800 * 1_000_000, .want = "\"timestamp\":\"1970-01-01T00:00:00.000000Z\"" },
+        .{ .ts_us = -946_684_800 * 1_000_000 - 1, .want = "\"timestamp\":\"1969-12-31T23:59:59.999999Z\"" },
+        .{ .ts_us = -63_113_904_000_000_000, .want = "\"timestamp\":\"0000-01-01T00:00:00.000000Z\"" },
+        .{ .ts_us = 252_455_615_999_999_999, .want = "\"timestamp\":\"9999-12-31T23:59:59.999999Z\"" },
+        .{ .ts_us = 252_455_616_000_000_000, .want = "\"timestamp\":null" },
+        .{ .ts_us = -63_145_440_000_000_000, .want = "\"timestamp\":null" },
+        .{ .ts_us = std.math.minInt(i64), .want = "\"timestamp\":null" },
+        .{ .ts_us = std.math.maxInt(i64), .want = "\"timestamp\":null" },
+    };
 
-test "timestamp across leap day" {
-    var tbuf: [40]u8 = undefined;
-    var fixed_w = std.Io.Writer.fixed(&tbuf);
-    // unix 2024-02-29T12:00:00Z = 1709208000s → PG ts = unix - 946684800s
-    try writeTimestamp(&fixed_w, (1709208000 - 946684800) * 1_000_000);
-    try std.testing.expectEqualStrings("2024-02-29T12:00:00.000000Z", fixed_w.buffered());
+    for (cases) |case| {
+        var entry = std.mem.zeroes(ring.ShmLogEntry);
+        entry.timestamp_us = case.ts_us;
+        entry.elevel = 19;
+        var line_w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer line_w.deinit();
+        try writeEntry(&line_w.writer, &entry, "", .{});
+        const line = line_w.written();
+        try std.testing.expect(try std.json.validate(std.testing.allocator, line));
+        try std.testing.expect(std.mem.indexOf(u8, line, case.want) != null);
+    }
 }
 
 test "sqlstate unpacking" {

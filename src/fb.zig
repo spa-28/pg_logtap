@@ -549,14 +549,14 @@ pub fn cursor() ?capture.FallbackCursor {
     return .{ .dev = queue_dev, .ino = queue_ino, .offset = offset };
 }
 
-/// Outcome of appending one batch. `failed` = nothing of it is in the file
-/// (a partial write is rolled back; the events stay in the caller's RAM
-/// backlog and the append may be retried). `appended` = in the file and
-/// fdatasynced. `not_durable` = in the file, fdatasync failed — the member
-/// STAYS (dropping it would be another write that can also fail) and must
-/// never be appended again: the caller drops the batch from RAM on anything
-/// but `failed`. Page cache survives postmaster death; an OS crash loses an
-/// unsynced tail (fbDatasync warns once).
+/// Outcome of appending one batch. `failed` keeps the events in the caller's
+/// RAM backlog for retry; a partial write is rolled back where possible.
+/// `appended` means the member is in the file: `sync=true` fdatasynced it,
+/// while `sync=false` defers the attempt to the cycle's fsync().
+/// `not_durable` means the immediate fdatasync failed. The member STAYS and
+/// must never be appended again: the caller drops the batch from RAM on
+/// anything but `failed`. Page cache survives postmaster death; an OS crash
+/// can lose an unsynced tail (fbDatasync warns once).
 pub const Outcome = enum { failed, appended, not_durable };
 
 /// Append one batch as a framed gzip member. `sync` fdatasyncs this member;

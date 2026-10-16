@@ -38,7 +38,7 @@ LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
    receiver host; fallback_broken — 1 = the fallback file is foreign/corrupt
    and the queue is disabled; redact_pattern_failed — 1 = an expression passed
    validation but failed an assign-time compile; the previous redactor remains.
-   0.4.2 gauge: fb_sync_failures — failed fdatasync calls on the fallback
+   0.4.2 counter: fb_sync_failures — failed fdatasync calls on the fallback
    queue, cumulative (queued events written but not durable).
    0.5.0 counters: warn_tls_no_verify / warn_fallback_open / warn_fallback_skipped /
    warn_fallback_unbounded — operator-facing WARNING lines the extension emitted,
