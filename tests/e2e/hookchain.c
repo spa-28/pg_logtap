@@ -3,7 +3,7 @@
  * Preloaded BEFORE pg_logtap (shared_preload_libraries =
  * 'hookchain,pg_logtap'), it installs emit_log_hook plus both shared-memory
  * hooks. pg_logtap must forward to all three instead of silently replacing
- * them (PROBLEMS.md B1). hookchain_count() reads the process-local log-hook
+ * them. hookchain_count() reads the process-local log-hook
  * counter, so it must be called in the session that logged.
  *
  * hookchain_arm(true) turns on the hostile mode: every hook invocation also
@@ -77,7 +77,7 @@ count_hook(ErrorData *edata)
 {
     hook_calls++;
     if (armed)
-        elog(NOTICE, "hookchain nested call %d", hook_calls);
+        elog(WARNING, "hookchain nested call %d", hook_calls);
     if (prev_hook)
         prev_hook(edata);
 }
@@ -89,6 +89,7 @@ PG_FUNCTION_INFO_V1(hookchain_shmem_ready);
 Datum
 hookchain_count(PG_FUNCTION_ARGS)
 {
+    (void) fcinfo;
     PG_RETURN_INT32(hook_calls);
 }
 
@@ -104,6 +105,7 @@ hookchain_arm(PG_FUNCTION_ARGS)
 Datum
 hookchain_shmem_ready(PG_FUNCTION_ARGS)
 {
+    (void) fcinfo;
     PG_RETURN_BOOL(hookchain_state != NULL &&
                    hookchain_state->magic == HOOKCHAIN_MAGIC);
 }

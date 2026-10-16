@@ -95,8 +95,10 @@ pg_logtap.export_fallback_file = 'pg_logtap-fallback.bin'
 TCP has no application-level acknowledgement. A successful socket write is
 counted as delivered, so live delivery is at-most-once; fallback replay can
 overlap data already accepted by Vector. Deduplicate downstream on
-`(host, cluster, seq)` when that overlap matters. The complete semantics for
-both transports are in [Delivery contract](delivery.md).
+`(host, cluster, seq)` when that overlap matters. If the wall clock rolls back
+across a restart, include `timestamp`: `(host, cluster, seq, timestamp)`; see
+[Ordering and identity](delivery.md#ordering-and-identity). The complete
+semantics for both transports are in [Delivery contract](delivery.md).
 
 For untrusted networks use `https://` or `tcps://`, configure TLS on the
 corresponding Vector source, and set pg_logtap's CA/name verification options.

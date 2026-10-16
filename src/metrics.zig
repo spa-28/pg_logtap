@@ -1,4 +1,4 @@
-//! Prometheus text endpoint for the export worker (plan §M4): /metrics,
+//! Prometheus text endpoint for the export worker: /metrics,
 //! /healthz, /livez, /readyz. Pure module — the worker does the socket IO.
 const std = @import("std");
 
@@ -101,7 +101,7 @@ fn writeBody(w: *std.Io.Writer, snap: ring.Stats) !void {
         \\# HELP pg_logtap_warn_tls_no_verify The verify=off WARNING fired (once per worker life): https/tcps export is shipping unauthenticated.
         \\# TYPE pg_logtap_warn_tls_no_verify counter
         \\pg_logtap_warn_tls_no_verify {d}
-        \\# HELP pg_logtap_warn_fallback_open The fallback queue could not be opened; fallback_broken also goes 1.
+        \\# HELP pg_logtap_warn_fallback_open Fallback queue opening was refused, or its reserved .compact rewrite path aliases the file:// sink (the valid queue is retained).
         \\# TYPE pg_logtap_warn_fallback_open counter
         \\pg_logtap_warn_fallback_open {d}
         \\# HELP pg_logtap_warn_fallback_skipped Unreadable counted fallback member observations during boot/reload scans and replay; only replay accounts their events in events_lost.
@@ -131,6 +131,7 @@ test "metrics response" {
     snap.fb_sync_failures = 3;
     snap.redact_pattern_failed = 1;
     snap.warn_tls_no_verify = 1;
+    snap.warn_fallback_open = 1;
     snap.warn_fallback_skipped = 4;
     var wbuf: [body_cap + 512]u8 = undefined;
     var resp_w = std.Io.Writer.fixed(&wbuf);
@@ -146,13 +147,14 @@ test "metrics response" {
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_redact_pattern_failed 1\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "# HELP pg_logtap_redact_pattern_failed 1 = pg_logtap.redact_pattern unexpectedly failed assign-time compilation; the previous compiled redactor remains active, if one existed.") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_tls_no_verify 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_open 1\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "# HELP pg_logtap_warn_fallback_open Fallback queue opening was refused, or its reserved .compact rewrite path aliases the file:// sink (the valid queue is retained).\n") != null);
     try std.testing.expect(std.mem.find(u8, got, "pg_logtap_warn_fallback_skipped 4\n") != null);
     try expectResponseLength(got);
 }
 
 test "metrics body fits with every counter at u64 width" {
-    // The structural T11 case: counters can legitimately be 20 digits after
-    // a long uptime at high rates. Every field at its type's widest must
+    // Counters can legitimately be 20 digits after a long uptime at high rates. Every field at its type's widest must
     // still render whole into body_cap — and the full response (status line
     // + headers + body) into the worker's body_cap + 512 serve buffer.
     var snap = std.mem.zeroes(ring.Stats);

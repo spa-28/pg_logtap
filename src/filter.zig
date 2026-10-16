@@ -1,6 +1,6 @@
 //! Capture filters: level threshold + POSIX regex include/exclude.
 //! Pure module: libc only, no PostgreSQL imports — regexes are compiled once
-//! per GUC assignment (PROBLEMS.md E1), never inside the log hook. The
+//! per GUC assignment, never inside the log hook. The
 //! compiled state lives behind an opaque box owned by src/c/regex_shim.c:
 //! regex_t layout is libc- and arch-specific (glibc's even has bitfields,
 //! opaque to translate-c), so the buffer is allocated in C against the
@@ -52,14 +52,16 @@ fn hasBackref(pattern: []const u8) bool {
     return false;
 }
 
-/// Shared compile-with-diag: on failure the shim filled buf with regerror's
-/// NUL-terminated text, which is copied into the caller's diag if it wants it.
+/// Shared compile-with-diag: use an OOM fallback unless the shim fills buf
+/// with regerror's NUL-terminated text; copy the result if the caller wants it.
 fn compileInto(comptime f: anytype, pattern: [:0]const u8, diag: ?*CompileDiag) ?*LtRegex {
     if (hasBackref(pattern)) {
         setDiag(diag, "backreferences (\\1..\\9) are not supported");
         return null;
     }
     var buf: [128]u8 = undefined;
+    @memset(&buf, 0);
+    @memcpy(buf[0.."out of memory".len], "out of memory");
     const re = f(pattern.ptr, &buf, buf.len) orelse {
         if (diag) |d| {
             d.len = std.mem.findScalar(u8, &buf, 0) orelse buf.len;
@@ -188,6 +190,19 @@ test "compile failure reports regerror's text" {
     try std.testing.expect(diag2.len > 0);
 }
 
+test "compile failure without errbuf reports OOM fallback" {
+    const noDiag = struct {
+        fn compile(_: [*:0]const u8, _: [*c]u8, _: usize) ?*LtRegex {
+            return null;
+        }
+    }.compile;
+
+    var diag = CompileDiag{};
+    try std.testing.expect(compileInto(noDiag, "valid", &diag) == null);
+    try std.testing.expect(std.mem.eql(u8, diag.text(), "out of memory"));
+    try std.testing.expect(compileInto(noDiag, "valid", null) == null);
+}
+
 // --- redaction ----------------------------------------------------------------
 //
 // Two layers, mirroring the ecosystem: core PostgreSQL masks nothing (a
@@ -205,7 +220,10 @@ pub const redacted = "<REDACTED>";
 /// cuts back to a UTF-8 character boundary and reports itself — setStr
 /// cannot know: the clipped result fits the slot, so it sees no truncation.
 fn put(dst: []u8, s: []const u8, clipped: *bool) usize {
-    if (dst.len == 0) return 0;
+    if (dst.len == 0) {
+        clipped.* = clipped.* or s.len != 0;
+        return 0;
+    }
     var n = @min(dst.len - 1, s.len);
     if (s.len > n) {
         clipped.* = true;
@@ -241,6 +259,39 @@ fn findWord(hay: []const u8, word: []const u8) ?usize {
 /// changed nothing) and whether it had to clip at the scratch size.
 pub const Masked = struct { text: []const u8, clipped: bool };
 
+/// Which password cut a field gets: none; a tail cut for query and
+/// statement-embedded message text; or a value cut for auxiliary fields.
+pub const PwCut = enum { none, tail, value };
+
+fn nextScratch(text: []const u8, scratch_a: []u8, scratch_b: []u8) []u8 {
+    return if (text.ptr == scratch_a.ptr) scratch_b else scratch_a;
+}
+
+fn applyLayer(out: Masked, layer: Masked) Masked {
+    return .{ .text = layer.text, .clipped = out.clipped or layer.clipped };
+}
+
+/// Applies the mandatory password/bind redaction and optional regex redaction,
+/// alternating the caller-owned scratch buffers between changed layers.
+pub fn maskThroughLayers(text: []const u8, pw: PwCut, red: ?*const Redactor, scratch_a: []u8, scratch_b: []u8) Masked {
+    var out = Masked{ .text = text, .clipped = false };
+    switch (pw) {
+        .none => {},
+        .tail => out = applyLayer(out, redactPassword(nextScratch(out.text, scratch_a, scratch_b), out.text)),
+        .value => {
+            out = applyLayer(out, redactPasswordValue(nextScratch(out.text, scratch_a, scratch_b), out.text));
+            out = applyLayer(out, redactParamValues(nextScratch(out.text, scratch_a, scratch_b), out.text));
+        },
+    }
+    if (red) |r| {
+        // A clipped mandatory pass is incomplete context: applying an active
+        // regex to it could miss a secret spanning the clipped suffix.
+        if (out.clipped) return .{ .text = redacted, .clipped = true };
+        out = applyLayer(out, r.apply(nextScratch(out.text, scratch_a, scratch_b), out.text));
+    }
+    return out;
+}
+
 /// True only for PostgreSQL primary-message format IDs that embed SQL. The
 /// rendered message is translated and formatted, so classifying that text
 /// would make the always-on password cut depend on lc_messages and would also
@@ -257,6 +308,13 @@ pub fn statementMessageId(message_id: []const u8) bool {
     };
     for (ids) |id| if (std.mem.eql(u8, message_id, id)) return true;
     return false;
+}
+
+/// True only for primary message IDs whose server-side DETAIL contains a
+/// prepared statement. Extended-protocol wrappers retain value redaction.
+pub fn statementDetailMessageId(message_id: []const u8) bool {
+    return std.mem.eql(u8, message_id, "statement: %s") or
+        std.mem.eql(u8, message_id, "duration: %s ms  statement: %s");
 }
 
 test "statement-embedded SQL primary message IDs" {
@@ -283,6 +341,25 @@ test "statement-embedded SQL primary message IDs" {
         "bind password 'x'",
     };
     for (rejected) |id| try std.testing.expect(!statementMessageId(id));
+}
+
+test "statement detail primary message IDs exclude extended protocol wrappers" {
+    const accepted = [_][]const u8{
+        "statement: %s",
+        "duration: %s ms  statement: %s",
+    };
+    for (accepted) |id| try std.testing.expect(statementDetailMessageId(id));
+
+    const rejected = [_][]const u8{
+        "parse %s: %s",
+        "duration: %s ms  parse %s: %s",
+        "duration: %s ms  bind %s%s%s: %s",
+        "%s %s%s%s: %s",
+        "duration: %s ms  %s %s%s%s: %s",
+        "prepare: %s",
+        "statement: %s ",
+    };
+    for (rejected) |id| try std.testing.expect(!statementDetailMessageId(id));
 }
 
 /// Everything from the end of a standalone `password` token on is dropped and
@@ -401,6 +478,10 @@ pub const Redactor = struct {
 
     /// src must be NUL-terminated at src.len.
     pub fn apply(self: *const Redactor, dst: []u8, src: []const u8) Masked {
+        return self.applyImpl(dst, src, lt_regex_find);
+    }
+
+    fn applyImpl(self: *const Redactor, dst: []u8, src: []const u8, comptime findFn: anytype) Masked {
         var clipped = false;
         var out_len: usize = 0;
         var read_pos: usize = 0;
@@ -410,16 +491,19 @@ pub const Redactor = struct {
             var rel_end: usize = 0;
             // notbol on resumed scans: '^' must anchor at the true string
             // start, not at the resume point (REG_NOTBOL is POSIX).
-            if (lt_regex_find(self.regex, src.ptr + read_pos, @intFromBool(!bol), &rel_start, &rel_end) != 0) break;
+            if (findFn(self.regex, src.ptr + read_pos, @intFromBool(!bol), &rel_start, &rel_end) != 0) break;
             bol = false;
             const match_start = read_pos + rel_start;
             const match_stop = read_pos + rel_end;
             out_len += put(dst[out_len..], src[read_pos..match_start], &clipped);
+            if (clipped) return .{ .text = dst[0..out_len], .clipped = true };
             out_len += put(dst[out_len..], redacted, &clipped);
+            if (clipped) return .{ .text = dst[0..out_len], .clipped = true };
             if (match_stop == match_start) { // zero-length match: emit one char and step past it
                 if (match_start >= src.len) break;
                 const char_len: usize = if (src[match_start] >= 0xF0) 4 else if (src[match_start] >= 0xE0) 3 else if (src[match_start] >= 0xC0) 2 else 1;
                 out_len += put(dst[out_len..], src[match_start .. match_start + @min(char_len, src.len - match_start)], &clipped);
+                if (clipped) return .{ .text = dst[0..out_len], .clipped = true };
                 read_pos = match_start + @min(char_len, src.len - match_start);
             } else read_pos = match_stop;
         }
@@ -586,6 +670,51 @@ test "redactor regex replace" {
     try std.testing.expect(!miss.clipped);
 }
 
+test "redactor stops regex searches after output clips" {
+    const search_counter = struct {
+        var calls: usize = 0;
+
+        fn find(re: *const LtRegex, s: [*]const u8, notbol: c_int, start: *usize, end: *usize) c_int {
+            calls += 1;
+            return lt_regex_find(re, s, notbol, start, end);
+        }
+    };
+
+    var red = Redactor.compile("x") orelse return error.CompileFailed;
+    defer red.deinit();
+    var clipped_buf: [8]u8 = undefined;
+    search_counter.calls = 0;
+    const clipped = red.applyImpl(&clipped_buf, "xxxxxxxx", search_counter.find);
+    try std.testing.expectEqual(@as(usize, 1), search_counter.calls);
+    try std.testing.expectEqualStrings("<REDACT", clipped.text);
+    try std.testing.expect(clipped.clipped);
+    try std.testing.expectEqual(@as(u8, 0), clipped_buf[clipped.text.len]);
+
+    var zero_buf: [0]u8 = .{};
+    const zero = red.apply(&zero_buf, "x");
+    try std.testing.expectEqual(@as(usize, 0), zero.text.len);
+    try std.testing.expect(zero.clipped);
+
+    var one_buf: [1]u8 = undefined;
+    const one = red.apply(&one_buf, "x");
+    try std.testing.expectEqual(@as(usize, 0), one.text.len);
+    try std.testing.expect(one.clipped);
+    try std.testing.expectEqual(@as(u8, 0), one_buf[0]);
+
+    var zero_match = Redactor.compile("^") orelse return error.CompileFailed;
+    defer zero_match.deinit();
+    var edge_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("<REDACTED>abc", zero_match.apply(&edge_buf, "abc").text);
+
+    var anchor = Redactor.compile("^a") orelse return error.CompileFailed;
+    defer anchor.deinit();
+    try std.testing.expectEqualStrings("<REDACTED>bc", anchor.apply(&edge_buf, "abc").text);
+
+    var utf8 = Redactor.compile("é") orelse return error.CompileFailed;
+    defer utf8.deinit();
+    try std.testing.expectEqualStrings("a<REDACTED><REDACTED>", utf8.apply(&edge_buf, "aéé").text);
+}
+
 test "redactor anchors and zero-length matches" {
     var red = Redactor.compile("^a") orelse return error.CompileFailed;
     defer red.deinit();
@@ -601,6 +730,26 @@ test "redactor anchors and zero-length matches" {
     // sed semantics (s/x*/R/g): empty match → marker, one char verbatim, step
     // past. The contract under test is termination.
     try std.testing.expectEqualStrings("<REDACTED>a<REDACTED>b<REDACTED>c", red3.apply(&buf, "abc").text);
+}
+
+test "clipped mandatory masking fails closed before regex redaction" {
+    var scratch_a: [33]u8 = undefined;
+    var scratch_b: [33]u8 = undefined;
+    var red = Redactor.compile("BEGIN_PRIVATE.*END_PRIVATE") orelse return error.CompileFailed;
+    defer red.deinit();
+    const private_prefix = "BEGIN_PRIVATE SECRET-canary " ++ ("a" ** 64) ++ " END_PRIVATE; ";
+
+    const value = maskThroughLayers(private_prefix ++ "password='benign'", .value, &red, &scratch_a, &scratch_b);
+    try std.testing.expectEqualStrings(redacted, value.text);
+    try std.testing.expect(value.clipped);
+
+    const tail = maskThroughLayers(private_prefix ++ "password='benign'", .tail, &red, &scratch_a, &scratch_b);
+    try std.testing.expectEqualStrings(redacted, tail.text);
+    try std.testing.expect(tail.clipped);
+
+    const bind = maskThroughLayers(private_prefix ++ "$1 = 'benign'", .value, &red, &scratch_a, &scratch_b);
+    try std.testing.expectEqualStrings(redacted, bind.text);
+    try std.testing.expect(bind.clipped);
 }
 
 test "clip cuts at a UTF-8 boundary and reports itself" {

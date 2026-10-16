@@ -110,6 +110,24 @@ var queue_identity_valid = false;
 // receive an external append or same-size rewrite. fchmod changes ctime on
 // every secure open, so compare content mtime instead.
 var credited_stat: ?worker.FileStat = null;
+// Readiness is independent of the healthy-HUP cache: our own writes/compact
+// can invalidate that cache without requiring a scan of unpublished appends.
+var needs_credit = false;
+
+pub fn creditPending() bool {
+    return path() != null and needs_credit and !broken;
+}
+
+fn retryNeeded() void {
+    credited_stat = null;
+    needs_credit = path() != null;
+}
+
+/// Only at a cycle boundary, before queued/replayed locals can accumulate.
+/// Known-broken files still degrade to RAM until an explicit HUP repairs them.
+pub fn retryCredit(alloc: std.mem.Allocator) void {
+    if (creditPending()) creditBacklog(alloc);
+}
 
 fn sameContents(a: worker.FileStat, b: worker.FileStat) bool {
     return a.st_dev == b.st_dev and a.st_ino == b.st_ino and a.st_size == b.st_size and
@@ -131,7 +149,7 @@ var guc_max_mb: c_int = 512;
 
 /// The fallback GUC pair, called from worker.init (one registration site).
 pub fn defineGucs() void {
-    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed export batches (any transport — http(s), tcp(s), file) are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it; a path equal to a file:// pg_logtap.export_url is rejected too (the NDJSON sink and the queue framing cannot share a file). See docs/delivery.md.", null, &guc_file, "", pg.PGC_SIGHUP, 0, checkFile, null, null);
+    pg.DefineCustomStringVariable("pg_logtap.export_fallback_file", "Path; failed export batches (any transport — http(s), tcp(s), file) are appended here as a compressed durable queue (fdatasynced once per flush cycle) and replayed automatically once the receiver answers. Relative resolves against the data directory. Empty = off. The resolved path must leave room for the .compact rewrite suffix (9 bytes under the 4096-byte path limit) or the value is rejected — the cap cannot work without it; a queue or reserved .compact path equal to a file:// pg_logtap.export_url is rejected too (the sink and queue rewrite cannot share a file). See docs/delivery.md.", null, &guc_file, "", pg.PGC_SIGHUP, 0, checkFile, null, null);
     pg.DefineCustomIntVariable("pg_logtap.fallback_max_mb", "Size cap for the fallback queue file. When an append pushes the file past the cap it is compacted to the newest half (atomic rewrite), and the undelivered events dropped by that count into events_lost — the EventsLost alert is the signal that the outage outlasted the queue. 0 = unlimited (pre-0.3.0 behavior: an unattended outage fills the disk). A cap smaller than one member (~a hundred KB compressed) can only bound the file at member granularity.", null, &guc_max_mb, 512, 0, 1_048_576, pg.PGC_SIGHUP, 0, null, null, null);
 }
 
@@ -181,6 +199,23 @@ fn compactPath(tmp_buf: *[4096]u8) ?[*:0]const u8 {
     return @ptrCast(tmp_buf);
 }
 
+var compact_alias_warned = false;
+
+/// Refuse cleanup/rewrite of a live sink, without breaking the valid queue.
+/// Same edge-triggered warning policy as the file sink's alias refusal.
+fn compactAvailable(tmp_path: [*:0]const u8) bool {
+    if (!worker.filePathAliasesFileUrl(std.mem.span(tmp_path))) {
+        compact_alias_warned = false;
+        return true;
+    }
+    if (!compact_alias_warned) {
+        compact_alias_warned = true;
+        capture.noteWarn(.fallback_open);
+        elog.Warning(@src(), "pg_logtap fallback reserved .compact pathname aliases the file:// sink: cleanup/rewrite refused, original queue retained: {s}", .{std.mem.span(tmp_path)});
+    }
+    return false;
+}
+
 /// Active path only: reading it never adopts a changed GUC or resets a cursor.
 fn path() ?[]const u8 {
     return if (fb_path_len == 0) null else fb_path_buf[0..fb_path_len];
@@ -204,6 +239,7 @@ fn adoptPath(full: []const u8) void {
     offset = 0;
     queue_identity_valid = false;
     credited_stat = null;
+    needs_credit = full.len != 0;
     broken = false;
     // Publish the choice and invalidate A's cursor before scanning/crediting B.
     capture.setFallbackPath(full);
@@ -215,30 +251,36 @@ fn reopen(alloc: std.mem.Allocator, healthy: bool) void {
     {
         defer _ = c.close(file_fd);
         const size = fbSize(file_fd) orelse {
-            credited_stat = null;
-            broken = true;
+            retryNeeded();
             return;
         };
-        // A short foreign file is not an empty queue. Never silently adopt
-        // another path because size <= magic_len happened to hide its bytes.
-        if (size != 0 and readFormat(file_fd) == null) {
-            credited_stat = null;
-            broken = true;
-            elog.Warning(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
-            return;
-        }
         const resume_offset = capture.fallbackOffset(queue_dev, queue_ino, size);
         const file_stat = fbStat(file_fd) orelse {
-            credited_stat = null;
+            retryNeeded();
             return;
         };
         const known = if (credited_stat) |credited| sameContents(credited, file_stat) else false;
-        const skip_credit = healthy and known and resume_offset == offset;
+        const skip_credit = healthy and !needs_credit and known and resume_offset == offset;
         offset = resume_offset;
+        // A short foreign file is not an empty queue. An I/O error, unlike
+        // foreign bytes, must leave validation pending for an ordinary cycle.
+        if (size != 0) switch (readFormat(file_fd)) {
+            .full => {},
+            .retry => {
+                retryNeeded();
+                return;
+            },
+            .foreign => {
+                retryNeeded();
+                broken = true;
+                elog.Warning(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
+                return;
+            },
+        };
         if (skip_credit) return;
     }
-    credited_stat = null;
-    creditBacklog(alloc);
+    retryNeeded();
+    retryCredit(alloc);
 }
 
 /// Worker start restores the ACTIVE choice even if a deferred configured B
@@ -251,9 +293,12 @@ pub fn boot(alloc: std.mem.Allocator) void {
         var buf: [4096]u8 = undefined;
         adoptPath(configuredPath(&buf) orelse return);
     }
+    needs_credit = path() != null;
     if (path() == null) return;
     var tmp_buf: [4096]u8 = undefined;
-    if (compactPath(&tmp_buf)) |p| _ = c.unlink(p);
+    if (compactPath(&tmp_buf)) |p| {
+        if (compactAvailable(p)) _ = c.unlink(p);
+    }
     reopen(alloc, false);
 }
 
@@ -277,22 +322,45 @@ pub fn reload(alloc: std.mem.Allocator) void {
 }
 
 fn drained() bool {
+    if (creditPending()) return false;
     const file_fd = fbOpen() orelse return false;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return false;
+    if (creditPending()) return false;
+    const size = fbSize(file_fd) orelse {
+        retryNeeded();
+        return false;
+    };
     if (capture.snapshot().queueBacklog() != 0) return false;
     if (size == 0) return true;
-    if (readFormat(file_fd) == null) return false;
+    switch (readFormat(file_fd)) {
+        .full => {},
+        .retry => {
+            retryNeeded();
+            return false;
+        },
+        .foreign => return false,
+    }
     return size == fb_magic_len or (offset >= fb_magic_len and offset == size);
 }
 
-/// True when the given inode is the file the active queue path names.
-/// Path spelling can differ even for a regular single-link file.
-pub fn aliasesQueueInode(st: worker.FileStat) bool {
+/// Active A, never configured/deferred B; protect both names before sink IO.
+pub fn fileUrlAliasesActive() bool {
+    const active = path() orelse return false;
+    if (worker.filePathAliasesFileUrl(active)) return true;
+    var tmp_buf: [4096]u8 = undefined;
+    const tmp_path = compactPath(&tmp_buf) orelse return false;
+    return worker.filePathAliasesFileUrl(std.mem.span(tmp_path));
+}
+
+/// Descriptor mirror, including existing /./ aliases of the reserved temp.
+pub fn aliasesActiveInode(st: worker.FileStat) bool {
     if (path() == null) return false;
     var qst: worker.FileStat = undefined;
-    if (c.stat(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), &qst) != 0) return false;
-    return st.st_dev == qst.st_dev and st.st_ino == qst.st_ino;
+    if (c.stat(@ptrCast(fb_path_buf[0..fb_path_len :0].ptr), &qst) == 0 and
+        st.st_dev == qst.st_dev and st.st_ino == qst.st_ino) return true;
+    var tmp_buf: [4096]u8 = undefined;
+    const tmp_path = compactPath(&tmp_buf) orelse return false;
+    return c.stat(tmp_path, &qst) == 0 and st.st_dev == qst.st_dev and st.st_ino == qst.st_ino;
 }
 
 fn fbOpen() ?c_int {
@@ -308,9 +376,13 @@ fn fbOpen() ?c_int {
     }
     const checked = if (file_fd >= 0) worker.privateFd(file_fd) else null;
     const file_stat = checked orelse {
-        credited_stat = null;
+        retryNeeded();
         const err = std.c._errno().*;
         if (file_fd >= 0) _ = c.close(file_fd);
+        // Descriptor/security refusal remains latched until HUP. Transient
+        // open/stat allocation or I/O failures do not prove a broken queue.
+        if (err == @intFromEnum(std.c.E.IO) or err == @intFromEnum(std.c.E.NOMEM) or
+            err == @intFromEnum(std.c.E.INTR) or err == @intFromEnum(std.c.E.AGAIN)) return null;
         broken = true;
         capture.noteWarn(.fallback_open);
         elog.Warning(@src(), "pg_logtap fallback queue refused: requires a regular single-link worker-owned 0600 file (errno={d}), fallback disabled: {s}", .{ err, path() orelse "" });
@@ -326,10 +398,13 @@ fn fbOpen() ?c_int {
         return null;
     }
     if (credited_stat) |credited| {
-        if (!sameContents(credited, file_stat)) credited_stat = null;
+        if (!sameContents(credited, file_stat)) retryNeeded();
     }
     const dev: i64 = @bitCast(@as(u64, file_stat.st_dev));
-    if (queue_identity_valid and (queue_dev != dev or queue_ino != file_stat.st_ino)) offset = 0;
+    if (queue_identity_valid and (queue_dev != dev or queue_ino != file_stat.st_ino)) {
+        offset = 0;
+        retryNeeded();
+    }
     queue_dev = dev;
     queue_ino = file_stat.st_ino;
     queue_identity_valid = true;
@@ -393,12 +468,18 @@ fn fbPread(fd: c_int, buf: []u8, offset_v: u64) ReadResult {
     return .full;
 }
 
-fn readFormat(file_fd: c_int) ?FrameFormat {
+const FormatResult = union(enum) { full: FrameFormat, foreign, retry };
+
+fn readFormat(file_fd: c_int) FormatResult {
     var magic: [fb_magic_len]u8 = undefined;
-    if (fbPread(file_fd, &magic, 0) != .full) return null;
-    if (std.mem.eql(u8, &magic, fb_magic_v1)) return .legacy;
-    if (std.mem.eql(u8, &magic, fb_magic_v2)) return .counted;
-    return null;
+    switch (fbPread(file_fd, &magic, 0)) {
+        .full => {},
+        .eof => return .foreign,
+        .err => return .retry,
+    }
+    if (std.mem.eql(u8, &magic, fb_magic_v1)) return .{ .full = .legacy };
+    if (std.mem.eql(u8, &magic, fb_magic_v2)) return .{ .full = .counted };
+    return .foreign;
 }
 
 const FrameHeader = struct {
@@ -453,10 +534,14 @@ fn repairTail(file_fd: c_int, at: u64) bool {
 pub fn queued() bool {
     if (path() == null) return false;
     if (broken) return false;
+    if (creditPending()) return true;
     const file_fd = fbOpen() orelse return false;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return false;
-    return if (offset == 0) size > fb_magic_len else size > offset;
+    const size = fbSize(file_fd) orelse {
+        retryNeeded();
+        return true;
+    };
+    return creditPending() or (if (offset == 0) size > fb_magic_len else size > offset);
 }
 
 pub fn cursor() ?capture.FallbackCursor {
@@ -464,14 +549,14 @@ pub fn cursor() ?capture.FallbackCursor {
     return .{ .dev = queue_dev, .ino = queue_ino, .offset = offset };
 }
 
-/// Outcome of appending one batch. `failed` = nothing of it is in the file
-/// (a partial write is rolled back; the events stay in the caller's RAM
-/// backlog and the append may be retried). `appended` = in the file and
-/// fdatasynced. `not_durable` = in the file, fdatasync failed — the member
-/// STAYS (dropping it would be another write that can also fail) and must
-/// never be appended again: the caller drops the batch from RAM on anything
-/// but `failed`. Page cache survives postmaster death; an OS crash loses an
-/// unsynced tail (fbDatasync warns once).
+/// Outcome of appending one batch. `failed` keeps the events in the caller's
+/// RAM backlog for retry; a partial write is rolled back where possible.
+/// `appended` means the member is in the file: `sync=true` fdatasynced it,
+/// while `sync=false` defers the attempt to the cycle's fsync().
+/// `not_durable` means the immediate fdatasync failed. The member STAYS and
+/// must never be appended again: the caller drops the batch from RAM on
+/// anything but `failed`. Page cache survives postmaster death; an OS crash
+/// can lose an unsynced tail (fbDatasync warns once).
 pub const Outcome = enum { failed, appended, not_durable };
 
 /// Append one batch as a framed gzip member. `sync` fdatasyncs this member;
@@ -480,19 +565,38 @@ pub const Outcome = enum { failed, appended, not_durable };
 /// 5k dropped in a 16-client storm). Success = the events left pg_logtap
 /// (page cache survives postmaster death; an OS crash loses the unsynced tail).
 pub fn append(alloc: std.mem.Allocator, body: []const u8, events: usize, sync: bool) Outcome {
-    if (broken or events == 0 or events > chunk_max) return .failed;
+    if (broken or creditPending() or events == 0 or events > chunk_max) return .failed;
     const file_fd = fbOpen() orelse return .failed;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return .failed;
-    const format: FrameFormat = if (size == 0) .counted else readFormat(file_fd) orelse {
-        broken = true;
-        elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
+    if (creditPending()) return .failed; // external mutation discovered on open
+    const size = fbSize(file_fd) orelse {
+        retryNeeded();
         return .failed;
     };
+    const format: FrameFormat = if (size == 0) .counted else switch (readFormat(file_fd)) {
+        .full => |format| format,
+        .retry => {
+            retryNeeded();
+            return .failed;
+        },
+        .foreign => {
+            broken = true;
+            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, fallback disabled: {s}", .{path() orelse ""});
+            return .failed;
+        },
+    };
     const prior_credit: ?worker.FileStat = if (credited_stat) |credited| blk: {
-        const before_write = fbStat(file_fd) orelse break :blk null;
-        break :blk if (sameContents(credited, before_write) and credited.st_size >= 0 and
-            @as(u64, @intCast(credited.st_size)) == size) credited else null;
+        const before_write = fbStat(file_fd) orelse {
+            retryNeeded();
+            return .failed;
+        };
+        if (!sameContents(credited, before_write) or credited.st_size < 0 or
+            @as(u64, @intCast(credited.st_size)) != size)
+        {
+            retryNeeded();
+            return .failed;
+        }
+        break :blk credited;
     } else null;
     credited_stat = null;
     if (size == 0) {
@@ -607,6 +711,20 @@ pub const Next = union(enum) {
     skipped: Skipped,
 };
 
+const ScanEnd = struct { stat: worker.FileStat, repaired: bool };
+const ReadNext = union(enum) {
+    member: Member,
+    skipped: Skipped,
+    end: ScanEnd,
+    retry,
+};
+
+fn readEnd(file_fd: c_int, at: u64, repaired: bool) ReadNext {
+    const st = fbStat(file_fd) orelse return .retry;
+    if (st.st_size < 0 or @as(u64, @intCast(st.st_size)) != at) return .retry;
+    return .{ .end = .{ .stat = st, .repaired = repaired } };
+}
+
 // Reused inflate state: the 32K window and the ≤ member_max decompressed
 // member sit above glibc's mmap threshold — same story as the gzip pool.
 // The body buffer is FIXED at member_max, not an allocating writer: the
@@ -614,20 +732,20 @@ pub const Next = union(enum) {
 // inflate without limit (a decompression bomb) — the buffer itself is the
 // ceiling, and one that crosses it fails the write and is skipped below
 // exactly like a gzip-damaged one. ~5MB, allocated once on first replay.
-var fb_dec: ?struct { window: []u8, body_buf: []u8 } = null;
+var fb_dec: ?gzip.DecoderBuffers = null;
 
-fn unreadableMember(format: FrameFormat, at: u64, size: u64, advance: u64, event_count: ?u32) Next {
+fn unreadableMember(format: FrameFormat, at: u64, size: u64, advance: u64, event_count: ?u32) ReadNext {
     if (format == .legacy) {
         // v1 stores no count outside gzip. Skipping it as one event makes both
         // events_lost and queue_backlog lie; stop and require operator action.
         broken = true;
         elog.Warning(@src(), "pg_logtap legacy fallback member at offset {d} is unreadable and its event count is unknown, replay disabled: {s}", .{ at, path() orelse "" });
-        return .none;
+        return .retry;
     }
     const events = storedEventCount(event_count) orelse {
         broken = true;
         elog.Warning(@src(), "pg_logtap fallback member at offset {d} is unreadable and its stored event_count={d} is outside 1..{d}, replay disabled: {s}", .{ at, event_count.?, chunk_max, path() orelse "" });
-        return .none;
+        return .retry;
     };
     offset += advance;
     lost += events;
@@ -642,67 +760,83 @@ fn unreadableMember(format: FrameFormat, at: u64, size: u64, advance: u64, event
 /// valid members it has only inspected. Torn tails are repaired at the current
 /// member boundary so later appends cannot land behind stale framing bytes.
 pub fn nextMember(alloc: std.mem.Allocator) Next {
-    if (broken) return .none;
+    if (broken or creditPending()) return .none;
     const file_fd = fbOpen() orelse return .none;
     defer _ = c.close(file_fd);
-    const size = fbSize(file_fd) orelse return .none;
-    if (offset == 0) {
-        if (size <= fb_magic_len) return .none;
-        if (readFormat(file_fd) == null) {
-            broken = true;
-            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
-            return .none;
-        }
-        offset = fb_magic_len;
-    }
-    if (offset >= size) return .none;
-    const format = readFormat(file_fd) orelse {
-        broken = true;
-        elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
+    if (creditPending()) return .none;
+    const size = fbSize(file_fd) orelse {
+        retryNeeded();
         return .none;
     };
+    return switch (readMember(alloc, file_fd, size)) {
+        .member => |member| .{ .member = member },
+        .skipped => |skip| .{ .skipped = skip },
+        .end => .none,
+        .retry => blk: {
+            retryNeeded();
+            break :blk .none;
+        },
+    };
+}
+
+/// The scanner bypasses only readiness, using the same securely opened fd,
+/// framing, payload checks and tail repair as public replay.
+fn readMember(alloc: std.mem.Allocator, file_fd: c_int, size: u64) ReadNext {
+    if (broken) return .retry;
+    if (size == 0) return readEnd(file_fd, 0, false);
+    const format = switch (readFormat(file_fd)) {
+        .full => |format| format,
+        .retry => return .retry,
+        .foreign => {
+            broken = true;
+            elog.Log(@src(), "pg_logtap fallback file is not a pg_logtap queue, replay disabled: {s}", .{path() orelse ""});
+            return .retry;
+        },
+    };
+    if (offset == 0) offset = fb_magic_len;
+    if (offset >= size) return readEnd(file_fd, offset, false);
     const header = switch (readFrameHeader(file_fd, format, offset, size)) {
         .full => |h| h,
         .torn => {
-            _ = repairTail(file_fd, offset);
-            return .none;
+            if (!repairTail(file_fd, offset)) return .retry;
+            return readEnd(file_fd, offset, true);
         },
-        .err => return .none,
+        .err => return .retry,
         .corrupt => {
             broken = true;
             elog.Log(@src(), "pg_logtap fallback framing corrupt at offset {d}, replay disabled", .{offset});
-            return .none;
+            return .retry;
         },
     };
     const advance = header.len + @as(u64, header.compressed_len);
     if (size -| offset < advance) {
-        _ = repairTail(file_fd, offset);
-        return .none;
+        if (!repairTail(file_fd, offset)) return .retry;
+        return readEnd(file_fd, offset, true);
     }
-    const comp = alloc.alloc(u8, header.compressed_len) catch return .none;
+    const comp = alloc.alloc(u8, header.compressed_len) catch return .retry;
     const body_read = fbPread(file_fd, comp, offset + header.len);
     if (body_read == .err) {
         // An I/O error says nothing about the framing — leave the member in
         // place and retry next cycle; truncating here would destroy fully
         // valid members on a transient disk fault.
         alloc.free(comp);
-        return .none;
+        return .retry;
     }
     if (body_read == .eof) {
         alloc.free(comp);
-        _ = repairTail(file_fd, offset);
-        return .none;
+        if (!repairTail(file_fd, offset)) return .retry;
+        return readEnd(file_fd, offset, true);
     }
     defer alloc.free(comp);
-    if (fb_dec == null) fb_dec = .{
-        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return .none,
-        .body_buf = alloc.alloc(u8, member_max) catch return .none,
-    };
+    if (fb_dec == null) fb_dec = gzip.DecoderBuffers.init(alloc, member_max) catch return .retry;
     const dec_state = &fb_dec.?;
     var src: std.Io.Reader = .fixed(comp);
     var dec = std.compress.flate.Decompress.init(&src, .gzip, dec_state.window);
     var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
     _ = dec.reader.streamRemaining(&body) catch return unreadableMember(format, offset, size, advance, header.event_count);
+    const footer = dec.container_metadata.gzip;
+    if (!gzip.validTrailer(body.buffered(), footer.crc, footer.count))
+        return unreadableMember(format, offset, size, advance, header.event_count);
     const events: u32 = @intCast(std.mem.countScalar(u8, body.buffered(), '\n'));
     if (events == 0)
         return unreadableMember(format, offset, size, advance, header.event_count);
@@ -730,10 +864,18 @@ pub fn nextMember(alloc: std.mem.Allocator) Next {
 /// a failed sync (counted in fb_sync_failures) only re-opens that duplicate
 /// window; the events are already delivered.
 pub fn truncate() void {
-    if (broken) return;
+    if (broken or creditPending()) return;
     const file_fd = fbOpen() orelse return;
     defer _ = c.close(file_fd);
-    if (readFormat(file_fd) == null) return;
+    if (creditPending()) return;
+    switch (readFormat(file_fd)) {
+        .full => {},
+        .retry => {
+            retryNeeded();
+            return;
+        },
+        .foreign => return,
+    }
     // The next queue generation reuses this inode. Fail closed to replay from
     // byte zero if the worker exits before publishing that generation's cursor.
     capture.invalidateFallbackCursor();
@@ -753,17 +895,25 @@ pub fn truncate() void {
 /// normally credits zero; if the old worker died after an append but before
 /// publishing its cycle counters, only that uncounted suffix is credited.
 fn creditBacklog(alloc: std.mem.Allocator) void {
-    const before = blk: {
-        const file_fd = fbOpen() orelse return;
-        defer _ = c.close(file_fd);
-        break :blk fbStat(file_fd) orelse return;
-    };
+    const file_fd = fbOpen() orelse return;
+    defer _ = c.close(file_fd);
+    const before = fbStat(file_fd) orelse return;
+    const size = fbSize(file_fd) orelse return;
+    if (before.st_size < 0 or @as(u64, @intCast(before.st_size)) != size) return;
+    // Also restores a soft-replacement cursor if boot's first open/size read
+    // failed. All callers run before flush-local counters can exist.
+    offset = capture.fallbackOffset(queue_dev, queue_ino, size);
     const saved_offset = offset;
     const saved_lost = lost;
     const saved_discarded = discarded;
     var events: u64 = 0;
-    while (true) switch (nextMember(alloc)) {
-        .none => break,
+    var complete: ?ScanEnd = null;
+    while (true) switch (readMember(alloc, file_fd, size)) {
+        .retry => break,
+        .end => |end| {
+            complete = end;
+            break;
+        },
         .member => |member| {
             events += member.events;
             offset += member.advance;
@@ -772,22 +922,24 @@ fn creditBacklog(alloc: std.mem.Allocator) void {
         // the real drain later folds its exact count into lost + discarded.
         .skipped => |skip| events += skip.events,
     };
-    // .none also means transient IO/allocation failure, not necessarily EOF.
-    const complete = !broken and (before.st_size <= fb_magic_len or
-        offset >= @as(u64, @intCast(before.st_size)));
     offset = saved_offset;
     lost = saved_lost;
     discarded = saved_discarded;
-    const snap = capture.snapshot();
-    const backlog = snap.queueBacklog();
-    const due = events -| backlog;
+    const due = events -| capture.snapshot().queueBacklog();
     if (due > 0) capture.bumpExport(0, due, 0, 0, 0, 0, 0);
-    if (complete) {
-        const file_fd = fbOpen() orelse return;
-        defer _ = c.close(file_fd);
-        if (fbStat(file_fd)) |after| {
-            if (sameContents(before, after)) credited_stat = after;
-        }
+    const end = complete orelse return;
+    if (broken or before.st_dev != end.stat.st_dev or before.st_ino != end.stat.st_ino) return;
+    // Ordinary EOF requires unchanged contents. A repaired EOF instead uses
+    // the observed post-truncate size/mtime, never the stale pre-repair size.
+    if (end.repaired) {
+        if (end.stat.st_size > before.st_size) return;
+    } else if (!sameContents(before, end.stat)) return;
+    const after_fd = fbOpen() orelse return; // revalidate the active pathname too
+    defer _ = c.close(after_fd);
+    const after = fbStat(after_fd) orelse return;
+    if (sameContents(end.stat, after)) {
+        credited_stat = after;
+        needs_credit = false;
     }
 }
 
@@ -796,15 +948,14 @@ fn countFrameEvents(alloc: std.mem.Allocator, file_fd: c_int, format: FrameForma
     const comp = alloc.alloc(u8, header.compressed_len) catch return stored;
     defer alloc.free(comp);
     if (fbPread(file_fd, comp, off + header.len) != .full) return stored;
-    if (fb_dec == null) fb_dec = .{
-        .window = alloc.alloc(u8, std.compress.flate.max_window_len) catch return stored,
-        .body_buf = alloc.alloc(u8, member_max) catch return stored,
-    };
+    if (fb_dec == null) fb_dec = gzip.DecoderBuffers.init(alloc, member_max) catch return stored;
     const dec_state = &fb_dec.?;
     var src_reader: std.Io.Reader = .fixed(comp);
     var dec = std.compress.flate.Decompress.init(&src_reader, .gzip, dec_state.window);
     var body: std.Io.Writer = std.Io.Writer.fixed(dec_state.body_buf);
     _ = dec.reader.streamRemaining(&body) catch return stored;
+    const footer = dec.container_metadata.gzip;
+    if (!gzip.validTrailer(body.buffered(), footer.crc, footer.count)) return stored;
     const events: u64 = std.mem.countScalar(u8, body.buffered(), '\n');
     if (events == 0) return stored;
     if (format == .counted and events != header.event_count.?)
@@ -862,6 +1013,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFor
     // self-contained; no recompression).
     var tmp_buf: [4096]u8 = undefined;
     const tmp_path = compactPath(&tmp_buf) orelse return;
+    if (!compactAvailable(tmp_path)) return;
     // The temp must be exclusively ours: a predictable name opened with
     // O_TRUNC follows a symlink planted in a writable directory (truncating
     // its target, and the rename would then put that symlink in the queue's
@@ -874,6 +1026,7 @@ fn compact(alloc: std.mem.Allocator, file_fd: c_int, size: u64, format: FrameFor
     if (tmp_fd < 0) {
         const open_errno = std.c._errno().*;
         if (open_errno != @intFromEnum(std.c.E.EXIST)) return;
+        if (!compactAvailable(tmp_path)) return;
         if (c.unlink(tmp_path) != 0) return;
         tmp_fd = c.open(tmp_path, tmp_flags, @as(c_uint, 0o600));
         if (tmp_fd < 0) return;

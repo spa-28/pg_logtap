@@ -6,6 +6,7 @@ comptime {
     _ = @import("filter.zig");
     _ = @import("jsonl.zig");
     _ = @import("export.zig");
+    _ = @import("tls.zig");
     _ = @import("gzip.zig");
     _ = @import("metrics.zig");
 }

@@ -1,4 +1,4 @@
-# M3 e2e: pg_logtap pushes ndjson over HTTP → Vector sinks it to
+# E2E: pg_logtap pushes ndjson over HTTP → Vector sinks it to
 # console+file AND to VictoriaLogs (the prod-shaped jsonline ingest with the
 # field mapping in the query string — e2e-vlogs.sh asserts exact delivery
 # through that chain; the file sink is what the other suites count).

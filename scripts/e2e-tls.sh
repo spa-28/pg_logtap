@@ -57,9 +57,123 @@
 #            covers the same writer without the signal harness
 # Markers are per-phase NAMED buckets (received counts DISTINCT markers), so
 # a phase's asserts can never be satisfied by another phase's events.
+# Guarded system-root probe: PG_LOGTAP_TLS_SYSTEM_ROOT_PROBE=run invokes a
+# controller-provided, task-owned PG whose generated chain root is mounted
+# read-only at /etc/ssl/certs/ca-certificates.crt. Required controller values:
+# LT_TLS_ROOT_PG_CONTAINER, LT_TLS_ROOT_EXPECTED_ID, LT_TLS_ROOT_LABEL_KEY,
+# LT_TLS_ROOT_LABEL_VALUE, LT_TLS_ROOT_CA_SOURCE, LT_TLS_ROOT_CA_SHA256 and
+# LT_TLS_ROOT_URL (the existing chain receiver URL).
 # Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
+[ -z "${PG_LOGTAP_TLS_SYSTEM_ROOT_PROBE:-}" ] || E2E_TAG=tls-system-root
 set -u
 . "$(dirname "$0")/e2e-common.sh"
+
+tls_root_fail() {
+  printf '%s\n' "e2e-$E2E_TAG: FAILED: $*" >&2
+  exit 1
+}
+
+tls_root_psql() {
+  docker exec "$tls_root_target" psql -X -U postgres -v ON_ERROR_STOP=1 "$@"
+}
+
+tls_root_set_guc() {
+  case "$1" in
+    pg_logtap.export_url|pg_logtap.export_tls_ca|pg_logtap.export_tls_verify|pg_logtap.export_tls_server_name|pg_logtap.export_fallback_file|pg_logtap.metrics_port) ;;
+    *) tls_root_fail "system-root probe: unsupported GUC $1" ;;
+  esac
+  docker exec -i "$tls_root_target" psql -X -U postgres -v ON_ERROR_STOP=1 \
+    -v "guc=$1" -v "value=$2" >/dev/null <<'SQL'
+SELECT format('ALTER SYSTEM SET %s = %L', :'guc', :'value')
+\gexec
+SQL
+}
+
+tls_root_expect_guc() {
+  n=0
+  while [ "$n" -lt 20 ]; do
+    [ "$(tls_root_psql -Atc "SHOW $1")" = "$2" ] && return 0
+    n=$((n + 1)); sleep 1
+  done
+  tls_root_fail "system-root probe: $1 never became '$2'"
+}
+
+tls_root_counter() {
+  tls_root_psql -Atc "SELECT substring(pg_logtap_stats() from '$1=([0-9]+)')"
+}
+
+tls_root_http_code() {
+  docker exec "$tls_root_target" bash -c '
+    exec 3<>/dev/tcp/127.0.0.1/9187 || exit
+    printf "GET %s HTTP/1.0\r\n\r\n" "$1" >&3
+    IFS= read -r -t 8 line <&3 || exit
+    set -- $line; printf "%s\n" "$2"
+  ' bash "$1" 2>/dev/null
+}
+
+tls_system_root_probe() {
+  [ -n "${LT_TLS_ROOT_PG_CONTAINER:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_PG_CONTAINER is required"
+  [ -n "${LT_TLS_ROOT_EXPECTED_ID:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_EXPECTED_ID is required"
+  [ -n "${LT_TLS_ROOT_LABEL_KEY:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_LABEL_KEY is required"
+  [ -n "${LT_TLS_ROOT_LABEL_VALUE:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_LABEL_VALUE is required"
+  [ -n "${LT_TLS_ROOT_CA_SOURCE:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_CA_SOURCE is required"
+  [ -n "${LT_TLS_ROOT_CA_SHA256:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_CA_SHA256 is required"
+  [ -n "${LT_TLS_ROOT_URL:-}" ] || tls_root_fail "system-root probe: LT_TLS_ROOT_URL is required"
+  case "$LT_TLS_ROOT_LABEL_KEY" in ''|*[!A-Za-z0-9_.-]*) tls_root_fail "system-root probe: invalid label key" ;; esac
+  case "$LT_TLS_ROOT_URL" in https://*) ;; *) tls_root_fail "system-root probe: chain receiver must use https" ;; esac
+
+  tls_root_id=$(docker inspect -f '{{.Id}}' "$LT_TLS_ROOT_PG_CONTAINER") || tls_root_fail "system-root probe: cannot inspect supplied PG container"
+  [ "$tls_root_id" = "$LT_TLS_ROOT_EXPECTED_ID" ] || tls_root_fail "system-root probe: supplied PG container ID does not match"
+  tls_root_target=$tls_root_id
+  tls_root_label=$(docker inspect -f "{{index .Config.Labels \"$LT_TLS_ROOT_LABEL_KEY\"}}" "$tls_root_target") || tls_root_fail "system-root probe: cannot read supplied PG label"
+  [ "$tls_root_label" = "$LT_TLS_ROOT_LABEL_VALUE" ] || tls_root_fail "system-root probe: supplied PG container label does not match"
+  [ "$(docker inspect -f '{{.State.Running}}' "$tls_root_target")" = true ] || tls_root_fail "system-root probe: supplied PG container is not running"
+  tls_root_mount=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/ssl/certs/ca-certificates.crt"}}{{.Source}}|{{.RW}}{{end}}{{end}}' "$tls_root_target") || tls_root_fail "system-root probe: cannot inspect CA mount"
+  [ "$tls_root_mount" = "$LT_TLS_ROOT_CA_SOURCE|false" ] || tls_root_fail "system-root probe: generated root is not the expected read-only system-store mount"
+  tls_root_hash=$(docker exec "$tls_root_target" sha256sum /etc/ssl/certs/ca-certificates.crt) || tls_root_fail "system-root probe: cannot hash mounted root"
+  tls_root_hash=${tls_root_hash%% *}
+  [ "$tls_root_hash" = "$LT_TLS_ROOT_CA_SHA256" ] || tls_root_fail "system-root probe: mounted root does not match generated chain root"
+
+  tls_root_set_guc pg_logtap.export_url "$LT_TLS_ROOT_URL" || tls_root_fail "system-root probe: cannot set export_url"
+  tls_root_set_guc pg_logtap.export_tls_ca '' || tls_root_fail "system-root probe: cannot clear export_tls_ca"
+  tls_root_set_guc pg_logtap.export_tls_verify on || tls_root_fail "system-root probe: cannot set export_tls_verify"
+  tls_root_set_guc pg_logtap.export_tls_server_name localhost || tls_root_fail "system-root probe: cannot set export_tls_server_name"
+  tls_root_set_guc pg_logtap.export_fallback_file '' || tls_root_fail "system-root probe: cannot clear export_fallback_file"
+  tls_root_set_guc pg_logtap.metrics_port 9187 || tls_root_fail "system-root probe: cannot set metrics_port"
+  tls_root_psql -qc 'SELECT pg_reload_conf()' >/dev/null || tls_root_fail "system-root probe: cannot reload configuration"
+  tls_root_expect_guc pg_logtap.export_url "$LT_TLS_ROOT_URL"
+  tls_root_expect_guc pg_logtap.export_tls_ca ''
+  tls_root_expect_guc pg_logtap.export_tls_verify on
+  tls_root_expect_guc pg_logtap.export_tls_server_name localhost
+  tls_root_expect_guc pg_logtap.export_fallback_file ''
+  tls_root_expect_guc pg_logtap.metrics_port 9187
+
+  tls_root_sent0=$(tls_root_counter events_sent)
+  tls_root_failed0=$(tls_root_counter send_cycles_failed)
+  tls_root_psql -qc "DO \$\$ BEGIN RAISE WARNING 'logtap tls-system-root'; END \$\$" >/dev/null || tls_root_fail "system-root probe: cannot emit warning"
+  n=0
+  while [ "$n" -lt 30 ]; do
+    tls_root_sent1=$(tls_root_counter events_sent)
+    tls_root_failed1=$(tls_root_counter send_cycles_failed)
+    if [ "$tls_root_sent1" -gt "$tls_root_sent0" ] 2>/dev/null &&
+       [ "$tls_root_failed1" = "$tls_root_failed0" ] &&
+       [ "$(tls_root_http_code /readyz)" = 200 ]; then
+      ok "system-root chain verification delivered and readyz stayed 200 without new failed cycles"
+      return 0
+    fi
+    n=$((n + 1)); sleep 1
+  done
+  [ "${tls_root_failed1:-}" = "$tls_root_failed0" ] || tls_root_fail "system-root probe: failed cycles rose from $tls_root_failed0 to ${tls_root_failed1:-?}"
+  [ "${tls_root_sent1:-0}" -gt "$tls_root_sent0" ] 2>/dev/null || tls_root_fail "system-root probe: no delivery through the system-root chain"
+  tls_root_fail "system-root probe: readyz did not become 200"
+}
+
+case "${PG_LOGTAP_TLS_SYSTEM_ROOT_PROBE:-}" in
+  '') ;;
+  run) tls_system_root_probe; exit $? ;;
+  *) printf '%s\n' 'PG_LOGTAP_TLS_SYSTEM_ROOT_PROBE must be run' >&2; exit 2 ;;
+esac
+
 e2e_init tls "${1:-}"
 N="${2:-10}"
 e2e_gate
@@ -109,11 +223,24 @@ PORT_WDRIB=$((TLS_BASE + 8))
 PORT_TDRIB=$((TLS_BASE + 9))
 B64=$(printf %s 'pglogtap:s3cret' | base64 | tr -d '\n') # phase 9's Basic credentials
 
-# The receiver's address as seen from the pg container: the docker network
-# gateway (the host). The certificate's SAN carries that IP — verification
-# matches the URL host, which is exactly this address.
-NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end}}' "$PG_CT")
-GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
+# E2E_TLS_PYTHON opts into the controller-owned, container-local fixture. It
+# keeps normal CI's host receiver unchanged while avoiding host listeners for
+# the private owned-run adapter.
+TLS_PYTHON=${E2E_TLS_PYTHON:-}
+TLS_CT_ID=
+TLS_DIR_IN_CT=
+TLS_PID_IN_CT=
+TLS_DIR_CLEANUP=0
+if [ -n "$TLS_PYTHON" ]; then
+  TLS_CT_ID=$(docker inspect -f '{{.Id}}' "$PG_CT") || fail "could not identify TLS fixture container"
+  [ -n "$TLS_CT_ID" ] || fail "TLS fixture container has no immutable ID"
+  GW=127.0.0.1
+else
+  # The normal receiver's address as seen from the pg container is the Docker
+  # network gateway (the host); its certificate carries that IP.
+  NET=$(docker inspect -f '{{range $k,$_ := .NetworkSettings.Networks}}{{$k}}{{end}}' "$PG_CT")
+  GW=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET")
+fi
 
 mkdir -p "$DIR"
 rm -f "$OUT" "$TCPS_OUT" "$EVIL_OUT" "$CHAIN_OUT" "$AMBIG_OUT" "$AUTH_OUT" "$T12_OUT" "$T12_VER"
@@ -147,7 +274,7 @@ docker cp "$CERT" "$PG_CT:$CA_IN_CT"
 docker cp "$DIR/root.pem" "$PG_CT:$CA_IN_CT.root"
 docker cp "$DIR/inter.pem" "$PG_CT:$CA_IN_CT.inter"
 
-DIR="$DIR" PORT_HTTPS="$PORT_HTTPS" PORT_TCPS="$PORT_TCPS" PORT_EVIL="$PORT_EVIL" PORT_CHAIN="$PORT_CHAIN" PORT_AMBIG="$PORT_AMBIG" PORT_AUTH="$PORT_AUTH" PORT_DRIB="$PORT_DRIB" PORT_T12="$PORT_T12" PORT_WDRIB="$PORT_WDRIB" PORT_TDRIB="$PORT_TDRIB" python3 - <<'PYEOF' &
+cat > "$DIR/receiver.py" <<'PYEOF'
 import base64
 import gzip
 import os
@@ -220,7 +347,14 @@ def dump_tls(port, ctx, out):
             pass
 
 threading.Thread(target=dump_tls, args=(int(os.environ["PORT_TCPS"]), ctx, "tcps-out.jsonl"), daemon=True).start()
-threading.Thread(target=dump_tls, args=(int(os.environ["PORT_EVIL"]), ctx_evil, "evil-out.jsonl"), daemon=True).start()
+# Phase 5 must exercise the same complete status-only HTTP acknowledgement as
+# the trusted sink: record the decoded body before returning its numeric status.
+class HEvil(H):
+    sink = "evil-out.jsonl"
+
+httpd_evil = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_EVIL"])), HEvil)
+httpd_evil.socket = ctx_evil.wrap_socket(httpd_evil.socket, server_side=True)
+threading.Thread(target=httpd_evil.serve_forever, daemon=True).start()
 # Phase 10's dribbler: accept, then feed ONE handshake-record byte every 2s —
 # each client read succeeds (per-read SO_RCVTIMEO never fires), only the
 # absolute per-attempt deadline can end the handshake. It never completes,
@@ -232,17 +366,23 @@ def dribble(port):
     raw.listen(8)
     while True:
         conn, _ = raw.accept()
+        with open(os.path.join(d, "drib-evidence"), "a") as f:
+            f.write("connected\n")
         conn.settimeout(30)
         try:
             while True:
-                conn.send(b"\x16")
+                if not conn.send(b"\x16"):
+                    break
+                with open(os.path.join(d, "drib-evidence"), "a") as f:
+                    f.write("bytes\n")
                 time.sleep(2)
         except OSError:
             pass
-        try:
-            conn.close()
-        except OSError:
-            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 threading.Thread(target=dribble, args=(int(os.environ["PORT_DRIB"]),), daemon=True).start()
 # The chain receiver ANSWERS an HTTP status (like the main one): phase 7
@@ -346,16 +486,23 @@ def dribble_write(port):
     srv.listen(8)
     while True:
         conn, _ = srv.accept()
+        with open(os.path.join(d, "wdrib-evidence"), "a") as f:
+            f.write("connected\n")
         try:
             while True:
-                conn.recv(1)
+                chunk = conn.recv(1)
+                if not chunk:
+                    break
+                with open(os.path.join(d, "wdrib-evidence"), "a") as f:
+                    f.write("bytes\n")
                 time.sleep(1)
         except OSError:
             pass
-        try:
-            conn.close()
-        except OSError:
-            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 threading.Thread(target=dribble_write, args=(int(os.environ["PORT_WDRIB"]),), daemon=True).start()
 # Phase 14's TLS write-dribbler: the phase-13 drain wrapped in a COMPLETED
@@ -372,39 +519,144 @@ def dribble_write_tls(port, ctx):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     srv.bind(("0.0.0.0", port))
     srv.listen(8)
-    while True:
-        conn, _ = srv.accept()
+    def handle(conn):
+        tls = None
+        stage = None
         try:
             tls = ctx.wrap_socket(conn, server_side=True)
             while True:
-                tls.recv(1)
+                chunk = tls.recv(1)
+                if not chunk:
+                    break
+                if stage is None:
+                    # HTTP starts POST; raw tcps NDJSON starts with its JSON body.
+                    stage = "https" if chunk == b"P" else "tcps"
+                    with open(os.path.join(d, "tdrib-evidence"), "a") as f:
+                        f.write(f"{stage}-connected\n{stage}-handshake\n{stage}-bytes\n")
+                else:
+                    with open(os.path.join(d, "tdrib-evidence"), "a") as f:
+                        f.write(f"{stage}-bytes\n")
                 time.sleep(1)
         except OSError:
             pass
-        try:
-            conn.close()
-        except OSError:
-            pass
+        finally:
+            if tls is not None:
+                try:
+                    tls.close()
+                except OSError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 threading.Thread(target=dribble_write_tls, args=(int(os.environ["PORT_TDRIB"]), ctx), daemon=True).start()
 httpd = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT_HTTPS"])), H)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 PYEOF
-RECV=$!
+RECV=
 cleanup() {
   cleanup_status=$?
   trap - EXIT INT TERM
-  kill "$RECV" 2>/dev/null || true
+  if [ -n "$TLS_PYTHON" ] && [ "$TLS_DIR_CLEANUP" = 1 ]; then
+    if [ "$cleanup_status" -ne 0 ]; then
+      mkdir -p "$DIR/receiver-failed" 2>/dev/null || true
+      docker cp "$TLS_CT_ID:$TLS_DIR_IN_CT/." "$DIR/receiver-failed/" >/dev/null 2>&1 || true
+    fi
+    docker exec "$TLS_CT_ID" sh -c 'test ! -r "$1" || kill "$(cat "$1")" 2>/dev/null || true; rm -rf "$2"' sh "$TLS_PID_IN_CT" "$TLS_DIR_IN_CT" >/dev/null 2>&1 || true
+  else
+    kill "$RECV" 2>/dev/null || true
+  fi
   setguc pg_logtap.metrics_port "$METRICS_PORT0" && reload || cleanup_status=1
   exit "$cleanup_status"
 }
 trap cleanup EXIT INT TERM
+if [ -n "$TLS_PYTHON" ]; then
+  TLS_DIR_IN_CT="/tmp/pg-logtap-tls-$E2E_TAG-$$"
+  TLS_PID_IN_CT="$TLS_DIR_IN_CT/receiver.pid"
+  docker exec "$TLS_CT_ID" test -x "$TLS_PYTHON" || fail "E2E_TLS_PYTHON is not executable in the owned container"
+  TLS_DIR_CLEANUP=1 # private unique path: cleanup is armed before mkdir/copy/start
+  docker exec "$TLS_CT_ID" mkdir -p "$TLS_DIR_IN_CT" || fail "could not create private TLS fixture directory"
+  docker cp "$DIR/." "$TLS_CT_ID:$TLS_DIR_IN_CT/" || fail "could not copy TLS fixture into owned container"
+  LD_LIBRARY_PATH=${E2E_TLS_LD_LIBRARY_PATH:-} docker exec -e LD_LIBRARY_PATH \
+    -e "DIR=$TLS_DIR_IN_CT" -e "PORT_HTTPS=$PORT_HTTPS" -e "PORT_TCPS=$PORT_TCPS" \
+    -e "PORT_EVIL=$PORT_EVIL" -e "PORT_CHAIN=$PORT_CHAIN" -e "PORT_AMBIG=$PORT_AMBIG" \
+    -e "PORT_AUTH=$PORT_AUTH" -e "PORT_DRIB=$PORT_DRIB" -e "PORT_T12=$PORT_T12" \
+    -e "PORT_WDRIB=$PORT_WDRIB" -e "PORT_TDRIB=$PORT_TDRIB" "$TLS_CT_ID" sh -c \
+    'gate="$4.start"; rm -f "$4" "$gate"; nohup sh -c '\''while [ ! -e "$3" ]; do sleep 1; done; exec "$1" -I -S -u "$2"'\'' sh "$1" "$2" "$gate" >"$3" 2>&1 & pid=$!; printf "%s\n" "$pid" >"$4" || { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1; }; : >"$gate"' sh \
+    "$TLS_PYTHON" "$TLS_DIR_IN_CT/receiver.py" "$TLS_DIR_IN_CT/receiver.log" "$TLS_PID_IN_CT" \
+    || fail "could not start container-local TLS receiver"
+else
+  (
+    export DIR PORT_HTTPS PORT_TCPS PORT_EVIL PORT_CHAIN PORT_AMBIG PORT_AUTH PORT_DRIB PORT_T12 PORT_WDRIB PORT_TDRIB
+    exec python3 "$DIR/receiver.py"
+  ) &
+  RECV=$!
+fi
+
+sync_receiver_file() {
+  [ -z "$TLS_PYTHON" ] && return 0
+  remote=$TLS_DIR_IN_CT/$(basename "$1")
+  if docker exec "$TLS_CT_ID" test -e "$remote"; then
+    docker cp "$TLS_CT_ID:$remote" "$1" || fail "could not transfer receiver evidence $remote"
+    return 0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 1 ] || fail "could not inspect receiver evidence $remote"
+  [ ! -e "$1" ] || fail "receiver evidence disappeared remotely: $remote"
+}
+received() { # TLS receiver outputs are copied back only for the opt-in adapter.
+  file=${2:-$OUT}
+  sync_receiver_file "$file"
+  grep -oE "logtap $E2E_TAG $1$E2E_SUF [0-9]+" "$file" 2>/dev/null | sort -u | wc -l
+}
+received_count() { # checked count for callers that cannot preserve substitution status.
+  RECEIVED=$(received "$@") || fail "could not count required receiver evidence ${2:-$OUT}"
+}
+require_tdrib_stage() { # stage-specific evidence prevents HTTPS satisfying tcps.
+  stage=$1
+  evidence=${2:-$DIR/tdrib-evidence}
+  if grep -qx "$stage-connected" "$evidence" && grep -qx "$stage-handshake" "$evidence" && grep -qx "$stage-bytes" "$evidence"; then
+    return 0
+  fi
+  fail "e2e-tls: phase 14 $stage timed out before its own TLS connection, handshake, and decrypted body progress"
+}
+receiver_ready() {
+  probe="import socket; [socket.create_connection(('127.0.0.1', p), 1).close() for p in ($PORT_HTTPS, $PORT_TCPS, $PORT_EVIL, $PORT_CHAIN, $PORT_AMBIG, $PORT_AUTH, $PORT_DRIB, $PORT_T12, $PORT_WDRIB, $PORT_TDRIB)]"
+  if [ -n "$TLS_PYTHON" ]; then
+    LD_LIBRARY_PATH=${E2E_TLS_LD_LIBRARY_PATH:-} docker exec -e LD_LIBRARY_PATH "$TLS_CT_ID" "$TLS_PYTHON" -I -S -c "$probe"
+  else
+    python3 -c "$probe"
+  fi
+}
 i=0
-until python3 -c "import socket; socket.create_connection(('127.0.0.1', $PORT_HTTPS), 1); socket.create_connection(('127.0.0.1', $PORT_TCPS), 1); socket.create_connection(('127.0.0.1', $PORT_EVIL), 1); socket.create_connection(('127.0.0.1', $PORT_CHAIN), 1); socket.create_connection(('127.0.0.1', $PORT_AMBIG), 1); socket.create_connection(('127.0.0.1', $PORT_AUTH), 1); socket.create_connection(('127.0.0.1', $PORT_DRIB), 1); socket.create_connection(('127.0.0.1', $PORT_T12), 1); socket.create_connection(('127.0.0.1', $PORT_WDRIB), 1); socket.create_connection(('127.0.0.1', $PORT_TDRIB), 1)" 2>/dev/null; do
+until receiver_ready 2>/dev/null; do
   i=$((i + 1)); [ "$i" -lt 30 ] || { echo "e2e-tls: receiver never listened" >&2; exit 1; }
   sleep 1
 done
+if [ -n "$TLS_PYTHON" ]; then
+  docker exec "$TLS_CT_ID" sh -c ': > "$1"; : > "$2"; : > "$3"' sh \
+    "$TLS_DIR_IN_CT/drib-evidence" "$TLS_DIR_IN_CT/wdrib-evidence" "$TLS_DIR_IN_CT/tdrib-evidence" \
+    || fail "could not reset TLS stage evidence"
+fi
+: > "$DIR/drib-evidence"
+: > "$DIR/wdrib-evidence"
+: > "$DIR/tdrib-evidence"
+# A successful controlled request proves the impostor detector itself is live;
+# phase 5's nonce cannot otherwise distinguish a dead fixture from good trust.
+EVIL_PROBE='import gzip,socket,ssl,sys; b=gzip.compress(b"{\"detector\":\"evil-live\"}\n"); s=ssl._create_unverified_context().wrap_socket(socket.create_connection(("127.0.0.1",int(sys.argv[1]))),server_hostname="localhost"); s.sendall(b"POST /insert/jsonline HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: "+str(len(b)).encode()+b"\r\nConnection: close\r\n\r\n"+b); assert b" 200 " in s.recv(128); s.close()'
+if [ -n "$TLS_PYTHON" ]; then
+  LD_LIBRARY_PATH=${E2E_TLS_LD_LIBRARY_PATH:-} docker exec -e LD_LIBRARY_PATH "$TLS_CT_ID" "$TLS_PYTHON" -I -S -c "$EVIL_PROBE" "$PORT_EVIL" || fail "impostor control request failed"
+else
+  python3 -c "$EVIL_PROBE" "$PORT_EVIL" || fail "impostor control request failed"
+fi
+sync_receiver_file "$EVIL_OUT"
+grep -Fqx '{"detector":"evil-live"}' "$EVIL_OUT" || fail "impostor did not record the accepted control request"
 
 start_hup_storm() { # worker-pid, 100ms signal count; sets HUP_STORM_PID
   docker exec "$PG_CT" sh -c "i=0; while [ \$i -lt $2 ]; do kill -HUP '$1' 2>/dev/null || true; i=\$((i + 1)); sleep 0.1; done" >/dev/null 2>&1 &
@@ -440,6 +692,39 @@ set_gucs() { # each ALTER SYSTEM its own -c: a multi-statement -c silently fails
 # asserts do not want. RAM backlog only.
 set_gucs "pg_logtap.export_fallback_file = ''" "pg_logtap.metrics_port = '9187'"
 
+# --- name GUC bounds: these ALTER SYSTEM rejections happen while export is
+# disabled, so neither invalid value can start a socket send. The TLS boundary
+# has its own invalid-fd unit proof for values that bypass this hook.
+set_gucs "pg_logtap.export_url = ''" "pg_logtap.export_tls_server_name = ''"
+NAME255=$(python3 -c 'print("a" * 255)')
+NAME256=$(python3 -c 'print("a" * 256)')
+NAME65536=$(python3 -c 'print("a" * 65536)')
+apply_server_name() {
+  setguc pg_logtap.export_tls_server_name "$1" || return 1
+  reload || return 1
+  n=0
+  while [ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_tls_server_name')" != "$1" ] && [ "$n" -lt 20 ]; do
+    n=$((n + 1)); sleep 1
+  done
+  [ "$n" -lt 20 ]
+}
+apply_server_name "$NAME255" || fail "TLS server_name: could not apply the accepted 255-byte value"
+SENT_NAME0=$(statf events_sent)
+FAILED_NAME0=$(statf send_cycles_failed)
+reject_server_name() {
+  if setguc pg_logtap.export_tls_server_name "$1" >/dev/null 2>&1; then
+    fail "TLS server_name: accepted ${#1}-byte value"
+  fi
+}
+reject_server_name "$NAME256"
+reject_server_name "$NAME65536"
+[ "$(docker exec "$PG_CT" psql -U postgres -Atc 'SHOW pg_logtap.export_tls_server_name')" = "$NAME255" ] \
+  || fail "TLS server_name: rejected value replaced the active 255-byte name"
+[ "$(statf events_sent)" = "$SENT_NAME0" ] && [ "$(statf send_cycles_failed)" = "$FAILED_NAME0" ] \
+  || fail "TLS server_name: rejected GUC started an export send"
+apply_server_name '' || fail "TLS server_name: could not restore the empty value"
+echo "TLS server_name bounds ok: empty and 255 bytes accepted; 256 and 65536 rejected before send"
+
 # --- phase 1: verified https. server_name exercises the GUC AND the std
 # limitation it exists for: verifyHostName matches dNSName SANs only, an
 # iPAddress SAN never matches the IP-literal URL host.
@@ -458,7 +743,8 @@ gen p2fail "$N"
 sleep 3 # a couple of flush cycles of guaranteed failures
 FAILED=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
 [ "$FAILED" -gt 0 ] 2>/dev/null || { echo "e2e-tls: phase 2 expected failed cycles with the ca cleared, got $FAILED"; exit 1; }
-[ "$(received p2fail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2 leaked $(received p2fail "$OUT") events through an unverified handshake"; exit 1; }
+received_count p2fail "$OUT"
+[ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 2 leaked $RECEIVED events through an unverified handshake"; exit 1; }
 expect_ready 503
 [ "$(http_code /healthz)" = 200 ] && [ "$(http_code /livez)" = 200 ] \
   || fail "TLS CA failure broke liveness"
@@ -478,7 +764,8 @@ gen p2bfail "$N"
 sleep 3
 FAILED2=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
 [ "$FAILED2" -gt "$FAILED" ] 2>/dev/null || { echo "e2e-tls: phase 2b expected failed cycles with an empty ca file, got $FAILED2 (was $FAILED)"; exit 1; }
-[ "$(received p2bfail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2b leaked $(received p2bfail "$OUT") events through a certificate-less CA"; exit 1; }
+received_count p2bfail "$OUT"
+[ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 2b leaked $RECEIVED events through a certificate-less CA"; exit 1; }
 set_gucs "pg_logtap.export_tls_ca = '$CA_IN_CT'"
 gen p2bre "$N"
 wait_for p2bfail "$N" "$OUT"
@@ -496,7 +783,8 @@ gen p2cfail "$N"
 sleep 3
 FAILED2C=$(docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()" | grep -o 'send_cycles_failed=[0-9]*' | head -1 | cut -d= -f2)
 [ "$FAILED2C" -gt "$FAILED2" ] 2>/dev/null || { echo "e2e-tls: phase 2c expected failed cycles with the ca cleared and the queue on, got $FAILED2C (was $FAILED2)"; exit 1; }
-[ "$(received p2cfail "$OUT")" = 0 ] || { echo "e2e-tls: phase 2c leaked $(received p2cfail "$OUT") events through an unverified handshake"; exit 1; }
+received_count p2cfail "$OUT"
+[ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 2c leaked $RECEIVED events through an unverified handshake"; exit 1; }
 qsz=$(docker exec "$PG_CT" stat -c %s "$PGD/$FB_TLS" 2>/dev/null || echo 0)
 [ "$qsz" -gt 8 ] || { echo "e2e-tls: phase 2c nothing parked on the fallback file ($qsz bytes — RAM backlog only?)"; exit 1; }
 expect_ready 503
@@ -549,18 +837,30 @@ echo "phase 4 ok: verify=off delivered, warned once"
 # name, so only the pinned CA can reject it — a passing handshake here would
 # mean verification is off. Buffered events must later arrive at the real
 # receiver, verified.
+P5_FAILED0=$(statf send_cycles_failed)
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_EVIL/insert/jsonline'" \
   "pg_logtap.export_tls_server_name = 'localhost'"
 gen p5fail "$N"
-sleep 3 # a couple of flush cycles of guaranteed rejections
-FAILED3=$(statf send_cycles_failed)
-[ "$FAILED3" -gt "$FAILED2" ] 2>/dev/null || { echo "e2e-tls: phase 5 expected failed cycles against the impostor, got $FAILED3 (was $FAILED2)"; exit 1; }
-[ "$(received p5fail "$EVIL_OUT")" = 0 ] || { echo "e2e-tls: phase 5 leaked $(received p5fail "$EVIL_OUT") events to the impostor"; exit 1; }
+n=0
+while [ "$n" -lt 15 ]; do
+  FAILED3=$(statf send_cycles_failed)
+  [ "$FAILED3" -gt "$P5_FAILED0" ] && break
+  n=$((n + 1)); sleep 1
+done
+[ "${FAILED3:-0}" -gt "$P5_FAILED0" ] 2>/dev/null || fail "e2e-tls: phase 5 had no failed cycle against the live impostor"
+# The p5 nonce is current-run-local; after a settled failed cycle it must stay
+# absent from the accepting impostor's decoded sink.
+n=0
+while [ "$n" -lt 3 ]; do
+  received_count p5fail "$EVIL_OUT"
+  [ "$RECEIVED" = 0 ] || fail "e2e-tls: phase 5 leaked $RECEIVED events to the impostor"
+  n=$((n + 1)); sleep 1
+done
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
 gen p5re "$N"
 wait_for p5fail "$N" "$OUT"
 wait_for p5re "$N" "$OUT"
-echo "phase 5 ok: impostor chain rejected ($((FAILED3 - FAILED2)) failed cycles), zero leaks, $N buffered + $N live verified at the real receiver"
+echo "phase 5 ok: live impostor chain rejected ($((FAILED3 - P5_FAILED0)) failed cycles), settled current-run zero leaks, $N buffered + $N live verified at the real receiver"
 
 # --- phase 6: server_name mismatch. The real receiver, the right CA — only
 # the name to verify is absent from the SANs. The handshake must fail on the
@@ -570,7 +870,8 @@ gen p6fail "$N"
 sleep 3
 FAILED4=$(statf send_cycles_failed)
 [ "$FAILED4" -gt "$FAILED3" ] 2>/dev/null || { echo "e2e-tls: phase 6 expected failed cycles on the name mismatch, got $FAILED4 (was $FAILED3)"; exit 1; }
-[ "$(received p6fail "$OUT")" = 0 ] || { echo "e2e-tls: phase 6 leaked $(received p6fail "$OUT") events past the name mismatch"; exit 1; }
+received_count p6fail "$OUT"
+[ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 6 leaked $RECEIVED events past the name mismatch"; exit 1; }
 set_gucs "pg_logtap.export_tls_server_name = 'localhost'"
 gen p6re "$N"
 wait_for p6fail "$N" "$OUT"
@@ -604,7 +905,8 @@ gen p8amb "$N"
 sleep 3 # a couple of flush cycles of guaranteed ambiguous closes
 FAILED5=$(statf send_cycles_failed)
 [ "$FAILED5" -gt "$FAILED4" ] 2>/dev/null || { echo "e2e-tls: phase 8 expected failed cycles on the pre-status close, got $FAILED5 (was $FAILED4)"; exit 1; }
-AMBIG_GOT=$(received p8amb "$AMBIG_OUT")
+received_count p8amb "$AMBIG_OUT"
+AMBIG_GOT=$RECEIVED
 [ "$AMBIG_GOT" -ge 1 ] 2>/dev/null || { echo "e2e-tls: phase 8 the closer never saw a body — the scenario did not happen"; exit 1; }
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'"
 wait_for p8amb "$N" "$OUT"
@@ -625,7 +927,8 @@ gen p9fail "$N"
 sleep 3 # a couple of flush cycles of guaranteed 401s
 FAILED6=$(statf send_cycles_failed)
 [ "$FAILED6" -gt "$FAILED5" ] 2>/dev/null || { echo "e2e-tls: phase 9 expected failed cycles on the 401s, got $FAILED6 (was $FAILED5)"; exit 1; }
-[ "$(received p9fail "$AUTH_OUT")" = 0 ] || { echo "e2e-tls: phase 9 leaked $(received p9fail "$AUTH_OUT") events past the 401 gate"; exit 1; }
+received_count p9fail "$AUTH_OUT"
+[ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 9 leaked $RECEIVED events past the 401 gate"; exit 1; }
 set_gucs "pg_logtap.export_http_content_type = 'application/json'" \
   "pg_logtap.export_http_extra_headers = 'X-Logtap-E2E: t9-json\nAuthorization: Bearer e2e-token'"
 gen p9json "$N"
@@ -680,6 +983,10 @@ DRIB_FIRST_MS=$((DRIB_FIRST - DRIB_T0))
   || fail "e2e-tls: phase 10 first failure appeared only after the SIGHUP storm ended (${DRIB_FIRST_MS}ms)"
 [ "$DRIB_FIRST_MS" -le 6000 ] \
   || fail "e2e-tls: phase 10 first failure took ${DRIB_FIRST_MS}ms with a 3000ms attempt budget"
+sync_receiver_file "$DIR/drib-evidence"
+if ! grep -qx connected "$DIR/drib-evidence" || ! grep -qx bytes "$DIR/drib-evidence"; then
+  fail "e2e-tls: phase 10 timed out before the dribbler accepted and wrote a handshake byte"
+fi
 n=0
 while [ "$n" -lt 15 ]; do
   DRIB1=$(statf send_cycles_failed)
@@ -710,7 +1017,8 @@ while [ "$r" -le 2 ]; do
   sleep 3 # a couple of flush cycles of guaranteed failures
   ROTF1=$(statf send_cycles_failed)
   [ "$ROTF1" -gt "$ROTF" ] 2>/dev/null || { echo "e2e-tls: phase 11 round $r: expected failed cycles with the ca cleared, got $ROTF1 (was $ROTF)"; exit 1; }
-  [ "$(received rot$r-bad "$OUT")" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $(received rot$r-bad "$OUT") events past a cleared ca"; exit 1; }
+  received_count rot$r-bad "$OUT"
+  [ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $RECEIVED events past a cleared ca"; exit 1; }
   set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_CHAIN/insert/jsonline'" \
     "pg_logtap.export_tls_ca = '$CA_IN_CT.root'"
   gen rot$r-chain "$N"
@@ -720,7 +1028,8 @@ while [ "$r" -le 2 ]; do
   sleep 3
   ROTF2=$(statf send_cycles_failed)
   [ "$ROTF2" -gt "$ROTF1" ] 2>/dev/null || { echo "e2e-tls: phase 11 round $r: expected failed cycles on the rotated name mismatch, got $ROTF2 (was $ROTF1)"; exit 1; }
-  [ "$(received rot$r-name "$CHAIN_OUT")" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $(received rot$r-name "$CHAIN_OUT") events past the name mismatch"; exit 1; }
+  received_count rot$r-name "$CHAIN_OUT"
+  [ "$RECEIVED" = 0 ] || { echo "e2e-tls: phase 11 round $r leaked $RECEIVED events past the name mismatch"; exit 1; }
   ROTF=$ROTF2
   r=$((r + 1))
 done
@@ -737,6 +1046,7 @@ echo "phase 11 ok: 2 rounds of verified → cleared-ca fail → root-pinned chai
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_T12/insert/jsonline'"
 gen p12 "$N"
 wait_for p12 "$N" "$T12_OUT"
+sync_receiver_file "$T12_VER"
 VERS=$(sort -u "$T12_VER" 2>/dev/null)
 [ -n "$VERS" ] || { echo "e2e-tls: phase 12 no recorded session version — the receiver never answered"; exit 1; }
 [ "$VERS" = "TLSv1.2" ] || { echo "e2e-tls: phase 12 negotiated '$VERS', want TLSv1.2 (receiver pinned to 1.2 only)"; exit 1; }
@@ -763,6 +1073,10 @@ while [ "$n" -lt 15 ]; do
   n=$((n + 1)); sleep 1
 done
 [ "${WDRIB1:-0}" -ge $((WDRIB0 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 13 expected failed cycles against the write dribbler, got ${WDRIB1:-none} (was $WDRIB0) — the body write outlived the absolute deadline"; exit 1; }
+sync_receiver_file "$DIR/wdrib-evidence"
+if ! grep -qx connected "$DIR/wdrib-evidence" || ! grep -qx bytes "$DIR/wdrib-evidence"; then
+  fail "e2e-tls: phase 13 timed out before the plain dribbler accepted and read body bytes"
+fi
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '$TMOUT1'"
 wait_for p13wd 500 "$OUT" 60
@@ -806,6 +1120,8 @@ TDRIB_FIRST_MS=$((TDRIB_FIRST - TDRIB_T0))
   || fail "e2e-tls: phase 14 https first failure appeared only after the SIGHUP storm ended (${TDRIB_FIRST_MS}ms)"
 [ "$TDRIB_FIRST_MS" -le 8000 ] \
   || fail "e2e-tls: phase 14 https first failure took ${TDRIB_FIRST_MS}ms with a 3000ms attempt budget"
+sync_receiver_file "$DIR/tdrib-evidence"
+require_tdrib_stage https
 n=0
 while [ "$n" -lt 15 ]; do
   TDRIB1=$(statf send_cycles_failed)
@@ -823,11 +1139,42 @@ while [ "$n" -lt 15 ]; do
   n=$((n + 1)); sleep 1
 done
 [ "${TDRIB3:-0}" -ge $((TDRIB2 + 2)) ] 2>/dev/null || { echo "e2e-tls: phase 14 tcps expected failed cycles against the TLS write dribbler, got ${TDRIB3:-none} (was $TDRIB2) — the encrypted body write outlived the absolute deadline"; exit 1; }
+sync_receiver_file "$DIR/tdrib-evidence"
+require_tdrib_stage tcps
 set_gucs "pg_logtap.export_url = 'https://$GW:$PORT_HTTPS/insert/jsonline'" \
   "pg_logtap.export_timeout_ms = '$TMOUT2'"
 wait_for p14h 500 "$OUT" 60
 wait_for p14t 500 "$OUT" 60
 echo "phase 14 ok: SIGHUP-interrupted https sendmsg failed in ${TDRIB_FIRST_MS}ms; https+tcps stayed deadline-bounded ($((TDRIB1 - TDRIB0)) + $((TDRIB3 - TDRIB2)) failed cycles), all 1000 replayed once repointed"
 
-echo "events_per_phase=$N https_ok=$(received p1 "$OUT")+$(received p2fail "$OUT")+$(received p2re "$OUT")+$(received p2bfail "$OUT")+$(received p2bre "$OUT")+$(received p5fail "$OUT")+$(received p5re "$OUT")+$(received p6fail "$OUT")+$(received p6re "$OUT")+$(received p8amb "$OUT") chain_ok=$(received p7root "$CHAIN_OUT")+$(received p7inter "$CHAIN_OUT") tcps_ok=$(received p3 "$TCPS_OUT")+$(received p4 "$TCPS_OUT") auth_ok=$(received p9fail "$AUTH_OUT")+$(received p9json "$AUTH_OUT")+$(received p9default "$AUTH_OUT")+$(received p9basic "$AUTH_OUT") evil_leaks=$(received p5fail "$EVIL_OUT") ambig_body=$(received p8amb "$AMBIG_OUT") dribble_replayed=$(received p10drib "$OUT") rotation_leaks=$(( $(received rot1-bad "$OUT") + $(received rot1-name "$CHAIN_OUT") + $(received rot2-bad "$OUT") + $(received rot2-name "$CHAIN_OUT") )) tls12_ok=$(received p12 "$T12_OUT") tls12_versions=$VERS wdribble_replayed=$(received p13wd "$OUT") tdribble_replayed=$(received p14h "$OUT")+$(received p14t "$OUT")"
+received_count p1 "$OUT"; P1=$RECEIVED
+received_count p2fail "$OUT"; P2FAIL=$RECEIVED
+received_count p2re "$OUT"; P2RE=$RECEIVED
+received_count p2bfail "$OUT"; P2BFAIL=$RECEIVED
+received_count p2bre "$OUT"; P2BRE=$RECEIVED
+received_count p5fail "$OUT"; P5FAIL=$RECEIVED
+received_count p5re "$OUT"; P5RE=$RECEIVED
+received_count p6fail "$OUT"; P6FAIL=$RECEIVED
+received_count p6re "$OUT"; P6RE=$RECEIVED
+received_count p8amb "$OUT"; P8AMB=$RECEIVED
+received_count p7root "$CHAIN_OUT"; P7ROOT=$RECEIVED
+received_count p7inter "$CHAIN_OUT"; P7INTER=$RECEIVED
+received_count p3 "$TCPS_OUT"; P3=$RECEIVED
+received_count p4 "$TCPS_OUT"; P4=$RECEIVED
+received_count p9fail "$AUTH_OUT"; P9FAIL=$RECEIVED
+received_count p9json "$AUTH_OUT"; P9JSON=$RECEIVED
+received_count p9default "$AUTH_OUT"; P9DEFAULT=$RECEIVED
+received_count p9basic "$AUTH_OUT"; P9BASIC=$RECEIVED
+received_count p5fail "$EVIL_OUT"; EVIL_LEAKS=$RECEIVED
+received_count p8amb "$AMBIG_OUT"; AMBIG_BODY=$RECEIVED
+received_count p10drib "$OUT"; P10DRIB=$RECEIVED
+received_count rot1-bad "$OUT"; ROT1BAD=$RECEIVED
+received_count rot1-name "$CHAIN_OUT"; ROT1NAME=$RECEIVED
+received_count rot2-bad "$OUT"; ROT2BAD=$RECEIVED
+received_count rot2-name "$CHAIN_OUT"; ROT2NAME=$RECEIVED
+received_count p12 "$T12_OUT"; P12=$RECEIVED
+received_count p13wd "$OUT"; P13WD=$RECEIVED
+received_count p14h "$OUT"; P14H=$RECEIVED
+received_count p14t "$OUT"; P14T=$RECEIVED
+echo "events_per_phase=$N https_ok=$P1+$P2FAIL+$P2RE+$P2BFAIL+$P2BRE+$P5FAIL+$P5RE+$P6FAIL+$P6RE+$P8AMB chain_ok=$P7ROOT+$P7INTER tcps_ok=$P3+$P4 auth_ok=$P9FAIL+$P9JSON+$P9DEFAULT+$P9BASIC evil_leaks=$EVIL_LEAKS ambig_body=$AMBIG_BODY dribble_replayed=$P10DRIB rotation_leaks=$(( ROT1BAD + ROT1NAME + ROT2BAD + ROT2NAME )) tls12_ok=$P12 tls12_versions=$VERS wdribble_replayed=$P13WD tdribble_replayed=$P14H+$P14T"
 docker exec "$PG_CT" psql -U postgres -Atc "SELECT pg_logtap_stats()"

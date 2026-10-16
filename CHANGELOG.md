@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Timestamp serialization avoids arithmetic overflow and false dates: values
+  outside four-digit RFC3339 years become JSON null without discarding the event.
+- Acceptance scripts safely quote saved scalar settings and restore them on
+  failure and catchable termination, including nondefault message widths.
 - Built-in password masking identifies statement-bearing primary messages by
   PostgreSQL's untranslated format ID, so translated `lc_messages` output no
   longer bypasses the cut and application messages resembling English
@@ -44,6 +48,8 @@
 
 ### Security
 
+- Regex allocation failures use deterministic diagnostics instead of reading
+  uninitialized bytes into a server-log message.
 - `file://` sinks, fallback queues and compaction temporary files require
   worker-owned regular single-link descriptors with verified `0600` permissions
   before IO. Final-component symlinks, hardlinks, foreign-owned files and
@@ -54,11 +60,20 @@
 
 ### Changed
 
-- The next extension version is `0.6.1`. Updating a historical installation
-  normalizes `pg_logtap_stats_t` and `pg_logtap_delivery` to the fresh-install
-  column order. Noncanonical installations must remove external dependencies
-  and custom object metadata before the update; the transactional migration
-  never uses `CASCADE`, and successful normalization changes the type/view OIDs.
+- The next development version is `0.6.2`. Direct updates from historical
+  origins use the guarded `0.6.0--0.6.2` normalization, bypassing the old 0.6.1
+  hop. Noncanonical layouts refuse comments/security labels on delivery-view
+  rewrite rules before destructive DDL, as well as other custom metadata and
+  external dependencies. Successful normalization changes type/view OIDs;
+  refusals roll back the whole update, and neither drop uses `CASCADE`.
+- Fresh 0.6.2 has the same SQL API and canonical column order as 0.6.1.
+  Canonical 0.6.0 updates and the no-DDL 0.6.1 hop retain object OIDs,
+  dependencies, privileges and annotations.
+- Development deployment builds for the discovered PostgreSQL target major
+  and stops before replacing the library if the target is unknown or the build
+  fails. It preserves other preloads and leaves SQL extension updates explicit.
+- The manual OpenTelemetry stand uses unique run names, private endpoints,
+  bounded readiness and early ownership-checked cleanup.
 
 ## 0.6.0 (2026-09-30)
 
@@ -108,7 +123,7 @@
 
 ## 0.5.0 (2026-09-07)
 
-TLS export and HTTP auth-header round. Upgrade is the
+TLS export and HTTP auth headers. Upgrade is the
 0.4.5 → 0.5.0 script (the four warn-counter attributes and the re-created
 view) + binary replace + restart; the four new GUCs are all SIGHUP.
 Audit `pg_logtap.export_url` before upgrading: a network URL with a space,
@@ -426,153 +441,28 @@ fails the reload (at boot it is fatal).
 
 ### Internal
 
-- The CA bundle replacement under a rotating `export_tls_ca` takes the
-  same lock the TLS client takes shared while verifying: the mutation was
-  safe only by the worker's single-threaded call graph, now it holds by
-  construction.
-- SIGHUP resets the receiver-slow flag (a stale flag from the previous
-  receiver — or from a threshold since disabled — parked the new
-  destination's batches until a quiet cycle re-probed it), and the
-  unparseable-URL warning re-arms when a URL parses again (bad → fixed →
-  bad warns twice, like the file:// latches). A TLS receiver closing the
-  session cleanly before any status line is reported as `tls eof`, not as
-  the previous attempt's leftover error text.
-- `writeAll` owns its failure reason — the abort exit says `write abort`,
-  a write error says `write errno=N`, and the deadline arming says its
-  own; the network callers return it instead of stamping a stage label
-  over it with an errno that may belong to an earlier syscall.
-- The `events_queued` Prometheus HELP and the fallback section of
-  delivery.md call it a lifecycle stage like the counters glossary already
-  did, and delivery.md's `events_captured ≈ …` invariant subtracts
-  `events_compacted` from the backlog term — compacted events sit in both
-  `queued − replayed` and `events_lost`, so the formula double-counted
-  them.
-- The Makefile is the single entry point now: `make check` (fmt + lint +
-  unit tests + the .so compile), `make container` (the same battery in the
-  pgzx-build container), `make e2e` (the docker matrix), `make deploy` —
-  thin aliases over the scripts, plus the conventional
-  `make && make install`. CI runs the make targets itself, so the interface
-  cannot drift from the real build.
-- The extension's update chain is continuous again: the
-  0.4.4 → 0.4.5 hop was missing (0.4.5 changed no SQL, but every version
-  ships one — without it `ALTER EXTENSION UPDATE` could not leave 0.4.4).
-  It ships now, comment-only, alongside this version's 0.4.5 → 0.5.0
-  script.
-- SIGHUP no longer leaks the source-identity strings (hostname/cluster/
-  pgdata were duped on every reload and never freed; the copies are owned
-  now, and a reload with unchanged values keeps the allocation), and the
-  oid→name cache is bounded (4096 entries per map — a database/role
-  create-drop storm grew it forever; past the bound the maps reset and
-  re-fill lazily from the catalog).
-- `fb_sync_failures` non-zero is history, not current state, everywhere the
-  counter appears (README, delivery.md, the /metrics HELP): the next
-  successful sync — or a compaction, whose rewrite is fdatasynced before
-  the rename — makes the queue durable again while the counter stays;
-  alert on its growth, not its level.
-- e2e-tls phase 11, rapid trust rotation through SIGHUP: ca / server_name /
-  url alternated across reloads, two rounds of verified → cleared-CA fail →
-  root-pinned chain → name-mismatch fail — the per-handshake bundle rebuild
-  must land the right trust decision every time (no stale bundle, no stale
-  name), with failed-cycle and zero-leak asserts at every step.
-- e2e-tls phase 12, a receiver pinned to TLS 1.2 only (min = max =
-  TLSv1_2): verified delivery with the negotiated version asserted from the
-  receiver side — the 1.2 half of the documented TLS 1.2/1.3 support is
-  acceptance-tested instead of implied by the 1.3 passes (Zig's client
-  offers both).
-- e2e-tls phase 13, the write-side dribbler on plain http: a receiver with a
-  tiny receive buffer draining one byte per second — every body-write
-  syscall succeeds inside its per-write `SO_SNDTIMEO` (a partial write
-  resets the wait), so the phase proves the between-syscall absolute
-  deadline is what fails the send; the body replays whole once repointed.
-  The write-side twin of phase 10's handshake dribbler.
-- e2e-tls phase 14, the TLS write-dribbler over both encrypted schemes: a
-  receiver that completes the handshake normally and then drains one
-  decrypted byte per second — every TLS record write succeeds inside its
-  per-write `SO_SNDTIMEO` and a 64 KB chunk spans several records, so the
-  phase proves the per-write re-arm of the absolute deadline is what fails
-  the send — by the failed cycles growing AND by the first failure's
-  timing (≈ the budget; a chunk-boundary-only arm would fail ~4–5× later —
-  kernel socket timeouts are wall-clock, so runner speed is not in the
-  margin) (https first, then tcps on the same listener); both bodies
-  replay whole once repointed.
-- delivery.md states the compaction duplicate window: the rewrite's rename
-  is made durable by a directory fsync, and its failure (already warned
-  once like the queue's other sync failures) means an OS crash can
-  resurrect pre-compaction members — events already counted as compacted
-  replaying again. At-least-once: delivery is the extension's job, the
-  receiver dedups on the documented `(host, seq)` recipe, and nothing is
-  lost in either outcome.
-- Docs: the DNS last-known-good window is stated as hard 60 s (only a dial
-  after a fresh resolution refreshes it — the cached-address dial does
-  not), `export_tls_ca` is documented as local-disk (the per-handshake read
-  sits in the send path), the `file://` sink's single-writer assumption is
-  spelled out, and the README states the IPv6-literal stance next to the
-  export_url schemes. The worker also refuses to compile off-Linux now —
-  the raw syscall structs are asm-generic Linux layouts.
-- The DNS last-known-good address has explicit semantics, documented with
-  the `export_url` schemes: it is used only while in-process resolution
-  fails, only for the host that produced it, and only within 60 s of the
-  last successful dial (a successful dial refreshes it). On
-  `https://`/`tcps://` a stale address that no longer serves the host fails
-  certificate verification; on plain `http://`/`tcp://` a reassigned IP can
-  receive logs for at most that window.
-- e2e-tls phase 8, the ambiguous close: a receiver whose TLS layer takes
-  the whole request body and then ends the session before any status line.
-  The send fails on the status read (with tls.zig's stage detail folded
-  into the reason now), the events survive in RAM and replay whole to the
-  next url, and the body the closer did accept is asserted present — the
-  duplicate window the contract allows for exactly this shape.
-- The eleven e2e scripts share `scripts/e2e-common.sh` instead of a
-  copy-pasted prologue: container/GUC/marker helpers, the ready gate and a
-  per-container `flock` so two suites cannot race one stand. The container
-  argument is now optional everywhere (defaults to the running compose
-  stand), and e2e-tls counts per-phase named markers instead of number
-  ranges, so one phase's asserts cannot be satisfied by another's events.
-  e2e-kill's no-loss asserts became deltas — the counters are
-  per-cluster-life and a reused container already carried a previous run's
-  deliberate losses.
-- The e2e suites run under plain `set -u` (asserts are explicit; `set -e`
-  only bred `|| true` noise around every expected-to-fail command), and
-  `wait_for` FAILS on timeout instead of silently falling through — a wait
-  that rode the fall-through once green-lit suites on follow-up asserts or
-  on nothing. The four WARNING-count checks read the new warn_* counters
-  via `pg_logtap_stats()` instead of grepping `docker logs` (torn-tail
-  escalations via the `fallback_broken` gauge), and robust's
-  pattern_exclude control event is actually awaited now — the old marker
-  never matched.
-- The TLS suite is a `test-matrix.sh` phase (`PHASES=…,tls,…`, on by
-  default): every PG major gets the verified/impostor/server_name/
-  intermediate/tcps/verify=off acceptance, not just the dev stand's
-  major. The receivers run host-side, so the phase needs `openssl` and
-  `python` on the host. `set_gucs` applies a reload barrier instead of
-  timed sleeps — SHOW polled in a fresh session until the new config
-  generation is visible, plus one `export_timeout_ms` for the worker's
-  worst in-flight send — so markers generated after a url switch cannot
-  ride the old destination; the suite also clears any fallback file
-  inherited from earlier matrix phases, whose failure-phase parking
-  belonged to those suites' scenarios, not this one's.
-- `JOBS=N test-matrix.sh` runs the PG majors in parallel (~1.7× on four):
-  each major gets its own output dir, its own vector receiver (the
-  kill/robust suites stop THEIR receiver mid-scenario — with one shared
-  vector those phases serialized the whole matrix behind a lock, measured
-  slower than sequential; vlogs and the mute silent receiver stay shared,
-  nothing stops them and the vlogs asserts are marker-filtered), its own
-  TLS receiver ports and per-container names for the ephemeral receivers
-  (slow/faults/metrics/frag/hookchain). The tested pg containers are plain
-  `docker run` on the stand's network — compose offers one container per
-  project+service, and the cross-major recreate/label-rm dance existed
-  only to fake per-major service slots. Builds and stand bring-ups
-  serialize on one lock (shared zig-out and the pgzx-build cache).
-- The fallback queue moved out of worker.zig into src/fb.zig (~540 lines):
-  the queue owns its GUCs (`export_fallback_file`, `fallback_max_mb`), the
-  chunk bounds shared with buildBody, and its boot path (compaction-litter
-  cleanup, backlog credit). No behavior change — the same functions under
-  `fb.` with namespaced state; the worker keeps the transports, deadlines
-  and the metrics server.
+- TLS trust reloads synchronize with certificate verification. SIGHUP clears
+  stale slow-receiver state, and URL warnings re-arm after a valid URL.
+  TLS EOF and write failures retain their specific cause.
+- Kept the Makefile developer interface aligned with CI: `make check`,
+  `make container`, `make e2e`, `make deploy`, and conventional `make` /
+  `make install` remain supported targets.
+- Restored the comment-only 0.4.4 → 0.4.5 SQL update hop so extension updates
+  remain continuous.
+- Bounded source-identity and catalog-name cache memory across reloads and
+  create/drop churn.
+- Kept fallback-sync counters as historical signals: alert on growth, while a
+  later successful sync restores crash durability for current queue contents.
+- Consolidated fallback-queue implementation in `src/fb.zig`; worker transport,
+  deadline, and metrics responsibilities remain separate. The export worker
+  requires Linux.
+- The test matrix supports parallel PostgreSQL majors through `JOBS=N`.
+- Clarified receiver, fallback, filesystem, and DNS documentation boundaries
+  without changing the published transport contract.
 
 ## 0.4.5 (2026-09-04)
 
-Boot-safety and delivery-contract documentation round. No schema, GUC or
+Boot-safety fixes and delivery-contract documentation. No schema, GUC or
 counter changes; upgrade is binary replace + restart.
 
 ### Fixed
@@ -600,7 +490,7 @@ counter changes; upgrade is binary replace + restart.
 
 ## 0.4.4 (2026-09-04)
 
-TCP-stream parsing and accounting round.
+TCP-stream parsing and accounting fixes.
 Upgrade is the 0.4.3 → 0.4.4 script (schema unchanged — the script only
 provides the update path) + binary replace + restart; no new GUCs or
 counters.
@@ -644,7 +534,7 @@ counters.
 
 ## 0.4.3 (2026-09-03)
 
-Filesystem-hardening round. Upgrade is the
+Filesystem hardening. Upgrade is the
 0.4.2 → 0.4.3 script (schema unchanged — the script only provides the
 update path) + binary replace + restart; no new GUCs or counters.
 
@@ -686,7 +576,7 @@ update path) + binary replace + restart; no new GUCs or counters.
 
 ## 0.4.2 (2026-09-02)
 
-Delivery-hardening round. Upgrade is the
+Delivery hardening. Upgrade is the
 0.4.1 → 0.4.2 script (one new counter attribute) + binary replace +
 restart.
 
@@ -723,7 +613,7 @@ restart.
 
 ## 0.4.1 (2026-09-01)
 
-Hardening round. No schema or shmem
+Hardening fixes. No schema or shmem
 changes; upgrade is a binary replace + restart as usual.
 
 ### Fixed

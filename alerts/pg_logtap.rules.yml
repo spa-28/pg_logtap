@@ -1,5 +1,6 @@
 # Prometheus alert rules for pg_logtap (see docs/delivery.md for the contract).
-# Load e.g.: prometheus --rules.alerts.file ... or wire into your rule_dirs.
+# Load through `rule_files` in prometheus.yml, then start Prometheus with
+# `--config.file` pointing to that configuration.
 groups:
   - name: pg_logtap
     rules:

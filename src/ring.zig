@@ -13,7 +13,8 @@ pub const max_capacity = 8192;
 /// ShmState.magic once the segment is initialized by the startup hook.
 pub const ready_magic: u32 = 0x70677461; // "pgta"
 
-/// Fixed-size, NUL-free string field. `len` counts valid UTF-8 bytes.
+/// Length-prefixed, fixed-capacity string field. `len` counts stored bytes.
+/// JSON serialization sanitizes invalid UTF-8.
 pub fn FixedStr(comptime cap: usize) type {
     return extern struct {
         len: u32 = 0,
@@ -107,8 +108,8 @@ pub const ShmState = extern struct {
     /// any success. The originals are worker-local — these copies are what
     /// stats/metrics/alerts see.
     dns_fail_streak: u32 = 0,
-    /// 1 = the fallback file is foreign/corrupt and neither appended to nor
-    /// replayed: durability is silently degraded to the RAM backlog bound.
+    /// 1 = the fallback queue is unusable and neither appended to nor replayed;
+    /// durability degrades to the RAM backlog bound, with a warning.
     fallback_broken: u8 = 0,
     /// Failed fdatasync calls on the fallback queue, cumulative. The events
     /// of such a cycle are in the file but not durable (lost on OS crash,
@@ -121,8 +122,9 @@ pub const ShmState = extern struct {
     /// Operator-facing WARNING/LOG lines the extension emitted, cumulative
     /// per kind — the log lines are edge-triggered (once per worker life or
     /// per transition), these are the queryable/alertable copy: verify=off
-    /// seen, fallback queue unopenable, unreadable member skipped, divert
-    /// into an unbounded (fallback_max_mb=0) queue.
+    /// seen, fallback queue unopenable or its reserved .compact path aliasing a
+    /// file:// sink, unreadable member skipped, divert into an unbounded
+    /// (fallback_max_mb=0) queue.
     warn_tls_no_verify: u64 = 0,
     warn_fallback_open: u64 = 0,
     warn_fallback_skipped: u64 = 0,

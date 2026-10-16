@@ -214,7 +214,7 @@ HTTP_PG="pglogtap-fluentd-check-pg-http-$RUN_ID"
 TCP_PG="pglogtap-fluentd-check-pg-tcp-$RUN_ID"
 RUNTIME_DIR=$(mktemp -d)
 OUTPUT_DIR=$(mktemp -d)
-chmod 0777 "$OUTPUT_DIR"
+chmod 0700 "$OUTPUT_DIR"
 
 cleanup() {
   docker rm -fv "$HTTP_PG" "$TCP_PG" "$FLUENTD" >/dev/null 2>&1 || true
@@ -256,8 +256,17 @@ docker network create "$NET"
 docker run -d --name "$FLUENTD" \
   --network "$NET" --network-alias fluentd \
   -v "$PWD/tests/e2e/fluentd.conf:/fluentd/etc/fluent.conf:ro" \
-  -v "$OUTPUT_DIR:/fluentd/log" \
   "$FLUENTD_IMAGE"
+
+# Leave the image's default user and /fluentd/log container-private. Copy file
+# contents into a child directory; never copy container metadata over the
+# private OUTPUT_DIR boundary.
+snapshot_output() {
+  local snapshot="$OUTPUT_DIR/log"
+  rm -rf "$snapshot"
+  mkdir "$snapshot"
+  docker cp "$FLUENTD:/fluentd/log/." "$snapshot/"
+}
 
 attempt=0
 until docker exec "$FLUENTD" ruby -rsocket -e \
@@ -346,7 +355,7 @@ so the counter reads every matching file:
 
 ```sh
 marker_count() {
-  python3 - "$OUTPUT_DIR" "$1" "$2" <<'PY'
+  python3 - "$OUTPUT_DIR/log" "$1" "$2" <<'PY'
 import json, pathlib, sys
 root, prefix, marker = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 print(sum(json.loads(line).get("message", "").startswith(marker + " ")
@@ -357,23 +366,27 @@ PY
 
 attempt=0
 while [ "$attempt" -lt 60 ]; do
+  snapshot_output
   http_count=$(marker_count pg-logtap-http "$HTTP_MARKER")
   tcp_count=$(marker_count pg-logtap-tcp "$TCP_MARKER")
   [ "$http_count" -ge 100 ] && [ "$tcp_count" -ge 100 ] && break
   attempt=$((attempt + 1))
   sleep 1
 done
+sleep 2
+snapshot_output
+http_count=$(marker_count pg-logtap-http "$HTTP_MARKER")
+tcp_count=$(marker_count pg-logtap-tcp "$TCP_MARKER")
 [ "$http_count" -eq 100 ]
 [ "$tcp_count" -eq 100 ]
-sleep 2
 ```
 
 Verify valid UTF-8 JSON, exact indexes, preserved fields and route isolation:
 
 ```sh
 python3 - \
-  "$OUTPUT_DIR" pg-logtap-http "$HTTP_MARKER" "$TCP_MARKER" fluentd-http-e2e HTTP \
-  "$OUTPUT_DIR" pg-logtap-tcp "$TCP_MARKER" "$HTTP_MARKER" fluentd-tcp-e2e TCP <<'PY'
+  "$OUTPUT_DIR/log" pg-logtap-http "$HTTP_MARKER" "$TCP_MARKER" fluentd-http-e2e HTTP \
+  "$OUTPUT_DIR/log" pg-logtap-tcp "$TCP_MARKER" "$HTTP_MARKER" fluentd-tcp-e2e TCP <<'PY'
 import collections, json, pathlib, sys
 expected_levels = {"DEBUG1", "LOG", "INFO", "NOTICE", "WARNING"}
 for offset in (1, 7):
@@ -439,17 +452,19 @@ docker logs "$FLUENTD"
 View recent HTTP or TCP records before removing the stand:
 
 ```sh
-tail -n 50 "$OUTPUT_DIR"/pg-logtap-http.*.log
-tail -n 50 "$OUTPUT_DIR"/pg-logtap-tcp.*.log
+snapshot_output
+tail -n 50 "$OUTPUT_DIR/log"/pg-logtap-http.*.log
+tail -n 50 "$OUTPUT_DIR/log"/pg-logtap-tcp.*.log
 ```
 
 With `jq`, pretty-print all records or inspect only a generated batch:
 
 ```sh
-jq . "$OUTPUT_DIR"/pg-logtap-http.*.log
+snapshot_output
+jq . "$OUTPUT_DIR/log"/pg-logtap-http.*.log
 jq --arg marker "$TCP_MARKER" \
   'select(.message | startswith($marker + " "))' \
-  "$OUTPUT_DIR"/pg-logtap-tcp.*.log
+  "$OUTPUT_DIR/log"/pg-logtap-tcp.*.log
 ```
 
 These files are the receiver output; this stand does not send their contents to
@@ -458,8 +473,10 @@ copy them first:
 
 ```sh
 SAVED_OUTPUT="$PWD/fluentd-output-$RUN_ID"
-mkdir -p "$SAVED_OUTPUT"
-cp "$OUTPUT_DIR"/pg-logtap-*.log "$SAVED_OUTPUT"/
+[ ! -e "$SAVED_OUTPUT" ] || { printf 'refusing to overwrite %s\n' "$SAVED_OUTPUT" >&2; exit 1; }
+mkdir -m 0700 "$SAVED_OUTPUT"
+snapshot_output
+cp "$OUTPUT_DIR/log"/pg-logtap-*.log "$SAVED_OUTPUT"/
 printf 'saved Fluentd records in %s\n' "$SAVED_OUTPUT"
 ```
 

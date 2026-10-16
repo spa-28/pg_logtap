@@ -117,7 +117,9 @@ Once Alloy has acknowledged the request, a later Alloy-to-Loki failure is
 outside pg_logtap's retry boundary. Monitor Alloy's `loki_write` retry/drop
 metrics and verify important deployments by querying Loki. As with every
 at-least-once pg_logtap HTTP path, deduplicate on `(host, cluster, seq)` when a
-lost acknowledgement can cause a whole-batch replay.
+lost acknowledgement can cause a whole-batch replay. If the wall clock rolls
+back across a restart, include `timestamp`: `(host, cluster, seq, timestamp)`;
+see [Ordering and identity](delivery.md#ordering-and-identity).
 
 ## Tested result
 

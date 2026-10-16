@@ -5,28 +5,35 @@ Bug reports and PRs are welcome. The dev loop is docker-based — see
 
 ## Setup
 
-```sh
-docker run -d --name pglogtap-pg -e POSTGRES_PASSWORD=dev -p 55432:5432 postgres:18
-scripts/dev-deploy.sh        # builds in the pgzx-build container, docker cp into pglogtap-pg
-```
+Start with [Development & Testing](README.md#development--testing) for the
+initial development stand and its prerequisites.
 
-Zig 0.16.0 and a `pg_config` for the target major are the only build
-prerequisites; `pg_logtap` supports PostgreSQL 15–18.
+A native build needs Zig 0.16.0, the target PostgreSQL's `pg_config` and server
+development files, and libpq development files. Checks also need Python 3.
+pg_logtap supports PostgreSQL 15–18. `make container` requires an existing
+pgzx-build container; it does not create the builder or a development stand.
+
+`scripts/dev-deploy.sh` is for an existing PostgreSQL container that already
+has pg_logtap preloaded and its SQL extension installed. It builds, copies the
+extension, and restarts that container; it is not bootstrap or an implicit
+`ALTER EXTENSION UPDATE`.
 
 ## Before opening a PR
 
 ```sh
-zig fmt --check src/ build.zig      # or scripts/build.sh 18 fmt
-scripts/build.sh 18 lint            # zlinter
-scripts/build.sh 18 test            # unit tests (standalone, no server needed)
+make check                 # harness, format, lint, unit tests, and library compile
 ```
 
-Anything touching the export path also deserves a run of the e2e scripts
-(`scripts/e2e-vector.sh`, `scripts/e2e-kill.sh`, `scripts/e2e-robust.sh`) —
-they need a container with the extension deployed. The full pipeline per
-PostgreSQL major, including the pgbench storm and every failure-mode suite:
-`scripts/test-matrix.sh`; a subset against a stand the full run brought up:
-`PHASES=storm,kill scripts/test-matrix.sh 5 18`.
+With an existing build container instead of native Zig/PostgreSQL setup:
+
+```sh
+python3 scripts/harness-selftest.py
+make container V=18        # Zig checks and library compile in pgzx-build
+```
+
+Use `make e2e` for the full compose-backed test matrix. For a prepared subset,
+run `PHASES=stand,storm,kill scripts/test-matrix.sh 5 18`. Successful matrix
+runs clean up their per-version containers.
 
 ## Rules of the road
 
@@ -35,6 +42,6 @@ PostgreSQL major, including the pgbench storm and every failure-mode suite:
   the Prometheus metric names in sync — they are one naming scheme
   (see [docs/delivery.md](docs/delivery.md)).
 - A version bump touches `pg_logtap.control`, the `sql/pg_logtap--X.Y.Z.sql`
-  filename, `build.zig.zon`, and adds a delta script from the previous version
-  (see [Releases](README.md#releases)).
+  filename, `build.zig.zon`, `src/version.zig`, and adds a delta script from
+  the previous version (see [Releases](README.md#releases)).
 - New GUCs or event fields → update README and docs/delivery.md in the same PR.

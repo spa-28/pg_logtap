@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the extension inside the pgzx-build container (zig 0.16 + PGDG
-# server-dev 15..18 + libpq). Host builds are not possible: configure runs
-# pg_config (via the pgzx dependency) and links libpq.
+# server-dev 15..18 + libpq). This wrapper builds in the container; host
+# builds use `make` with the target pg_config and development files.
 # Usage: scripts/build.sh [version] [zig-build-args...]   (default 18)
 set -euo pipefail
 cd "$(dirname "$0")/.."

@@ -1,6 +1,6 @@
 //! pg_logtap: PostgreSQL log tap → ring buffer → JSON export.
-//! M1: capture via emit_log_hook (capture.zig); pure logic in ring/filter.
-//! M3: export worker (worker.zig).
+//! Capture via emit_log_hook (capture.zig); pure logic in ring/filter.
+//! Export worker (worker.zig).
 const pg = @import("pgzx").c;
 const fmgr = @import("pgzx").fmgr;
 const elog = @import("pgzx").elog;

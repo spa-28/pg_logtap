@@ -27,6 +27,262 @@
 #                        reload; the next real EIO increases SQL and Prometheus
 # Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -u
+# Controller-owned native fixture only: no build, deployment, restart, container
+# creation or teardown. The caller must preload the freshly compiled shim and
+# deploy/restart the intended library first, then supply the immutable ID.
+if [ "${1:-}" = --credit-only ] || [ "${1:-}" = --final-append-only ]; then
+  [ "$#" = 3 ] && [ -n "${E2E_OUT:-}" ] || {
+    echo "usage: E2E_OUT=<private evidence dir> $0 <--credit-only|--final-append-only> <owned container> <immutable ID>" >&2
+    exit 2
+  }
+  python3 - "$2" "$3" "$E2E_OUT" "$1" <<'PY'
+import gzip, json, os, pathlib, struct, subprocess, sys, time
+
+ct, expected_id, out, mode = sys.argv[1:]
+out = pathlib.Path(out)
+out.mkdir(parents=True, exist_ok=True)
+
+def docker(*args, data=None):
+    return subprocess.check_output(["docker", *args], input=data)
+
+assert docker("inspect", "-f", "{{.Id}}", ct).decode().strip() == expected_id, "container identity mismatch"
+
+def sql(statement):
+    return docker("exec", ct, "psql", "-X", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-Atc", statement).decode().strip()
+
+def setting(name, value):
+    sql("ALTER SYSTEM SET " + name + " = '" + value.replace("'", "''") + "'")
+
+def reload():
+    sql("SELECT pg_reload_conf()")
+
+def stats():
+    return json.loads(sql("SELECT pg_logtap_stats_json()"))
+
+def backlog(s):
+    return int(sql("SELECT queue_backlog FROM pg_logtap_delivery"))
+
+def wait_for(predicate, reason, seconds=20):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if predicate():
+            return
+        time.sleep(.1)
+    raise AssertionError(reason + "; actual=" + json.dumps(stats(), sort_keys=True))
+
+def put(path, data):
+    docker("exec", "-i", "-u", "postgres", ct, "sh", "-c", 'umask 077; cat > "$1"', "sh", path, data=data)
+
+def read(path):
+    return docker("exec", ct, "cat", path)
+
+def log():
+    result = subprocess.run(["docker", "exec", ct, "cat", "/tmp/fsyncfail.log"], capture_output=True)
+    return result.stdout.decode()
+
+names = ["pg_logtap.export_url", "pg_logtap.export_fallback_file", "pg_logtap.level_min", "pg_logtap.flush_interval"]
+saved = {name: sql("SHOW " + name) for name in names}
+assert backlog(stats()) == 0, "requires drained controller-owned fixture"
+controls = ["/tmp/preadfail-target", "/tmp/preadfail-offsets", "/tmp/payloadfail-target", "/tmp/payloadfail-offsets"]
+for path in controls:
+    docker("exec", ct, "test", "!", "-e", path)
+assert stats()["ring_events"] == 0, "requires empty SQL-only ring"
+if mode == "--final-append-only":
+    queue, sink = os.environ["E2E_FINAL_QUEUE"], os.environ["E2E_FINAL_SINK"]
+    controls = ["/tmp/chmodfail-target", "/tmp/writefail-target", "/tmp/writefail-offsets"]
+    for path in controls:
+        docker("exec", ct, "test", "!", "-e", path)
+    marker = "task6-final-append-" + str(time.time_ns())
+    worker = None
+    try:
+        setting(names[0], "")
+        setting(names[1], "")
+        setting(names[2], "21") # exclude the deliberate sink-refusal WARNING
+        setting(names[3], "30000")
+        reload()
+        time.sleep(1)
+        result = subprocess.run(["docker", "exec", ct, "stat", "-c", "%s", queue], capture_output=True)
+        assert result.returncode != 0 or result.stdout.strip() == b"0", "requires empty fixture queue"
+        body = (json.dumps({"seq": 850000, "message": marker + " old"}) + "\n").encode()
+        member = gzip.compress(body, mtime=0)
+        seed = b"PGLTFB02" + struct.pack("<II", len(member), 1) + member
+        put(queue, seed)
+        put(sink, b"")
+        before = stats()
+        setting(names[1], queue)
+        setting(names[0], "tcp://127.0.0.1:1")
+        reload()
+        wait_for(lambda: stats()["events_queued"] == before["events_queued"] + 1, "SETUP: old member not credited")
+        # Apply a working file URL without letting the old member deliver yet.
+        put("/tmp/chmodfail-target", sink.encode())
+        failed0 = stats()["send_cycles_failed"]
+        setting(names[0], "file://" + sink)
+        reload()
+        wait_for(lambda: stats()["send_cycles_failed"] > failed0 and "fchmod EPERM" in log(), "SETUP: sink refusal not reached")
+        worker = sql("SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'")
+        assert worker.isdigit(), "SETUP: worker missing"
+        # No metrics/socket send is active: epoll here is the 30s idle latch.
+        wait_for(lambda: any(name in docker("exec", "-u", "postgres", ct, "cat", "/proc/" + worker + "/wchan") for name in (b"ep_poll", b"epoll")), "SETUP: worker not idle")
+        docker("exec", ct, "kill", "-STOP", worker)
+        assert b"T (stopped)" in read("/proc/" + worker + "/status"), "SETUP: STOP not confirmed"
+        assert read(queue) == seed and stats()["ring_events"] == 0, "SETUP: old queue/ring changed"
+        postmaster0 = sql("SELECT pg_postmaster_start_time()")
+        log_start = len(log())
+        put("/tmp/writefail-offsets", str(len(seed)).encode())
+        put("/tmp/writefail-target", queue.encode())
+        docker("exec", ct, "rm", "/tmp/chmodfail-target")
+        statement = "DO $$ BEGIN RAISE EXCEPTION '" + marker + " new'; END $$"
+        result = subprocess.run(["docker", "exec", ct, "psql", "-X", "-U", "postgres", "-c", statement], capture_output=True)
+        assert result.returncode == 1 and (marker + " new").encode() in result.stderr, "SETUP: live exception not emitted"
+        accepted = stats()
+        assert accepted["ring_events"] == 1 and accepted["events_captured"] == before["events_captured"] + 1
+        assert accepted["events_dropped"] == before["events_dropped"], "SETUP: marker dropped"
+        (out / "accepted.json").write_text(json.dumps(accepted, indent=2) + "\n")
+        docker("exec", ct, "kill", "-TERM", worker)
+        docker("exec", ct, "kill", "-CONT", worker)
+        old_worker = worker
+        worker = None
+        wait_for(lambda: sql("SELECT pid FROM pg_stat_activity WHERE backend_type = 'pg_logtap exporter'") not in ("", old_worker), "worker did not soft-replace")
+        assert sql("SELECT pg_postmaster_start_time()") == postmaster0, "postmaster restarted, not a final worker flush"
+        assert log()[log_start:].count("write ENOSPC once") == 1, "SETUP: expected one actual append failure"
+        wait_for(lambda: stats()["events_replayed"] == before["events_replayed"] + 2 and backlog(stats()) == 0,
+                 "SEMANTIC RED: successful final retry did not preserve new pending member after old replay EOF")
+        current = stats()
+        assert current["events_queued"] == before["events_queued"] + 2 and current["events_sent"] == before["events_sent"]
+        assert current["events_lost"] == before["events_lost"] and current["events_dropped"] == before["events_dropped"]
+        got = [json.loads(line)["message"] for line in read(sink).splitlines()]
+        assert got == [marker + " old", marker + " new"], ("missing/duplicate/out-of-order final replay", got)
+        assert read(queue) == b"" and current["fallback_broken"] == 0
+        print("NATIVE GREEN: one pending append ENOSPC, old EOF replay, final retry survives soft replacement", flush=True)
+    finally:
+        try:
+            if worker is not None:
+                docker("exec", ct, "kill", "-CONT", worker)
+            (out / "actual.json").write_text(json.dumps(stats(), indent=2) + "\n")
+            (out / "syscalls.log").write_text(log())
+            (out / "export.jsonl").write_bytes(read(sink))
+            (out / "queue-after.bin").write_bytes(read(queue))
+        finally:
+            for path in controls:
+                docker("exec", ct, "rm", "-f", path)
+            for name, value in saved.items():
+                setting(name, value)
+            reload()
+            wait_for(lambda: all(sql("SHOW " + name) == value for name, value in saved.items()), "public GUC restoration failed")
+    sys.exit(0)
+case_names = ["disabled", "live", "overlap", "magic", "oom"]
+if os.environ.get("E2E_CREDIT_CASE"):
+    case_names = [os.environ["E2E_CREDIT_CASE"]]
+assert all(case in ("disabled", "live", "overlap", "magic", "oom") for case in case_names)
+try:
+    # URL disabled makes the first regression a pure credit retry: SQL-only
+    # ring entries must survive it. ERROR-only capture excludes HUP/LOG noise.
+    setting(names[0], "")
+    setting(names[1], "")
+    setting(names[2], "21")
+    setting(names[3], "1000")
+    reload()
+    time.sleep(1)
+    data_dir = sql("SHOW data_directory")
+    for case in case_names:
+        print("== native credit retry " + case + " ==", flush=True)
+        queue = data_dir + "/task5-credit-" + str(os.getpid()) + "-" + case + ".bin"
+        sink = queue + ".jsonl"
+        docker("exec", ct, "test", "!", "-e", queue)
+        docker("exec", ct, "test", "!", "-e", sink)
+        seed = bytearray(b"PGLTFB02")
+        headers, payloads = [], []
+        for i in range(3):
+            body = (json.dumps({"seq": 840000 + i, "message": f"task5 {case} old {i}"}) + "\n").encode()
+            member = gzip.compress(body, mtime=0)
+            headers.append(len(seed))
+            payloads.append(len(seed) + 8)
+            seed += struct.pack("<II", len(member), 1) + member
+        clean_size = len(seed)
+        seed += b"\x07\x00\x00"  # incomplete final counted header
+        put(queue, seed)
+        (out / (case + "-seed.bin")).write_bytes(seed)
+        (out / (case + "-fixture.json")).write_text(json.dumps({
+            "container_id": expected_id, "queue": queue, "sink": sink,
+            "headers": headers, "payloads": payloads, "clean_size": clean_size,
+        }, indent=2) + "\n")
+        before = stats()
+        prefix = "payloadfail" if case == "oom" else "preadfail"
+        at = headers[1] if case == "oom" else (0 if case == "magic" else payloads[1])
+        offsets = [at] if case == "disabled" else [at] * 8
+        if case == "overlap":
+            offsets += [payloads[2]] * 8
+        log_start = len(log())
+        put("/tmp/" + prefix + "-offsets", " ".join(map(str, offsets)).encode())
+        put("/tmp/" + prefix + "-target", queue.encode())
+        setting(names[0], "" if case == "disabled" else "file://" + sink)
+        setting(names[1], queue)
+        reload()
+        fault = "malloc ENOMEM header " if case == "oom" else "pread EIO "
+        wait_for(lambda: fault in log()[log_start:], "SETUP: targeted fault not observed (preload/shim mismatch)")
+        # No reload from here to the automatic completion assertions.
+        for i in range(2):
+            statement = "DO $$ BEGIN RAISE EXCEPTION 'task5 " + case + " live " + str(i) + "'; END $$"
+            result = subprocess.run(["docker", "exec", ct, "psql", "-X", "-U", "postgres", "-c", statement], capture_output=True)
+            assert result.returncode == 1 and ("task5 " + case + " live " + str(i)).encode() in result.stderr, "SETUP: live capture not emitted"
+        if case != "disabled":
+            # The finite repeated faults keep a validation window open. No
+            # frame may land behind the torn header; not even the old prefix
+            # may replay until the entire old queue has been credited.
+            assert read(queue) == seed, "SEMANTIC RED: transient scan modified queue before completion"
+            current = stats()
+            assert current["events_replayed"] == before["events_replayed"], "SEMANTIC RED: replay passed incomplete credit"
+            assert current["events_sent"] == before["events_sent"], "SEMANTIC RED: live send bypassed old queue"
+        if case == "disabled":
+            wait_for(lambda: stats()["events_queued"] == before["events_queued"] + 3,
+                     "SEMANTIC RED: one-shot body EIO credit never recovered on ordinary disabled-URL cycles")
+            current = stats()
+            assert current["ring_events"] == 2, "disabled URL drained SQL-only ring"
+            assert current["events_replayed"] == before["events_replayed"] and current["events_sent"] == before["events_sent"]
+            assert read(queue) == seed[:clean_size], "torn-tail repair cut wrong boundary"
+            assert backlog(current) == 3, "partial scans double/missed credit"
+            # Recovery was already proven without reload. Now enable delivery
+            # to check the held SQL events follow the repaired old queue.
+            setting(names[0], "file://" + sink)
+            reload()
+        wait_for(lambda: stats()["events_replayed"] == before["events_replayed"] + 5 and backlog(stats()) == 0,
+                 "SEMANTIC RED: queue/live FIFO did not recover with exact five credits")
+        current = stats()
+        assert current["events_queued"] == before["events_queued"] + 5, "overlapping scans double/missed credit"
+        assert current["events_lost"] == before["events_lost"], "appended frame discarded after torn-tail recovery"
+        assert current["events_dropped"] == before["events_dropped"] and current["fallback_broken"] == 0
+        rows = [json.loads(line) for line in read(sink).splitlines()]
+        got = [row["message"] for row in rows if row.get("message", "").startswith("task5 " + case + " ")]
+        expected = [f"task5 {case} old {i}" for i in range(3)] + [f"task5 {case} live {i}" for i in range(2)]
+        assert got == expected, ("missing/duplicated/out-of-order delivery", got)
+        assert read(queue) == b"", "physical queue did not drain"
+        (out / (case + "-export.jsonl")).write_bytes(read(sink))
+        (out / (case + "-actual.json")).write_text(json.dumps(current, indent=2) + "\n")
+        (out / (case + "-syscalls.log")).write_text(log()[log_start:])
+        for path in controls:
+            docker("exec", ct, "rm", "-f", path)
+        setting(names[0], "")
+        setting(names[1], "")
+        reload()
+        time.sleep(1)
+        print("NATIVE GREEN: " + case + ": old3 then live2, queued=replayed delta5, lost/dropped delta0", flush=True)
+finally:
+    try:
+        (out / "last-actual.json").write_text(json.dumps(stats(), indent=2) + "\n")
+        (out / "last-syscalls.log").write_text(log())
+    finally:
+        for path in controls:
+            docker("exec", ct, "rm", "-f", path)
+        # On failure the active synthetic queue may still be unread. Restore the
+        # public GUCs, retain evidence/queue, and let the controller decide cleanup;
+        # a reload cannot be used to orphan that active queue.
+        for name, value in saved.items():
+            setting(name, value)
+        reload()
+        wait_for(lambda: all(sql("SHOW " + name) == value for name, value in saved.items()), "public GUC restoration failed")
+PY
+  exit $?
+fi
 . "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }
@@ -497,6 +753,18 @@ docker cp "$CT:/tmp/partial.log" "$OUT/partial.log" >/dev/null
 [ "$(head -n 1 "$OUT/partial.log")" = '{"canary":"partial"}' ] || fail "partial write: pre-existing prefix changed"
 ok "17-byte write then ENOSPC rolled back to the intact sink; same-file RAM retry delivered 20/20 valid JSON, no dups"
 
+# A one-shot queue write failure leaves old pending for the final postlude;
+# old replay reaches EOF first, so retaining the prefix is load-bearing.
+E2E_OUT="$OUT/final-append" E2E_FINAL_QUEUE="$PGDATA_C/$FB_REL" E2E_FINAL_SINK=/tmp/replay.log \
+  sh "$0" --final-append-only "$CT" "$(docker inspect -f '{{.Id}}' "$CT")" \
+  || fail "final pending retry after old queue EOF"
+
+# Run the same targeted recovery cases inside this suite's already-owned,
+# shim-preloaded fixture. The standalone controller mode above never creates
+# or tears down native resources.
+E2E_OUT="$OUT/credit" E2E_CREDIT_CASE='' sh "$0" --credit-only "$CT" "$(docker inspect -f '{{.Id}}' "$CT")" \
+  || fail "automatic fallback credit recovery"
+
 echo "== healthy HUP revalidates without rescanning fully credited contents =="
 setguc pg_logtap.export_fallback_file ''
 setguc pg_logtap.export_url ''
@@ -551,15 +819,20 @@ setguc pg_logtap.export_url ''; setguc pg_logtap.level_min 23
 # acknowledge the disabled URL, then observe a separate healthy HUP.
 observe_hup
 observe_hup; assert_credit cached 6
-# External growth before a subsequent own append must NOT be blessed by
-# that append's new stat. Only the next explicit HUP credits the unknown frame.
+# External growth discovered before a subsequent own append must NOT be
+# blessed by that append's new stat: it gates parking until a cycle-entry
+# scan credits the unknown frame, without needing HUP or double-crediting our
+# own three events. The later healthy HUP is cached only after that scan.
 setguc pg_logtap.export_url 'http://127.0.0.1:1'; setguc pg_logtap.level_min 19; observe_hup
+docker exec "$CT" rm -f /tmp/fsyncfail.log
 write_observed_queue "$OBSQ" 1 append || fail "HUP observer: external append failed"
 gen "observeunknown-$SUF" 3
-n=0; while [ "$n" -lt 20 ] && [ "$(queue_backlog)" != 9 ]; do n=$((n + 1)); sleep 1; done
-[ "$(queue_backlog)" = 9 ] || fail "HUP observer: own append accounting changed before credit"
+n=0; while [ "$n" -lt 20 ] && [ "$(queue_backlog)" != 10 ]; do n=$((n + 1)); sleep 1; done
+[ "$(queue_backlog)" = 10 ] && [ "$(statf events_queued)" = "$((q0 + 10))" ] \
+  || fail "HUP observer: external/own append automatic credit drift"
+scan_seen || fail "HUP observer: unknown external suffix blessed without a credit scan"
 setguc pg_logtap.export_url ''; setguc pg_logtap.level_min 23
-observe_hup; assert_credit scan 10
+observe_hup # acknowledge disable before observing the next healthy HUP
 observe_hup; assert_credit cached 10
 # Change a gzip MTIME byte, not its valid body/CRC, and force a different
 # content mtime. Neither the inode nor the byte size changes.
