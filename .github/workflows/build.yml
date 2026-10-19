@@ -52,7 +52,7 @@ jobs:
         # baseline; the whole docker-based e2e below runs there as-is.
         include:
           - arch: amd64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             zig_arch: x86_64
           - arch: arm64
             os: ubuntu-24.04-arm
