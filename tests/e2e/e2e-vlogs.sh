@@ -4,8 +4,10 @@
 # logs_victoria sink). N distinct events must arrive EXACTLY: the query
 # counts only this run's markers (PID suffix), so count < N is loss and
 # count > N is duplicate delivery — both fail.
-# Usage: scripts/e2e-vlogs.sh [pg_container] [events]
+# Usage: tests/e2e/e2e-vlogs.sh [pg_container] [events]
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init vlogs "${1:-}"
 EVENTS="${2:-50}"

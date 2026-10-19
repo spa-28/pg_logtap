@@ -4,10 +4,12 @@
 # slow, live batches park on the fallback file. Once the receiver is fast,
 # one rate-limited oldest-member probe must detect recovery and drain the
 # queue even while capture remains continuously busy.
-# Usage: scripts/e2e-slow-receiver.sh [pg_container] [sink_port]
+# Usage: tests/e2e/e2e-slow-receiver.sh [pg_container] [sink_port]
 # The stand (tests/e2e/compose.yaml) provides the network; this sink is
 # suite-local because the test changes its response delay in place.
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init slow "${1:-}"
 PORT="${2:-9498}"

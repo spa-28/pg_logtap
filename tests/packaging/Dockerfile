@@ -14,6 +14,6 @@ RUN case "$PG" in 15|16|17|18) ;; *) exit 1 ;; esac && \
     dnf clean all
 ENV PG_MAJOR=${PG}
 ENV PATH=/usr/pgsql-${PG}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-COPY scripts/archive-smoke.py /smoke/archive-smoke.py
+COPY tests/packaging/archive-smoke.py /smoke/archive-smoke.py
 COPY tests/packaging/smoke.sh /smoke/smoke.sh
 ENTRYPOINT ["bash", "/smoke/smoke.sh"]

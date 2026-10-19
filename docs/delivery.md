@@ -343,7 +343,7 @@ The queue is an internal format, not a tailable log.
 Once the receiver answers, the worker drains the queue in order, sends the
 members, and truncates the file back to empty; no shipper, rotation or manual
 step is involved. On restart the same replay happens automatically (the
-`fallback-queue` scenario of `scripts/e2e-kill.sh`: SIGKILL with a full
+`fallback-queue` scenario of `tests/e2e/e2e-kill.sh`: SIGKILL with a full
 queue, receiver back after boot → all events delivered, queue empty, zero
 duplicate seqs).
 

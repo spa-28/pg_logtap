@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fail fast when the pg container runs a stale pg_logtap: the postmaster keeps
 # the .so it was started with, so a dev-deploy without a restart silently
-# tests yesterday's code. Usage: scripts/e2e-require-ext.sh <pg_container>
+# tests yesterday's code. Usage: tests/e2e/e2e-require-ext.sh <pg_container>
 set -u
 CT="${1:?pg container name required}"
 
@@ -12,7 +12,7 @@ until docker exec "$CT" psql -U postgres -Atc "SELECT 1" >/dev/null 2>&1; do
     sleep 1
 done
 
-want=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' "$(dirname "$0")/../src/version.zig")
+want=$(sed -n 's/^pub const version = "\(.*\)";/\1/p' "$(dirname "$0")/../../src/version.zig")
 got=$(docker exec "$CT" psql -U postgres -Atc "SELECT pg_logtap_version()" 2>/dev/null)
 [ "$got" = "$want" ] || {
     echo "e2e-require-ext: $CT has pg_logtap $got loaded, the tree builds $want." >&2

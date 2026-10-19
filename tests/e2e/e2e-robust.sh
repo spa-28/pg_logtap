@@ -30,12 +30,12 @@
 #                   status line straddles recvs, the send must still count
 #                   as delivered — a false failure parks a batch the
 #                   receiver already has (duplicate + divert on live)
-# Usage: scripts/e2e-robust.sh [pg_container]
+# Usage: tests/e2e/e2e-robust.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 #
 # Isolated auth-DETAIL entry (never part of the normal suite):
-#   PG_LOGTAP_AUTH_PROBE=run scripts/e2e-robust.sh
+#   PG_LOGTAP_AUTH_PROBE=run tests/e2e/e2e-robust.sh
 # Required: LT_AUTH_PG_CONTAINER, LT_AUTH_EXPECTED_ID, LT_AUTH_LABEL_KEY,
 # LT_AUTH_LABEL_VALUE, LT_AUTH_ADMIN_USER, LT_AUTH_DB, LT_AUTH_CONNECT_HOST,
 # LT_AUTH_CONNECT_PORT, LT_AUTH_USER, LT_AUTH_BAD_PASSWORD, LT_AUTH_REASON,
@@ -48,6 +48,8 @@ set -u
 # e2e-common's fail helper prints E2E_TAG; the guarded modes intentionally
 # bypass e2e_init, so give their preflight failures their own tag.
 [ -z "${PG_LOGTAP_AUTH_PROBE:-}" ] || E2E_TAG=auth-detail
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 
 auth_require_assert_env() {

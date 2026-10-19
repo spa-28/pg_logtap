@@ -25,7 +25,7 @@
 #                        torn tail rolled back, RAM retry delivers one whole copy
 #   sync-soft-restart  : shared fb_sync_failures survives TERM/replacement and
 #                        reload; the next real EIO increases SQL and Prometheus
-# Usage: scripts/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
+# Usage: tests/e2e/e2e-faults.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -u
 # Controller-owned native fixture only: no build, deployment, restart, container
 # creation or teardown. The caller must preload the freshly compiled shim and
@@ -283,6 +283,8 @@ finally:
 PY
   exit $?
 fi
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 V=$1
 [ -n "$V" ] || { echo "usage: $0 <pg_major>" >&2; exit 2; }

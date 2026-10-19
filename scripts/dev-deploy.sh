@@ -4,8 +4,9 @@
 # Requires pg_logtap already preloaded and its SQL function installed; this is
 # a binary verifier, not fresh bootstrap or an implicit ALTER EXTENSION UPDATE.
 # Preserves preload configuration. Stopped official Debian containers work too.
-# shellcheck source=e2e-common.sh
-. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../tests/e2e/e2e-common.sh"
 
 main() {
 set -euo pipefail
@@ -40,7 +41,7 @@ for f in sql/*.sql; do docker cp "$f" "$C:$EXTDIR/"; done
 # The postmaster keeps the .so it was started with — a copied-over library
 # changes nothing until restart. Restart (or start) and prove the load.
 docker restart "$C" >/dev/null
-"$(dirname "$0")/e2e-require-ext.sh" "$C"
+"$(dirname "$0")/../tests/e2e/e2e-require-ext.sh" "$C"
 
 echo "deployed to $C ($LIBDIR), server restarted on the new .so"
 }

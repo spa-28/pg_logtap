@@ -3,7 +3,7 @@
 # the e2e stand's pg, deploys, installs, runs pgbench under it, reports
 # health per mode — TPS, events/s, exact delivery, worker RSS, capture→
 # receiver latency percentiles. The modes are the "extension on" profiles
-# from scripts/bench-overhead.sh (docs/bench.md):
+# from benchmarks/bench-overhead.sh (docs/bench.md):
 #   loud  — debug1 + every statement duration-logged, level_min=10: worst
 #           case, every statement captured and exported
 #   quiet — warning, no statement logging, level_min=15: typical production,
@@ -28,10 +28,10 @@
 # the build behave under a storm" in ~7 min per mode; modes share one stand
 # (a mode flip is a reload, no restarts).
 # The stand is LEFT UP for post-mortem; the teardown line prints at the end.
-# Usage: scripts/storm.sh [secs] [pg_major] [modes]   (default 300 18 loud)
+# Usage: tests/e2e/storm.sh [secs] [pg_major] [modes]   (default 300 18 loud)
 # The CPU governor must be `performance` (checked; a scaling governor halves
 # TPS on developer boxes).
-# shellcheck source=e2e-common.sh
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 wait_ready() {
@@ -210,7 +210,7 @@ PYEOF
 
 main() {
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 SECS=${1:-300}
 V=${2:-18}
 MODES=${3:-loud}

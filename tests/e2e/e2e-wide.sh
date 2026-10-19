@@ -5,10 +5,12 @@
 # boundary and named in "truncated"; aux fields (detail) stay 256 bytes
 # whatever the width. Runs the whole cycle itself: ALTER SYSTEM, restart,
 # probes, then restores its prior settings.
-# Usage: scripts/e2e-wide.sh [pg_container]
+# Usage: tests/e2e/e2e-wide.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init wide "${1:-}"
 e2e_gate

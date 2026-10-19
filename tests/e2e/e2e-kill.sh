@@ -54,10 +54,12 @@
 #   postmaster-stop    : graceful stop (SIGTERM) with a backlog finishes in
 #                        bounded time (final flush ≈1 s + one send timeout)
 #                        and the parked queue survives the restart
-# Usage: scripts/e2e-kill.sh [pg_container]
+# Usage: tests/e2e/e2e-kill.sh [pg_container]
 # The receiver comes from the compose stand (tests/e2e/compose.yaml); its
 # readiness gate must have passed.
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init kill "${1:-}"
 e2e_gate

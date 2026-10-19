@@ -16,12 +16,13 @@
 #                          stderr-logging cost in either job
 # Logging flips need only a reload; preload swaps need restarts, so each
 # preload state runs its jobs back to back.
-# Usage: scripts/bench-overhead.sh [secs] [container]   (default 300s per job)
+# Usage: benchmarks/bench-overhead.sh [secs] [container]   (default 300s per job)
 # Needs the stand from test-matrix.sh phase_stand (so deployed). The CPU
 # governor must be `performance` — a scaling governor halves TPS on developer
 # boxes and the numbers become garbage (checked below).
-# shellcheck source=e2e-common.sh
-. "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../tests/e2e/e2e-common.sh"
 
 cleanup() { docker rm -f "$RX" >/dev/null 2>&1 || true; }
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Package existing split_debug outputs once, then smoke those exact tarballs.
-# Usage: scripts/archive-smoke.sh <PG-major> [archive-output-dir]
+# Usage: tests/packaging/archive-smoke.sh <PG-major> [archive-output-dir]
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 PG=${1:?PG major required}
 case "$PG" in 15|16|17|18) ;; *) exit 1 ;; esac
 case "$(uname -m)" in
@@ -23,7 +23,7 @@ cp pg_logtap.control sql/*.sql "$TEMP/runtime/extension/"
 cp "dist/pg$PG/lib/pg_logtap.so.debug" "$TEMP/debug/lib/"
 tar -C "$TEMP/runtime" -czf "$OUT/$PACKAGE.tar.gz" .
 tar -C "$TEMP/debug" -czf "$OUT/$PACKAGE-debug.tar.gz" .
-python3 scripts/archive-smoke.py "$OUT/$PACKAGE.tar.gz" "$OUT/$PACKAGE-debug.tar.gz" "$ARCH" "$VERSION"
+python3 tests/packaging/archive-smoke.py "$OUT/$PACKAGE.tar.gz" "$OUT/$PACKAGE-debug.tar.gz" "$ARCH" "$VERSION"
 # Unique per invocation: neither smoke builds nor runs touch developer stands.
 IMAGE=pglogtap-archive-el8-pg$PG-$(basename "$TEMP" | tr '[:upper:]' '[:lower:]')
 trap 'docker image rm "$IMAGE" >/dev/null 2>&1 || true; rm -rf "$TEMP"' EXIT

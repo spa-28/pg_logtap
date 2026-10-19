@@ -6,9 +6,11 @@
 # Without the fixes the first status-line recv blocks forever (or until the
 # signal storm stops): no timely failed cycle, nothing diverts to fallback,
 # and /healthz is never served again — all asserted here.
-# Usage: scripts/e2e-silent-receiver.sh [pg_container] [sink_port]
+# Usage: tests/e2e/e2e-silent-receiver.sh [pg_container] [sink_port]
 # The mute receiver is the compose stand's `silent` service.
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init silent "${1:-}"
 PORT="${2:-9499}"

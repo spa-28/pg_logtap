@@ -23,7 +23,7 @@ import time
 import types
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def fail(message):
@@ -449,7 +449,7 @@ def test_common_gates():
             driver.write_text(f'''#!/bin/sh
 set -eu
 E2E_TAG=gate E2E_CT=model NET=net VEC=receiver E2E_SUF=-test
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 {body} || exit $?
 printf AFTER
 ''')
@@ -478,7 +478,7 @@ printf AFTER
         driver.write_text(f'''#!/bin/sh
 set -eu
 E2E_TAG=gate E2E_CT=model NET=net VEC=receiver
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 e2e_gate || exit $?
 printf AFTER
 ''')
@@ -491,9 +491,10 @@ def test_source_guards():
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         env = env_for(tmp)
-        for script, symbol in (("test-matrix.sh", "phase_stand"), ("bench-overhead.sh", "run_job"),
-                               ("storm.sh", "run_mode"), ("dev-deploy.sh", "main")):
-            source = ROOT / "scripts" / script
+        for source, script, symbol in ((ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", "phase_stand"),
+                                       (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_job"),
+                                       (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode"),
+                                       (ROOT / "scripts/dev-deploy.sh", "dev-deploy.sh", "main")):
             check = f'''before_pwd= before_opts= before_vars= before_traps=
 before_pwd=$PWD
 before_opts=$(set +o)
@@ -523,7 +524,7 @@ def test_container_locks():
         driver = tmp / "lock.sh"
         driver.write_text(f'''#!/bin/sh
 set -eu
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 OUT=$1 E2E_CT=$2 E2E_TAG=selftest
 mkdir -p "$OUT"
 e2e_lock
@@ -550,27 +551,27 @@ printf 'ACQUIRED\\n'
 
 def test_lock_cooperation():
     errors = []
-    for script, key, body in (
-        ("test-matrix.sh", "pglogtap-mx15", 'OUT="$HARNESS_OUT"; COMPOSE="docker compose -f tests/e2e/compose.yaml"; FLAGS=(); phase_stand 15'),
-        ("test-matrix.sh", "pglogtap-mx15", 'OUT="$HARNESS_OUT"; phase_storm 15 1'),
-        ("test-matrix.sh", "pglogtap-mx15", 'phase_cluster_ops 15'),
-        ("test-matrix.sh", "pglogtap-mx15", 'PHASES=none; STATUS=0; run_version 15'),
-        ("bench-overhead.sh", "model", 'main 1 model'),
-        ("dev-deploy.sh", "model", None),
-        ("storm.sh", "pglogtap-mx15", 'main 1 15 loud'),
+    for source, script, key, body in (
+        (ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", "pglogtap-mx15", 'OUT="$HARNESS_OUT"; COMPOSE="docker compose -f tests/e2e/compose.yaml"; FLAGS=(); phase_stand 15'),
+        (ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", "pglogtap-mx15", 'OUT="$HARNESS_OUT"; phase_storm 15 1'),
+        (ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", "pglogtap-mx15", 'phase_cluster_ops 15'),
+        (ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", "pglogtap-mx15", 'PHASES=none; STATUS=0; run_version 15'),
+        (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "model", 'main 1 model'),
+        (ROOT / "scripts/dev-deploy.sh", "dev-deploy.sh", "model", None),
+        (ROOT / "tests/e2e/storm.sh", "storm.sh", "pglogtap-mx15", 'main 1 15 loud'),
     ):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             env = env_for(tmp)
             env["HARNESS_OUT"] = str(tmp / "out")
             Path(env["HARNESS_OUT"]).mkdir()
-            holder_body = f'. "{ROOT / "scripts/e2e-common.sh"}"; E2E_CT={key}; E2E_TAG=selftest; e2e_lock; printf "ACQUIRED\\n"; read -r release'
+            holder_body = f'. "{ROOT / "tests/e2e/e2e-common.sh"}"; E2E_CT={key}; E2E_TAG=selftest; e2e_lock; printf "ACQUIRED\\n"; read -r release'
             holder = subprocess.Popen(["sh", "-c", holder_body], env=env, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 assert holder.stdout.readline() == "ACQUIRED\n", "cooperation holder failed"
-                command = (["bash", str(ROOT / "scripts" / script), key] if body is None else
-                           ["bash", "-c", f'source "{ROOT / "scripts" / script}"; {body}'])
+                command = (["bash", str(source), key] if body is None else
+                           ["bash", "-c", f'source "{source}"; {body}'])
                 result = run(command, env=env)
                 if result.returncode == 0 or "another e2e holds" not in result.stderr or calls(env):
                     errors.append(f"{script} bypassed suite lock: rc={result.returncode}, external calls={calls(env)}, stderr={result.stderr!r}")
@@ -593,10 +594,10 @@ case "$*" in
 esac
 ''')
             driver = f'''set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 OUT="{tmp}"; E2E_OUT="$OUT"; E2E_VECTOR=''; STATUS=0; SECS=1; PHASES={phase}
 run_version 15 || exit $?
-timeout 3 sh -c '. "{ROOT / 'scripts/e2e-common.sh'}"; E2E_CT=pglogtap-mx15; E2E_TAG=child; e2e_lock; e2e_stand_lock; printf CHILD'
+timeout 3 sh -c '. "{ROOT / 'tests/e2e/e2e-common.sh'}"; E2E_CT=pglogtap-mx15; E2E_TAG=child; e2e_lock; e2e_stand_lock; printf CHILD'
 '''
             result = run(["bash", "-c", driver], env=env)
             entries = calls(env)
@@ -608,15 +609,15 @@ timeout 3 sh -c '. "{ROOT / 'scripts/e2e-common.sh'}"; E2E_CT=pglogtap-mx15; E2E
 
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw); env = env_for(tmp)
-        holder_body = f'. "{ROOT / "scripts/e2e-common.sh"}"; e2e_stand_lock; printf "HELD\\n"; read -r release'
+        holder_body = f'. "{ROOT / "tests/e2e/e2e-common.sh"}"; e2e_stand_lock; printf "HELD\\n"; read -r release'
         holder = subprocess.Popen(["sh", "-c", holder_body], env=env, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         contender = None
         try:
             assert holder.stdout.readline() == b"HELD\n"
-            retained = run(["bash", "-c", f'source "{ROOT / "scripts/test-matrix.sh"}"; STATUS=1; COMPOSE="docker compose -f tests/e2e/compose.yaml"; cleanup'], env=env)
+            retained = run(["bash", "-c", f'source "{ROOT / "tests/e2e/test-matrix.sh"}"; STATUS=1; COMPOSE="docker compose -f tests/e2e/compose.yaml"; cleanup'], env=env)
             assert retained.returncode == 0 and not calls(env), ("failed stand cleanup", retained, calls(env))
-            body = f'source "{ROOT / "scripts/test-matrix.sh"}"; STATUS=0; COMPOSE="docker compose -f tests/e2e/compose.yaml"; printf "BEGIN\\n"; cleanup; printf "AFTER\\n"'
+            body = f'source "{ROOT / "tests/e2e/test-matrix.sh"}"; STATUS=0; COMPOSE="docker compose -f tests/e2e/compose.yaml"; printf "BEGIN\\n"; cleanup; printf "AFTER\\n"'
             contender = subprocess.Popen(["bash", "-c", body], env=env, stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             assert contender.stdout.readline() == b"BEGIN\n"
@@ -634,8 +635,8 @@ timeout 3 sh -c '. "{ROOT / 'scripts/e2e-common.sh'}"; E2E_CT=pglogtap-mx15; E2E
 def test_major_selection():
     # A matching PATH pg_config must not hide a conflicting effective override.
     errors = []
-    for script, body in (("test-matrix.sh", 'FLAGS=(); COMPOSE="docker compose -f tests/e2e/compose.yaml"; phase_stand 15'),
-                         ("storm.sh", 'V=15; ZIG_TARGET=x86_64-linux-gnu.2.28; build_extension')):
+    for source, script, body in ((ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", 'FLAGS=(); COMPOSE="docker compose -f tests/e2e/compose.yaml"; phase_stand 15'),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", 'V=15; ZIG_TARGET=x86_64-linux-gnu.2.28; build_extension')):
         for mode, override, wanted in (("matching", "", "host"), ("mismatch", "", "container"),
                                        ("absent", "", "container"), ("missing_override", "/missing/pg_config", "container"),
                                        ("conflict", "override", "container"), ("override_match", "override", "host")):
@@ -668,7 +669,7 @@ printf fixture > zig-out/lib/pg_logtap.so
                     env["PG_CONFIG"] = str(bindir / "override")
                 elif override:
                     env["PG_CONFIG"] = override
-                driver = f'set -euo pipefail; source "{ROOT / "scripts" / script}"; OUT="{tmp / "out"}"; mkdir -p "$OUT"; {body}'
+                driver = f'set -euo pipefail; source "{source}"; OUT="{tmp / "out"}"; mkdir -p "$OUT"; {body}'
                 result = run(["bash", "-c", driver], env=env, cwd=tmp)
                 chosen = [c[0] for c in calls(env) if c[0] in ("zig", "container-build")]
                 expected = ["zig" if wanted == "host" else "container-build"]
@@ -694,7 +695,7 @@ def test_hook_major_selection():
             elif mode in ("conflict", "matching_override"):
                 write_exe(bindir / "override", f'#!/bin/sh\ncase "$1" in --version) echo "PostgreSQL {15 if mode == "matching_override" else 18}.0" ;; --includedir-server) echo /headers ;; *) exit 97 ;; esac\n')
                 env["PG_CONFIG"] = str(bindir / "override")
-            result = run(["sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+            result = run(["sh", str(ROOT / "tests/e2e/e2e-hook-chain.sh"), "model"], env=env)
             host = any(c[0] == "zig" and c[1].startswith("cc ") for c in calls(env))
             container = any(c[:3] == ["exec", "pgzx-build", "/opt/zig016/files/zig"] for c in calls(env))
             want_host = mode in ("matching", "matching_override")
@@ -714,6 +715,7 @@ def test_deploy_major_selection():
             if override:
                 env["PG_CONFIG"] = "/missing/pg_config"
             scripts = tmp / "scripts"; scripts.mkdir()
+            checks = tmp / "tests/e2e"; checks.mkdir(parents=True)
             (tmp / "sql").mkdir(); (tmp / "sql/pg_logtap--0.6.1.sql").touch()
             write_exe(scripts / "build.sh", '''#!/bin/sh
 [ "$#" = 2 ] && [ "$2" = -Doptimize=ReleaseSafe ] || exit 97
@@ -721,7 +723,7 @@ case "$1" in 15|18) ;; *) exit 97 ;; esac
 printf '["container-build", "%s"]\\n' "$1" >> "$HARNESS_LOG"
 [ "$HARNESS_DEPLOY_STATE" != build_failure ] || exit 76
 ''')
-            write_exe(scripts / "e2e-require-ext.sh", '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = model ] || exit 97\n')
+            write_exe(checks / "e2e-require-ext.sh", '#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = model ] || exit 97\n')
             bindir = Path(env["PATH"].split(":", 1)[0])
             write_exe(bindir / "zig", '#!/bin/sh\n[ "$*" = "build -Doptimize=ReleaseSafe" ] || exit 97\nprintf \'["host-build", "15"]\\n\' >> "$HARNESS_LOG"\n')
             write_exe(bindir / "docker", r'''#!/usr/bin/env python3
@@ -771,7 +773,7 @@ def test_current_run_duplicates():
         old = [{"seq": 1, "message": "logtap robust panic3-old 0"}] * 2
         current = [{"seq": 2, "message": "logtap robust panic3-run 0"},
                    {"seq": 3, "message": "logtap robust huge-run 0"}]
-        driver = f'. "{ROOT / "scripts/e2e-common.sh"}"; OUT="{tmp}"; E2E_TAG=robust; E2E_SUF=-run; duplicate_seqs'
+        driver = f'. "{ROOT / "tests/e2e/e2e-common.sh"}"; OUT="{tmp}"; E2E_TAG=robust; E2E_SUF=-run; duplicate_seqs'
         for extra, expected in (([], 0), ([current[0]], 1)):
             sink.write_text("".join(json.dumps(event, separators=(",", ":")) + "\n" for event in old + current + extra))
             result = run(["sh", "-c", driver], env=os.environ.copy())
@@ -858,7 +860,7 @@ def test_export_epoch_accounting():
         with tempfile.TemporaryDirectory() as raw:
             tmp=Path(raw); env=export_epoch_env(tmp,rows)
             driver=f'''set -eu
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 E2E_CT=model
 unset E2E_EXPORT_EPOCH
 {setup}
@@ -905,7 +907,7 @@ def test_export_worker_generation():
         with tempfile.TemporaryDirectory() as raw:
             tmp=Path(raw); env=export_epoch_env(tmp,[initial,later])
             driver=f'''set -eu
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 E2E_CT=model; E2E_EXPORT_EPOCH=1
 e2e_export_begin || exit $?
 printf 'ARMED\n'
@@ -1055,11 +1057,13 @@ else: die()
 
 def test_measurement_windows():
     errors = []
-    for script, body in (("bench-overhead.sh", "run_loud"), ("storm.sh", "run_mode loud"), ("storm.sh", "run_mode chain")):
+    for source, script, body in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_loud"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode loud"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode chain")):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = measurement_env(tmp)
             driver = f'''set -euo pipefail
-source "{ROOT / 'scripts' / script}"
+source "{source}"
 C=model; E2E_CT=model; E2E_TAG=measurement; OUT="{tmp}"; DUMP="$HARNESS_DUMP"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 e2e_export_begin || exit $?
 {body} || exit $?
@@ -1089,15 +1093,14 @@ printf AFTER
     if errors: fail("; ".join(errors))
 
 
-def test_export_parent_arming(source_dir=ROOT / "scripts"):
+def test_export_parent_arming():
     # Execute the actual setup-to-warmup caller slices, not copied helper logic.
-    patterns = {
-        "bench-overhead.sh": r"^set_logging quiet\n.*?^run_job on-quiet$",
-        "storm.sh": r'^docker exec "\$C" pgbench -i -q -s 8 -U postgres postgres.*?^for mode in .*?done$',
-    }
+    patterns = (
+        (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", r"^set_logging quiet\n.*?^run_job on-quiet$"),
+        (ROOT / "tests/e2e/storm.sh", "storm.sh", r'^docker exec "\$C" pgbench -i -q -s 8 -U postgres postgres.*?^for mode in .*?done$'),
+    )
     errors = []
-    for script, pattern in patterns.items():
-        source = source_dir / script
+    for source, script, pattern in patterns:
         caller = re.search(pattern, source.read_text(), re.S | re.M)
         assert caller is not None, ("actual setup-to-workload caller not found", source)
         for history, worker_fault in ((False,""),(True,""),(False,"no_worker"),(False,"multiple_workers")):
@@ -1137,7 +1140,7 @@ assert a in (["exec","model","psql","-U","postgres","-qc","ALTER SYSTEM RESET sh
              ["restart","model"],["exec","model","pg_isready","-U","postgres","-h","127.0.0.1"])
 ''')
             driver=f'''set -euo pipefail
-source "{source_dir / 'bench-overhead.sh'}"
+source "{ROOT / 'benchmarks/bench-overhead.sh'}"
 C=model; E2E_CT=model; E2E_EXPORT_EPOCH=1
 set_preload '{preload}'
 if [ "${{E2E_EXPORT_EPOCH+x}}" ]; then exit 98; fi
@@ -1151,13 +1154,14 @@ printf RESTARTED
 
 
 def test_export_measurement_replay_and_pending():
-    for script, body in (("bench-overhead.sh","run_loud"),("bench-overhead.sh","run_job on-mute"),
-                         ("storm.sh","run_mode chain")):
+    for source, script, body in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_loud"),
+                                 (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_job on-mute"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode chain")):
         for fault in ("warmup_replay","warmup_queue_pending","warmup_ram_pending","warmup_ring_pending"):
             with tempfile.TemporaryDirectory() as raw:
                 tmp=Path(raw); env=measurement_env(tmp,fault)
                 driver=f'''set -euo pipefail
-source "{ROOT / 'scripts' / script}"
+source "{source}"
 C=model; E2E_CT=model; OUT="{tmp}"; DUMP="$HARNESS_DUMP"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 e2e_export_begin || exit $?
 {body} || exit $?
@@ -1183,13 +1187,14 @@ printf AFTER
 
 def test_export_recovery_before_measurement():
     errors=[]
-    for script, body in (("bench-overhead.sh","run_loud"),("bench-overhead.sh","run_job on-mute"),
-                         ("storm.sh","run_mode chain")):
+    for source, script, body in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_loud"),
+                                 (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_job on-mute"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode chain")):
         for fault in ("warmup_shmem_replay","warmup_shmem_uncredited"):
             with tempfile.TemporaryDirectory() as raw:
                 tmp=Path(raw); env=measurement_env(tmp,fault)
                 driver=f'''set -euo pipefail
-source "{ROOT / 'scripts' / script}"
+source "{source}"
 C=model; E2E_CT=model; OUT="{tmp}"; DUMP="$HARNESS_DUMP"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 e2e_export_begin || exit $?
 {body} || exit $?
@@ -1212,14 +1217,15 @@ printf AFTER
 
 def test_export_history_before_warmup():
     errors = []
-    for script, body in (("bench-overhead.sh", "run_loud"), ("bench-overhead.sh", "run_job on-mute"),
-                         ("storm.sh", "run_mode chain")):
+    for source, script, body in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_loud"),
+                                 (ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_job on-mute"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode chain")):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = measurement_env(tmp)
             # Old queue delivery is not part of this epoch's captured count.
             Path(env["HARNESS_STATE"]).write_text(json.dumps(dict(cap=0, sent=0, ready=0, queued=10, replayed=10)))
             driver = f'''set -euo pipefail
-source "{ROOT / 'scripts' / script}"
+source "{source}"
 C=model; E2E_CT=model; OUT="{tmp}"; DUMP="$HARNESS_DUMP"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 E2E_EXPORT_EPOCH=1
 {body} || exit $?
@@ -1238,7 +1244,7 @@ def test_chain_file_completion():
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = measurement_env(tmp, fault)
             driver = f'''set -euo pipefail
-source "{ROOT / 'scripts/storm.sh'}"
+source "{ROOT / 'tests/e2e/storm.sh'}"
 C=model; E2E_CT=model; OUT="{tmp}"; DUMP="$HARNESS_DUMP"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 e2e_export_begin || exit $?
 run_mode chain || exit $?
@@ -1269,7 +1275,7 @@ def test_mute_warmup_drain():
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = measurement_env(tmp, "warmup_pending")
             driver = f'''set -euo pipefail
-source "{ROOT / 'scripts/bench-overhead.sh'}"
+source "{ROOT / 'benchmarks/bench-overhead.sh'}"
 C=model; E2E_CT=model; OUT="{tmp}"; RX=rx; SECS=6; WARMUP=3; SEED=1
 e2e_export_begin || exit $?
 {body} || exit $?
@@ -1283,12 +1289,13 @@ printf AFTER
 
 def test_measurement_failures():
     errors = []
-    for script, body in (("bench-overhead.sh", "run_job off-loud"),("storm.sh", "run_mode loud")):
+    for source, script, body in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh", "run_job off-loud"),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", "run_mode loud")):
         for fault, code in (("warmup",41),("measured",42)):
             with tempfile.TemporaryDirectory() as raw:
                 tmp=Path(raw); env=measurement_env(tmp,fault)
                 driver=f'''set -euo pipefail
-source "{ROOT / 'scripts' / script}"
+source "{source}"
 C=model; E2E_CT=model; E2E_TAG=measurement; OUT="{tmp}"; NET=net; RX=rx; SECS=6; WARMUP=3; SEED=1
 {'e2e_export_begin || exit $?' if script == 'storm.sh' else ''}
 {body} || exit $?
@@ -1314,11 +1321,11 @@ def test_standby_lock_cooperation():
             tmp=Path(raw); env=env_for(tmp)
             env["E2E_OUT"]=str(tmp/"out"); (tmp/"out").mkdir()
             so=tmp/"dist/pg15/lib/pg_logtap.so"; so.parent.mkdir(parents=True); so.write_text("fixture")
-            holder=subprocess.Popen(["sh","-c", f'. "{ROOT / "scripts/e2e-common.sh"}"; E2E_CT={key}; E2E_TAG=selftest; e2e_lock; printf "ACQUIRED\\n"; read -r release'],
+            holder=subprocess.Popen(["sh","-c", f'. "{ROOT / "tests/e2e/e2e-common.sh"}"; E2E_CT={key}; E2E_TAG=selftest; e2e_lock; printf "ACQUIRED\\n"; read -r release'],
                                     env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
                 assert holder.stdout.readline()=="ACQUIRED\n"
-                result=run(["sh",str(ROOT/"scripts/e2e-standby.sh"),"15"],env=env,cwd=tmp)
+                result=run(["sh",str(ROOT/"tests/e2e/e2e-standby.sh"),"15"],env=env,cwd=tmp)
                 if result.returncode==0 or "another e2e holds" not in result.stderr or calls(env):
                     errors.append(f"standby bypassed {key} suite lock: calls={calls(env)}; stderr={result.stderr!r}")
             finally:
@@ -1331,7 +1338,7 @@ def test_disjoint_lock_namespaces():
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = env_for(tmp)
             body = f'''set -eu
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 E2E_TAG=selftest; E2E_CT={key}
 e2e_lock
 printf 'CONTAINER\\n'
@@ -1348,7 +1355,7 @@ printf 'BOTH\\n'
 def test_shared_lock_and_phase_release():
     with tempfile.TemporaryDirectory() as raw:
         tmp=Path(raw); env=env_for(tmp)
-        body=f'. "{ROOT / "scripts/e2e-common.sh"}"; OUT=$1; E2E_CT=$2; E2E_TAG=selftest; e2e_lock; printf "CONTAINER\\n"; e2e_stand_lock; printf "BUILD\\n"; read -r release'
+        body=f'. "{ROOT / "tests/e2e/e2e-common.sh"}"; OUT=$1; E2E_CT=$2; E2E_TAG=selftest; e2e_lock; printf "CONTAINER\\n"; e2e_stand_lock; printf "BUILD\\n"; read -r release'
         for name in ("a","b"): (tmp/name).mkdir()
         holder=subprocess.Popen(["sh","-c",body,"sh",str(tmp/"a"),"one"],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         contender=None
@@ -1367,18 +1374,18 @@ def test_shared_lock_and_phase_release():
         with tempfile.TemporaryDirectory() as raw:
             tmp=Path(raw); env=env_for(tmp,mode)
             body=f'''set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 OUT="{tmp / 'out'}"; mkdir -p "$OUT"; FLAGS=(); COMPOSE='docker compose -f tests/e2e/compose.yaml'
 phase_stand 15 || :
-timeout 3 sh -c '. "{ROOT / 'scripts/e2e-common.sh'}"; E2E_TAG=child; E2E_CT=pglogtap-mx15; e2e_lock; e2e_stand_lock; printf CHILD'
+timeout 3 sh -c '. "{ROOT / 'tests/e2e/e2e-common.sh'}"; E2E_TAG=child; E2E_CT=pglogtap-mx15; e2e_lock; e2e_stand_lock; printf CHILD'
 '''
             result=run(["bash","-c",body],env=env)
             assert result.returncode==0 and "CHILD" in result.stdout, ("parent phase leaked a container/build lock into child",mode,result)
 
 
 def test_failed_fallback_keeps_stale_library():
-    for script, body in (("test-matrix.sh", 'FLAGS=(); COMPOSE="docker compose -f tests/e2e/compose.yaml"; phase_stand 15'),
-                         ("storm.sh", 'V=15; ZIG_TARGET=x86_64-linux-gnu.2.28; build_extension')):
+    for source, script, body in ((ROOT / "tests/e2e/test-matrix.sh", "test-matrix.sh", 'FLAGS=(); COMPOSE="docker compose -f tests/e2e/compose.yaml"; phase_stand 15'),
+                                 (ROOT / "tests/e2e/storm.sh", "storm.sh", 'V=15; ZIG_TARGET=x86_64-linux-gnu.2.28; build_extension')):
         with tempfile.TemporaryDirectory() as raw:
             tmp=Path(raw); env=env_for(tmp); env["PG_CONFIG"]="/missing/pg_config"
             scripts=tmp/"scripts"; scripts.mkdir()
@@ -1390,7 +1397,7 @@ printf 'fallback-failed\\n' >> "$HARNESS_HITS"
 exit 76
 ''')
             stale=tmp/"zig-out/lib/pg_logtap.so"; stale.parent.mkdir(parents=True); stale.write_text("stale pg18 library")
-            driver=f'set -euo pipefail; source "{ROOT / "scripts" / script}"; OUT="{tmp / "out"}"; mkdir -p "$OUT"; {body} || exit $?; printf AFTER'
+            driver=f'set -euo pipefail; source "{source}"; OUT="{tmp / "out"}"; mkdir -p "$OUT"; {body} || exit $?; printf AFTER'
             result=run(["bash","-c",driver],env=env,cwd=tmp)
             assert hits(env)==["fallback-failed"], "did not reach the failed target-major builder"
             assert result.returncode!=0 and "AFTER" not in result.stdout and not (tmp/"dist/pg15/lib/pg_logtap.so").exists() and not any(c[:1]==["cp"] for c in calls(env)), (
@@ -1410,9 +1417,10 @@ if args[0] == "inspect":''').replace('elif cmd[0] == "pg_isready":', '''elif cmd
         if mode == "bench_not_ready": hit("not_ready", 1)''')
             docker.write_text(text)
             errors = []
-            for script in ("bench-overhead.sh", "storm.sh"):
+            for source, script in ((ROOT / "benchmarks/bench-overhead.sh", "bench-overhead.sh"),
+                                   (ROOT / "tests/e2e/storm.sh", "storm.sh")):
                 Path(env["HARNESS_LOG"]).unlink(missing_ok=True)
-                result = run(["bash", "-c", f'source "{ROOT / "scripts" / script}"; C=model; wait_ready'], env=env)
+                result = run(["bash", "-c", f'source "{source}"; C=model; wait_ready'], env=env)
                 probes = [c for c in calls(env) if c[:3] == ["exec", "model", "pg_isready"]]
                 if result.returncode != expected or len(probes) != (1 if expected == 0 else 60):
                     errors.append(f"{script} {mode}: rc={result.returncode}, TCP probes={len(probes)}, expected rc={expected}")
@@ -1477,7 +1485,7 @@ def test_matrix_fail_closed():
             driver = tmp / "driver.sh"
             driver.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 OUT="{tmp / 'out'}"; mkdir -p "$OUT"
 COMPOSE='docker compose -f tests/e2e/compose.yaml'; FLAGS=(); E2E_VECTOR=receiver; E2E_OUT="$OUT"
 phase_stand 15 || exit $?
@@ -1494,7 +1502,7 @@ printf AFTER
         driver = tmp / "driver.sh"
         driver.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 OUT="{tmp / 'out'}"; mkdir -p "$OUT"
 COMPOSE='docker compose -f tests/e2e/compose.yaml'; FLAGS=(); E2E_VECTOR=receiver; E2E_OUT="$OUT"
 phase_stand 15 || exit $?
@@ -1512,7 +1520,7 @@ printf AFTER
         driver = tmp / "driver.sh"
         driver.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 OUT="{tmp / 'out'}"; mkdir -p "$OUT"
 COMPOSE='docker compose -f tests/e2e/compose.yaml'; FLAGS=(); E2E_VECTOR=receiver; E2E_OUT="$OUT"
 phase_stand 15 || exit $?
@@ -1529,7 +1537,7 @@ printf AFTER
             driver = tmp / "driver.sh"
             driver.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 C=model; OUT="{tmp}"; E2E_OUT="$OUT"; VEC=receiver
 phase_storm 15 1 || exit $?
 printf AFTER
@@ -1542,8 +1550,8 @@ printf AFTER
                 fail(f"matrix {mode}: pgbench failure ran the later restore pipeline")
 
             mutated = tmp / "test-matrix-no-pipefail.sh"
-            (tmp / "e2e-common.sh").symlink_to(ROOT / "scripts/e2e-common.sh")
-            original = (ROOT / "scripts/test-matrix.sh").read_text()
+            (tmp / "e2e-common.sh").symlink_to(ROOT / "tests/e2e/e2e-common.sh")
+            original = (ROOT / "tests/e2e/test-matrix.sh").read_text()
             needle = 'bash -c "set -euo pipefail; pgbench -i -q -U postgres postgres >/dev/null 2>&1; \\\n    pgbench'
             if needle not in original:
                 fail("matrix pipefail mutation anchor not found")
@@ -1568,7 +1576,7 @@ def test_failed_stand_is_retained():
         driver = tmp / "driver.sh"
         driver.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-source "{ROOT / 'scripts/test-matrix.sh'}"
+source "{ROOT / 'tests/e2e/test-matrix.sh'}"
 phase_upgrade() {{ printf upgrade > "$HARNESS_LATER"; }}
 PHASES=stand,upgrade
 main 1 15 || exit $?
@@ -1605,7 +1613,7 @@ def test_configuration_restoration():
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = env_for(tmp, mode); want = initial(preload)
             env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["E2E_OUT"] = str(tmp / "out")
-            result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+            result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-hook-chain.sh"), "model"], env=env)
             if result.returncode:
                 fail(f"hook {preload or 'empty'} restore did not complete: {result.stderr}; trace={joined(env)}")
             restored(env, want, f"hook {preload or 'empty'}")
@@ -1619,7 +1627,7 @@ def test_configuration_restoration():
         tmp = Path(raw); env = env_for(tmp, "hook_config_normal"); want = initial()
         env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["E2E_OUT"] = str(tmp / "out")
         env["HARNESS_FAIL_PRELOAD_RESTORE"] = "1"
-        result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+        result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-hook-chain.sh"), "model"], env=env)
         value, trace = saved(env), "\n".join(joined(env))
         if result.returncode == 0:
             fail("hook preload restore failure returned success")
@@ -1634,7 +1642,7 @@ def test_configuration_restoration():
         tmp = Path(raw); env = env_for(tmp, "wide_early"); want = initial()
         env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["HARNESS_FAIL_FIRST_RESTART"] = "1"
         env["HARNESS_ASSERT_LOCK"] = "1"
-        result = run(["/bin/sh", str(ROOT / "scripts/e2e-wide.sh"), "model"], env=env)
+        result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-wide.sh"), "model"], env=env)
         if result.returncode == 0 or any("DO $$" in item for item in joined(env)):
             fail("wide early restart failure reached probes or returned success")
         restored(env, want, "wide early failure")
@@ -1645,12 +1653,12 @@ def test_configuration_restoration():
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw); env = env_for(tmp, "wide_signal"); want = initial()
             env["HARNESS_INITIAL_GUCS"] = json.dumps(want); env["HARNESS_SIGNAL"] = name
-            result = run(["/bin/sh", str(ROOT / "scripts/e2e-wide.sh"), "model"], env=env)
+            result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-wide.sh"), "model"], env=env)
             if result.returncode != code or any("DO $$" in item for item in joined(env)):
                 fail(f"wide {name}: rc={result.returncode}, later probes={joined(env)}")
             restored(env, want, f"wide {name}")
 
-    source = (ROOT / "scripts/e2e-wide.sh").read_text()
+    source = (ROOT / "tests/e2e/e2e-wide.sh").read_text()
     cleanup = re.search(r"cleanup\(\) \{\n.*?^\}", source, re.S | re.M)
     if cleanup is None:
         fail("wide actual cleanup function not found")
@@ -1662,7 +1670,7 @@ def test_configuration_restoration():
             driver = tmp / "cleanup.sh"
             driver.write_text(f'''#!/bin/sh
 set -u
-. "{ROOT / 'scripts/e2e-common.sh'}"
+. "{ROOT / 'tests/e2e/e2e-common.sh'}"
 E2E_CT=model E2E_TAG=wide PG_CT=model
 SAVED_EXPORT_URL=$(printf %s {want["pg_logtap.export_url"]!r})
 SAVED_EXPORT_FALLBACK_FILE=$(printf %s {want["pg_logtap.export_fallback_file"]!r})
@@ -1682,7 +1690,7 @@ def test_hook_restore():
         tmp = Path(raw)
         env = env_for(tmp, "hook_restart")
         env["E2E_OUT"] = str(tmp / "out")
-        result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+        result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-hook-chain.sh"), "model"], env=env)
         if result.returncode == 0:
             fail("hook early restart failure returned success")
         trace = "\n".join(joined(env))
@@ -1698,7 +1706,7 @@ def test_hook_restore():
             tmp = Path(raw)
             env = env_for(tmp, mode)
             env["E2E_OUT"] = str(tmp / "out")
-            result = run(["/bin/sh", str(ROOT / "scripts/e2e-hook-chain.sh"), "model"], env=env)
+            result = run(["/bin/sh", str(ROOT / "tests/e2e/e2e-hook-chain.sh"), "model"], env=env)
             trace = "\n".join(joined(env))
             armed = "hookchain_arm(true)" in trace
             if not armed:
@@ -1711,7 +1719,7 @@ def test_hook_restore():
 
 
 def tls_module():
-    source = (ROOT / "scripts/e2e-tls.sh").read_text()
+    source = (ROOT / "tests/e2e/e2e-tls.sh").read_text()
     match = re.search(r"cat > \"\$DIR/receiver\.py\" <<'PYEOF'\n(.*?)\nPYEOF", source, re.S)
     assert match, "TLS receiver heredoc not found"
     embedded = match.group(1)
@@ -1848,7 +1856,7 @@ def test_tls_fixture_semantics():
 
         # Shell-parse the actual assignment; this catches shell/Python escaping
         # regressions rather than exercising a separately reconstructed probe.
-        source = (ROOT / "scripts/e2e-tls.sh").read_text()
+        source = (ROOT / "tests/e2e/e2e-tls.sh").read_text()
         assignment = re.search(r"^EVIL_PROBE=.*$", source, re.M)
         if assignment is None:
             fail("TLS impostor probe assignment not found")
@@ -1884,7 +1892,7 @@ def test_tls_fixture_semantics():
         if fields.get(b"Content-Length") != str(len(body)).encode() or gzip.decompress(body) != b'{"detector":"evil-live"}\n':
             fail("TLS impostor probe did not frame the gzip detector payload")
 
-        source = (ROOT / "scripts/e2e-tls.sh").read_text()
+        source = (ROOT / "tests/e2e/e2e-tls.sh").read_text()
         helper = re.search(r"sync_receiver_file\(\) \{\n.*?\n\}", source, re.S)
         if helper is None:
             fail("TLS receiver evidence helper not found")
@@ -1948,7 +1956,7 @@ printf AFTER
 
 
 def test_tls_received_caller_propagation():
-    source = (ROOT / "scripts/e2e-tls.sh").read_text()
+    source = (ROOT / "tests/e2e/e2e-tls.sh").read_text()
     helpers = [re.search(rf"{name}\(\) \{{[^\n]*\n.*?\n\}}", source, re.S)
                for name in ("sync_receiver_file", "received", "received_count")]
     caller = re.search(r'received_count p2fail "\$OUT"\n\[ "\$RECEIVED" = 0 \] \|\| \{ echo "e2e-tls: phase 2 leaked \$RECEIVED events through an unverified handshake"; exit 1; \}', source)
@@ -1999,7 +2007,7 @@ printf 'FOLLOWING\\n'
 
 
 def test_tls_adapter_lifecycle():
-    source = (ROOT / "scripts/e2e-tls.sh").read_text()
+    source = (ROOT / "tests/e2e/e2e-tls.sh").read_text()
     cleanup = re.search(r"cleanup\(\) \{\n.*?\n\}", source, re.S)
     adapter = re.search(r'if \[ -n "\$TLS_PYTHON" \]; then\n(?P<body>  TLS_DIR_IN_CT=.*?)\nelse\n  \(\n', source, re.S)
     if cleanup is None or adapter is None:
@@ -2214,7 +2222,7 @@ printf AFTER
 
 
 def test_actual_finalizers():
-    source = ROOT / "scripts/e2e-faults.sh"
+    source = ROOT / "tests/e2e/e2e-faults.sh"
     embedded = source.read_text().split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
     tree = ast.parse(embedded, filename=str(source))
     helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
@@ -2290,35 +2298,3 @@ def test_actual_finalizers():
                 if "original failure" not in chain or armed or configured != expected or effective != expected:
                     fail(f"actual finalizer failed restoration for {fault}: armed={armed}, errors={chain}")
     print(f"actual finalizers: {case_count}/15 restored controls and configured/effective GUCs")
-
-
-def main():
-    tests = [test_common_gates, test_source_guards, test_mock_rejection, test_matrix_fail_closed,
-             test_failed_stand_is_retained, test_configuration_restoration, test_hook_restore, test_tls_fixture_semantics,
-             test_tls_received_caller_propagation, test_tls_adapter_lifecycle, test_actual_finalizers,
-             test_benchmark_readiness, test_container_locks, test_lock_cooperation,
-             test_matrix_native_lock_lifecycle,
-             test_major_selection, test_hook_major_selection, test_deploy_major_selection,
-             test_current_run_duplicates, test_measurement_windows, test_mute_warmup_drain, test_measurement_failures,
-             test_standby_lock_cooperation, test_shared_lock_and_phase_release,
-             test_failed_fallback_keeps_stale_library, test_chain_file_completion,
-             test_disjoint_lock_namespaces, test_export_epoch_accounting,
-             test_export_history_before_warmup, test_export_parent_arming,
-             test_export_measurement_replay_and_pending, test_export_worker_generation,
-             test_export_recovery_before_measurement]
-    errors = []
-    for test in tests:
-        try:
-            test()
-        except Exception as error:
-            errors.append(f"{test.__name__}: {error}")
-            print("FAIL", errors[-1], file=sys.stderr)
-        else:
-            print("PASS", test.__name__)
-    if errors:
-        raise SystemExit(f"{len(errors)} harness selftest failures")
-    print("PASS host-only actual-function harness selftest")
-
-
-if __name__ == "__main__":
-    main()

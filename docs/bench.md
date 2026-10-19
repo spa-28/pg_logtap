@@ -1,6 +1,6 @@
 # Overhead benchmark
 
-`scripts/bench-overhead.sh` measures what pg_logtap costs an OLTP workload:
+`benchmarks/bench-overhead.sh` measures what pg_logtap costs an OLTP workload:
 pgbench before/after the extension on one stand, six measured jobs —
 identical hardware, fixed seed, warmup before each.
 
@@ -34,14 +34,14 @@ HTTP receiver that stamps arrival time against each event's `timestamp`.
 ## Running it
 
 ```
-PHASES=stand,bench scripts/test-matrix.sh 300 18
+PHASES=stand,bench tests/e2e/test-matrix.sh 300 18
 ```
 
 The `bench` job is not in the default PHASES: benchmark numbers from shared
 CI runners are garbage. Run locally, CPU governor on `performance` (a
 scaling governor halves TPS on developer boxes — the script warns).
 
-`scripts/storm.sh [secs] [pg_major] [modes]` is the same load without the
+`tests/e2e/storm.sh [secs] [pg_major] [modes]` is the same load without the
 baseline half: it builds the current tree, brings up the stand, and storms
 the "on" profiles (`loud,quiet,mute`, default `loud`) back to back on one
 stand — a mode flip is a reload. `plain` is statement volume without

@@ -2,8 +2,8 @@
 # Version-matrix acceptance: for each requested PG major — build from its
 # vendored headers, deploy into the stand, run the e2e + a log storm,
 # assert zero drops and exact delivery to Vector.
-# Usage: scripts/test-matrix.sh [storm_secs] [version ...]   (default: all vendored)
-# PHASES=storm,kill scripts/test-matrix.sh [secs] [version ...] runs a subset
+# Usage: tests/e2e/test-matrix.sh [storm_secs] [version ...]   (default: all vendored)
+# PHASES=storm,kill tests/e2e/test-matrix.sh [secs] [version ...] runs a subset
 # of the pipeline (comma list, order as below) against a stand the full run
 # brought up — for load-shaped local research. Default: every phase except
 # bench (opt-in: PHASES=stand,bench runs the overhead benchmark locally).
@@ -12,7 +12,7 @@
 # the mute silent receiver stay shared (nobody stops them mid-scenario, and
 # the vlogs asserts are marker-filtered). Stands and builds serialize on one
 # lock (shared zig-out and the pgzx-build cache).
-# shellcheck source=e2e-common.sh
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/e2e-common.sh"
 
 has_phase() { case ",$PHASES," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
@@ -187,7 +187,7 @@ phase_stand() ( # <v>: phase-local locks close on every return, including failur
 )
 
 phase_upgrade() { # <v>: direct/current and historical SQL upgrade chains.
-  scripts/e2e-upgrade.sh "pglogtap-mx$1"
+  tests/e2e/e2e-upgrade.sh "pglogtap-mx$1"
 }
 
 phase_cluster_ops() ( # <v>: ops that interact with other backends — the
@@ -213,15 +213,15 @@ phase_cluster_ops() ( # <v>: ops that interact with other backends — the
 phase_standby() { # <v>: database-independent worker startup on a primary
   # without database postgres, then export from a physical standby that stays
   # in recovery. Own throwaway containers; the matrix stand supplies Vector.
-  scripts/e2e-standby.sh "$1"
+  tests/e2e/e2e-standby.sh "$1"
 }
 
 phase_e2e() { # <v>: N distinct events must reach Vector (file sink).
-  scripts/e2e-vector.sh "pglogtap-mx$1" 20
+  tests/e2e/e2e-vector.sh "pglogtap-mx$1" 20
 }
 
 phase_vlogs() { # <v>: prod-shaped chain Vector → VictoriaLogs, exact count.
-  scripts/e2e-vlogs.sh "pglogtap-mx$1" 50
+  tests/e2e/e2e-vlogs.sh "pglogtap-mx$1" 50
 }
 
 phase_storm() ( # <v> <secs>: log storm at debug volume; assert dropped=0 and
@@ -276,66 +276,66 @@ phase_storm() ( # <v> <secs>: log storm at debug volume; assert dropped=0 and
 
 phase_kill() { # <v>: failure modes — receiver down→up, SIGKILL postmaster,
   # fallback file, worker kill: the docs/delivery.md contract.
-  scripts/e2e-kill.sh "pglogtap-mx$1"
+  tests/e2e/e2e-kill.sh "pglogtap-mx$1"
 }
 
 phase_silent() { # <v>: mute-but-accepting receiver: sends must fail after
   # export_timeout_ms, batches divert to the fallback file, /healthz answers.
-  scripts/e2e-silent-receiver.sh "pglogtap-mx$1"
+  tests/e2e/e2e-silent-receiver.sh "pglogtap-mx$1"
 }
 
 phase_slow() { # <v>: slow-but-answering receiver: export_slow_ms parks live
   # batches on the fallback file (lossless), drains once it answers fast.
-  scripts/e2e-slow-receiver.sh "pglogtap-mx$1"
+  tests/e2e/e2e-slow-receiver.sh "pglogtap-mx$1"
 }
 
 phase_tls() { # <v>: TLS export acceptance — verified https, ca-cleared and
   # empty-ca handshake failures with replay, impostor chain, server_name
   # mismatch, intermediate-CA path, tcps, verify=off warn-once. Needs openssl
   # on the host; the receivers run host-side (python).
-  scripts/e2e-tls.sh "pglogtap-mx$1"
+  tests/e2e/e2e-tls.sh "pglogtap-mx$1"
 }
 
 phase_faults() { # <v>: fault injection — a throwaway postgres under an
   # LD_PRELOAD shim that fails fdatasync for one named file: rollback-and-
   # retry on a file:// sink, keep-but-count on the fallback queue, and
   # /dev/full write failure. Owns its own container; the stand is untouched.
-  scripts/e2e-faults.sh "$1"
+  tests/e2e/e2e-faults.sh "$1"
 }
 
 phase_robust() { # <v>: robustness classes beyond the happy path — fields past
   # their ring slots, a logging backend SIGKILLed mid-emit (the PANIC/
   # emergency-restart path), and the RAM backlog's memory bound under a
   # receiver-dead storm.
-  scripts/e2e-robust.sh "pglogtap-mx$1"
+  tests/e2e/e2e-robust.sh "pglogtap-mx$1"
 }
 
 phase_hook_chain() { # <v>: another hook extension preloaded first:
   # pg_logtap must chain its emit-log and shared-memory hooks, not replace them.
-  scripts/e2e-hook-chain.sh "pglogtap-mx$1"
+  tests/e2e/e2e-hook-chain.sh "pglogtap-mx$1"
 }
 
 phase_metrics() { # <v>: worker serves /metrics, Vector prometheus_scrape
   # reads it. Opens metrics_addr to the stand network.
-  scripts/e2e-metrics.sh "pglogtap-mx$1"
+  tests/e2e/e2e-metrics.sh "pglogtap-mx$1"
 }
 
 phase_wide() { # <v>: pg_logtap.message_max=8192 (POSTMASTER): whole messages
   # past the 1024B default, char-boundary cut past the configured width, aux
   # fields still 256B. Last on purpose: it ALTER SYSTEMs + restarts the pg
   # container, so every earlier phase must have passed on the default config.
-  scripts/e2e-wide.sh "pglogtap-mx$1"
+  tests/e2e/e2e-wide.sh "pglogtap-mx$1"
 }
 
 phase_archive() { # <v>: exact runtime/debug release archives on actual EL8.
-  scripts/archive-smoke.sh "$1"
+  tests/packaging/archive-smoke.sh "$1"
 }
 
 phase_bench() { # <v> <secs>: formal overhead benchmark (docs/bench.md) —
   # pgbench before/after the extension, TPS/CPU/events/s/latency report. Not
   # in the default PHASES: benchmark numbers from shared CI runners are
   # garbage; run locally on a performance-governor box.
-  scripts/bench-overhead.sh "$2" "pglogtap-mx$1"
+  benchmarks/bench-overhead.sh "$2" "pglogtap-mx$1"
 }
 
 cleanup_version() (
@@ -412,7 +412,7 @@ run_version() { # <v>: every phase for one major, in PHASES order. Returns
 
 main() {
   set -euo pipefail
-  cd "$(dirname "$0")/.."
+  cd "$(dirname "$0")/../.."
   SECS=${1:-5}; shift || true
   if [ $# -gt 0 ]; then VERSIONS="$*"; else VERSIONS="15 16 17 18"; fi
   PHASES=${PHASES:-stand,upgrade,cluster-ops,standby,e2e,vlogs,storm,kill,silent,slow,tls,faults,robust,hook-chain,metrics,wide,archive}

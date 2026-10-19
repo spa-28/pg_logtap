@@ -20,6 +20,10 @@ jobs:
       # The pgzx dependency runs pg_config at configure time (any zig build
       # invocation) and links libpq; any server-dev version will do here.
       - run: sudo apt-get update && sudo apt-get install -y postgresql-server-dev-16 libpq-dev libkrb5-dev
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.4"
+          enable-cache: false
       # Version lives in control + sql filename + build.zig.zon + version.zig;
       # fail early if they drift apart (the release job names packages from the tag).
       - run: |
@@ -27,9 +31,12 @@ jobs:
           [ -f "sql/pg_logtap--$v.sql" ] || { echo "sql/pg_logtap--$v.sql missing"; exit 1; }
           grep -q "\"$v\"" build.zig.zon || { echo "build.zig.zon version != $v"; exit 1; }
           grep -q "\"$v\"" src/version.zig || { echo "src/version.zig version != $v"; exit 1; }
-      # fmt + lint + unit tests + the .so compile (see the Makefile's check
+      # Harness + fmt + lint + unit tests + the .so compile (see Makefile's check
       # target — CI and local dev run the same targets).
       - run: make check
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/pg-logtap-tests
+          UV_PYTHON_DOWNLOADS: never
 
   matrix:
     # Fast-fail: check (fmt/lint/test/version sync, ~2.5 min) gates the eight
@@ -53,6 +60,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # The metrics phase runs pytest on the host, not inside the PG images.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.4"
+          enable-cache: false
       - name: Install zig 0.16.0
         run: |
           curl -fsSL https://ziglang.org/download/0.16.0/zig-${{ matrix.zig_arch }}-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
@@ -75,9 +87,13 @@ jobs:
       - run: make test
         env:
           PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
-      - run: make e2e PGS=${{ matrix.pg }}
+      - name: Run native E2E
+        run: |
+          export PATH="/opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:$PATH"
+          make e2e PGS=${{ matrix.pg }}
         env:
-          PATH: /opt/zig:/usr/lib/postgresql/${{ matrix.pg }}/bin:/usr/local/bin:/usr/bin:/bin
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/pg-logtap-tests
+          UV_PYTHON_DOWNLOADS: never
       - uses: actions/upload-artifact@v4
         with:
           name: pg_logtap-pg${{ matrix.pg }}-${{ matrix.arch }}

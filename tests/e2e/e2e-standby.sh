@@ -2,8 +2,10 @@
 # Worker lifecycle acceptance: no dependency on a database named `postgres`,
 # and export while a physical standby remains in recovery. Owns a throwaway
 # primary, standby and standby volume; the matrix stand supplies Vector only.
-# Usage: scripts/e2e-standby.sh <pg_major>   (needs dist/pg<major> from `stand`)
+# Usage: tests/e2e/e2e-standby.sh <pg_major>   (needs dist/pg<major> from `stand`)
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 
 V=${1:-}

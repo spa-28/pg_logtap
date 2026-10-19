@@ -2,8 +2,10 @@
 # End-to-end acceptance: generate N events in Postgres, assert Vector received >= N.
 # The receiver is the compose stand's vector (tests/e2e/compose.yaml); its
 # output file accumulates across runs, so counting is by distinct markers.
-# Usage: scripts/e2e-vector.sh [pg_container] [events]
+# Usage: tests/e2e/e2e-vector.sh [pg_container] [events]
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init vector "${1:-}"
 EVENTS="${2:-20}"

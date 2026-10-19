@@ -2,8 +2,10 @@
 # PostgreSQL hook interop: pg_logtap must chain to previously-installed
 # emit_log, shmem-request and shmem-startup hooks, not silently replace them.
 # hookchain.c is preloaded BEFORE pg_logtap.
-# Usage: scripts/e2e-hook-chain.sh [pg_container]   (restarts it twice)
+# Usage: tests/e2e/e2e-hook-chain.sh [pg_container]   (restarts it twice)
 set -eu
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init hookchain "${1:-}"
 e2e_gate

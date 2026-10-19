@@ -14,7 +14,7 @@ STORM ?= 5  # storm seconds for make e2e (CI's value)
 PGS ?=      # PG majors for make e2e (empty = all vendored)
 C ?=        # stand container for make deploy (default: pglogtap-pg)
 
-.PHONY: all build check install test fmt lint clean container deploy e2e
+.PHONY: all build check install test test-harness fmt lint clean container deploy e2e
 
 all: build
 
@@ -24,10 +24,12 @@ build:
 # What CI's fast job runs: fmt + lint + unit tests in one zig build pass, then
 # the library compile — `zig build test` only builds the test module, and
 # broken src/ has passed it before.
-check:
-	python3 scripts/harness-selftest.py
+check: test-harness
 	zig build fmt lint test --summary all
 	zig build --summary all
+
+test-harness:
+	uv run --project tests --locked --only-group test python -m pytest tests/harness
 
 install: build
 	install -D zig-out/lib/pg_logtap.so $(PG_PKGLIBDIR)/pg_logtap.so
@@ -58,4 +60,4 @@ deploy:
 
 # The docker e2e matrix; JOBS=4 (env) runs the majors in parallel.
 e2e:
-	scripts/test-matrix.sh $(STORM) $(PGS)
+	tests/e2e/test-matrix.sh $(STORM) $(PGS)

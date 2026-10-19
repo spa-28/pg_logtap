@@ -63,9 +63,11 @@
 # LT_TLS_ROOT_PG_CONTAINER, LT_TLS_ROOT_EXPECTED_ID, LT_TLS_ROOT_LABEL_KEY,
 # LT_TLS_ROOT_LABEL_VALUE, LT_TLS_ROOT_CA_SOURCE, LT_TLS_ROOT_CA_SHA256 and
 # LT_TLS_ROOT_URL (the existing chain receiver URL).
-# Usage: scripts/e2e-tls.sh [pg_container] [events_per_phase]
+# Usage: tests/e2e/e2e-tls.sh [pg_container] [events_per_phase]
 [ -z "${PG_LOGTAP_TLS_SYSTEM_ROOT_PROBE:-}" ] || E2E_TAG=tls-system-root
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 
 tls_root_fail() {

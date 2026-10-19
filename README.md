@@ -90,7 +90,8 @@ the [pgzx](https://github.com/spa-28/pgzx) dependency (git dep in
 `build.zig.zon`) translates the server headers and links libpq at build time.
 `make e2e` additionally requires GNU Binutils (`objcopy` and `readelf`; the
 `binutils` package on Debian/Ubuntu) to produce and validate the release-like
-stripped runtime.
+stripped runtime, plus uv and Python 3.10+ on the host for the metrics pytest
+pilot.
 
 ```sh
 make && make install          # uses pg_config from PATH
@@ -589,7 +590,7 @@ for attempt in $(seq 1 60); do
 done
 [ "$ready" -eq 1 ] || { printf 'preloaded PostgreSQL not ready\n' >&2; exit 1; }
 docker exec "$C" psql -X -U postgres -v ON_ERROR_STOP=1 -qc 'CREATE EXTENSION pg_logtap'
-scripts/e2e-require-ext.sh "$C"
+tests/e2e/e2e-require-ext.sh "$C"
 ```
 
 No host ports are needed for `docker exec`; publish only loopback ports if a
@@ -601,6 +602,37 @@ PostgreSQL-extension interface).
 
 ### Testing
 
+Zig unit tests stay beside the implementation in `src/`. Host-only harness
+checks live in `tests/harness/`, E2E suites and fixtures in `tests/e2e/`, and
+release-archive checks in `tests/packaging/`. The comparative overhead benchmark
+is separate in `benchmarks/`.
+
+The host-only harness uses pytest and Python 3.10+, managed by
+[uv](https://docs.astral.sh/uv/getting-started/installation/). It runs the actual
+shell functions with strict command stubs; it does not call real Docker or
+PostgreSQL. Test dependencies are declared in `tests/pyproject.toml` and pinned,
+including transitive dependencies and hashes, in `tests/uv.lock`.
+
+```sh
+make test-harness
+uv run --project tests --locked --only-group test python -m pytest tests/harness -k configuration_restoration
+```
+
+Uv creates and syncs the test-only environment in `tests/.venv` automatically;
+`--locked` refuses dependency changes that would require a lockfile update.
+`make test-harness` needs neither Zig nor `pg_config`. Uv and pytest are not
+build or runtime requirements. The full `make check` still requires the native
+build prerequisites. Default pytest discovery is limited to `tests/harness/`
+and does not start Docker.
+
+Metrics is the first native pytest scenario; the other E2E scenarios remain
+shell-driven. Use `tests/e2e/e2e-metrics.sh [container] [port]` against a prepared
+stand: the adapter performs the existing readiness/freshness checks, holds the
+container lock through cleanup, and runs the scenario through uv. Running the
+native pytest module directly without adapter context fails before Docker is
+called. The full E2E matrix also needs uv and Python 3.10+ on the host, not in
+the PostgreSQL or archive-validation images.
+
 The e2e suites run against a docker-compose stand — postgres plus the
 receivers, brought up gated on real readiness (pg healthcheck, the
 receiver's port actually accepting):
@@ -608,27 +640,27 @@ receiver's port actually accepting):
 ```sh
 PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
 # deploy the build into it, then:
-scripts/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
-scripts/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
-scripts/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
-scripts/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
-scripts/e2e-hook-chain.sh pglogtap-e2e       # another extension's emit-log + shmem hooks: chained, not replaced
-scripts/e2e-upgrade.sh pglogtap-e2e          # direct 0.6.2 paths, rule-metadata refusals, canonical OIDs and rollback
-scripts/e2e-upgrade.sh pglogtap-e2e 0.6.1    # frozen historical hops (not the protected update route)
-scripts/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
-scripts/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
-scripts/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
-scripts/e2e-tls.sh pglogtap-e2e             # TLS: verified https/tcps, CA/name failures, auth gate, Content-Type reload, bearer/basic credentials, TLS 1.2-only receiver
-scripts/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
-scripts/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
-scripts/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
-PHASES=stand,bench scripts/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
+tests/e2e/e2e-vector.sh pglogtap-e2e 20        # 20 events through a real Vector
+tests/e2e/e2e-vlogs.sh pglogtap-e2e 50         # Vector → VictoriaLogs: exactly 50 arrive
+tests/e2e/e2e-kill.sh pglogtap-e2e             # failure modes: receiver outage, SIGKILL postmaster, fallback queue replay, torn tail, worker crash/TERM, graceful stop
+tests/e2e/e2e-robust.sh pglogtap-e2e           # huge fields past slot caps, backend SIGKILL mid-emit (the PANIC path), 60k-event storm into a dead receiver: bounded RAM, exact loss accounting
+tests/e2e/e2e-hook-chain.sh pglogtap-e2e       # another extension's emit-log + shmem hooks: chained, not replaced
+tests/e2e/e2e-upgrade.sh pglogtap-e2e          # direct 0.6.2 paths, rule-metadata refusals, canonical OIDs and rollback
+tests/e2e/e2e-upgrade.sh pglogtap-e2e 0.6.1    # frozen historical hops (not the protected update route)
+tests/e2e/e2e-metrics.sh pglogtap-e2e 9187     # /metrics scraped, values checked
+tests/e2e/e2e-silent-receiver.sh pglogtap-e2e  # mute receiver: timeout fires, fallback absorbs, /healthz alive
+tests/e2e/e2e-slow-receiver.sh pglogtap-e2e    # slow receiver: batches park losslessly (export_slow_ms), queue drains on recovery
+tests/e2e/e2e-tls.sh pglogtap-e2e             # TLS: verified https/tcps, CA/name failures, auth gate, Content-Type reload, bearer/basic credentials, TLS 1.2-only receiver
+tests/e2e/e2e-wide.sh pglogtap-e2e            # message_max widened: message arrives whole / cut at a UTF-8 boundary, "truncated" fields
+tests/e2e/e2e-faults.sh 18                    # fault injection: an LD_PRELOAD shim fails fdatasync on one file (own throwaway container) — sync-fail rollback/retry, /dev/full write-fail
+tests/e2e/test-matrix.sh                       # per major: build + deploy into the stand + every suite + pgbench storm
+PHASES=stand,bench tests/e2e/test-matrix.sh 300 18  # overhead benchmark: 6 pgbench jobs before/after the extension (docs/bench.md)
 scripts/build.sh 18 test                     # unit tests (any zig build target; needs pg_config)
 scripts/build.sh 18 fmt && scripts/build.sh 18 lint   # zig fmt + zlinter
 ```
 
 `test-matrix.sh` runs each stage as a phase; `PHASES=storm,kill
-scripts/test-matrix.sh 5 18` replays a subset against a stand the full run
+tests/e2e/test-matrix.sh 5 18` replays a subset against a stand the full run
 brought up — for load-shaped local research.
 
 `scripts/build.sh [major] [args...]` runs `zig build` inside the `pgzx-build`
@@ -636,11 +668,12 @@ container (zig 0.16 + PGDG server-dev 15–18 + libpq); on a machine with a
 local `pg_config` plain `zig build` / `make` works too. CI installs
 `postgresql-server-dev-$major` per matrix job instead.
 
-The Makefile is the front door for all of it: `make check` (fmt + lint +
-unit tests + the .so compile), `make container V=17` (the same battery in
-the pgzx-build container), `make e2e PGS=18` (the matrix above; `JOBS=4`
-runs the majors in parallel), `make deploy`, and the conventional
-`make && make install` against a local `pg_config`. CI runs
+The Makefile is the front door for all of it: `make test-harness` (host-only
+checks through uv), `make check` (harness + fmt + lint + Zig unit tests + the
+.so compile), `make container V=17` (Zig checks and library compile in the
+pgzx-build container), `make e2e PGS=18` (the matrix above; `JOBS=4` runs the
+majors in parallel), `make deploy`, and the conventional `make && make install`
+against a local `pg_config`. CI runs
 `make check` / `make test` / `make e2e` itself, so the targets cannot drift
 from the real build.
 
@@ -649,7 +682,7 @@ run inside a live PostgreSQL): all PostgreSQL interop in pg_logtap is
 concentrated in `capture.zig` / `worker.zig`, the rest (`ring`, `filter`,
 `jsonl`, `export`, `metrics`) is pure and links without postgres symbols — so
 `zig build test` runs standalone and identically across the whole 15–18 matrix.
-Behavior that needs a real server is covered by the e2e scripts instead.
+Behavior that needs a real server is covered by the E2E scenarios instead.
 The final `archive` matrix phase validates and loads the exact runtime/debug
 tarballs on pinned native Rocky 8.10 with glibc 2.28, checks the extension in
 `template1` and exports a marker to a private file. CI uploads those tested

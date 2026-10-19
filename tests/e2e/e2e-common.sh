@@ -75,6 +75,8 @@ e2e_gate() { # the compose stand must be up, freshly deployed, reachable
   [ "$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' pglogtap-ready 2>/dev/null)" = "exited/0" ] \
     || fail "e2e stand not up: PG_MAJOR=<v> docker compose -f tests/e2e/compose.yaml up -d"
   # A stale .so (copied without a restart) would test yesterday's code.
+  # shellcheck source-path=SCRIPTDIR
+  # shellcheck source=../tests/e2e/e2e-require-ext.sh
   "$(dirname "$0")/e2e-require-ext.sh" "$E2E_CT" || fail "freshness check failed for $E2E_CT"
   docker network connect "$NET" "$E2E_CT" >/dev/null 2>&1 || true # non-stand pg arg
   # A run that failed mid-suite may have left the receiver stopped; the next

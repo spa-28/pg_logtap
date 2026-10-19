@@ -1,7 +1,7 @@
 # E2E stand: one command brings up everything the suites need, gated on real
 # readiness —
 #   PG_MAJOR=18 docker compose -f tests/e2e/compose.yaml up -d
-# The suites then run against it by container name (scripts/test-matrix.sh
+# The suites then run against it by container name (tests/e2e/test-matrix.sh
 # brings it up per PG major). Standing infrastructure with a readiness
 # contract lives here; the failure choreography inside the suites (docker
 # kill/stop/start mid-scenario) stays imperative — compose brings the stand

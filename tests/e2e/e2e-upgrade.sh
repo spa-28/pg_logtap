@@ -1,14 +1,16 @@
 #!/bin/sh
 # Acceptance: released SQL layouts reach the canonical current API.
 # Fresh 0.6.0/0.6.1 keep OIDs and metadata; historical normalization fails closed.
-# Usage: scripts/e2e-upgrade.sh [pg_container] [target: 0.6.2|0.6.1]
+# Usage: tests/e2e/e2e-upgrade.sh [pg_container] [target: 0.6.2|0.6.1]
 # The explicit 0.6.1 target tests frozen historical hops, not protected upgrades.
 set -u
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../tests/e2e/e2e-common.sh
 . "$(dirname "$0")/e2e-common.sh"
 e2e_init upgrade "${1:-}"
 e2e_gate
 EXTDIR=$(docker exec "$PG_CT" pg_config --sharedir)/extension
-docker cp "$(dirname "$0")/../tests/e2e/fixtures/pg_logtap--0.1.0.sql" \
+docker cp "$(dirname "$0")/fixtures/pg_logtap--0.1.0.sql" \
   "$PG_CT:$EXTDIR/" >/dev/null \
   || fail "upgrade: could not install the 0.1.0 test fixture"
 
